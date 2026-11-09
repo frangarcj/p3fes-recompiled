@@ -26,7 +26,11 @@ correctness fallback.
 For direct RenderWare compatibility checks, configure with `-DP3FES_BUILD_RW_PROBE=ON`
 and build `p3fes_rw_probe`. The probe fetches [aap/librw](https://github.com/aap/librw)
 at commit `18532c2e13efbc1aa43f0b00b4459831f9414de0` (MIT), uses its parser-only `NULL`
-platform, and reports the geometry/material/skin structure of one RMD without keeping
-converted game assets. It is diagnostic tooling, not a runtime dependency.
+platform, and converts the geometry/material/skin data to a small GPU-neutral mesh
+representation. The conversion follows the approach used by
+[Coney](https://github.com/Ryubara/coney) at commit
+`eb07fc0f9d69e62c7aeee6307be5c2ef162f4ee6` (GPL-3.0-or-later). PS2 texture decoding
+stays on the existing offline Virtual-AK path for now; the probe deliberately does not
+load the RMD texture dictionary. It is diagnostic tooling, not a runtime dependency.
 
 Do not commit extracted game assets or converted output.

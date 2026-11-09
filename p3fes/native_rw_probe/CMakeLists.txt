@@ -13,6 +13,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(p3fes_librw)
 
-add_executable(p3fes_rw_probe main.cpp)
+add_executable(p3fes_rw_probe main.cpp mesh_convert.cpp)
 target_link_libraries(p3fes_rw_probe PRIVATE librw::librw)
 target_compile_features(p3fes_rw_probe PRIVATE cxx_std_20)

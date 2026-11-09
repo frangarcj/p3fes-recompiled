@@ -1,5 +1,7 @@
 #include <rw.h>
 
+#include "mesh_convert.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -40,17 +42,6 @@ std::vector<std::uint8_t> readFile(const char *path)
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-rw::TexDictionary *readTextureDictionary(std::uint8_t *data, std::size_t size)
-{
-    rw::StreamMemory stream;
-    stream.open(data, static_cast<rw::uint32>(size));
-    rw::TexDictionary *dict = nullptr;
-    if (rw::findChunk(&stream, rw::ID_TEXDICTIONARY, nullptr, nullptr))
-        dict = rw::TexDictionary::streamRead(&stream);
-    stream.close();
-    return dict;
-}
-
 rw::Clump *readClump(std::uint8_t *data, std::size_t size)
 {
     rw::StreamMemory stream;
@@ -66,6 +57,8 @@ void printClump(rw::Clump *clump)
 {
     int atomics = 0;
     int nativeGeometries = 0;
+    std::size_t convertedVertices = 0;
+    std::size_t convertedIndices = 0;
     FORLIST(lnk, clump->atomics)
     {
         rw::Atomic *atomic = rw::Atomic::fromClump(lnk);
@@ -78,9 +71,18 @@ void printClump(rw::Clump *clump)
             ++nativeGeometries;
 
         rw::Skin *skin = rw::Skin::get(geometry);
+        std::string conversionError;
+        auto converted = p3fes::native_rw::convertGeometry(*geometry, conversionError);
+        if (!converted)
+        {
+            std::fprintf(stderr, "atomic %d conversion failed: %s\n", atomics, conversionError.c_str());
+            continue;
+        }
+        convertedVertices += converted->vertices.size();
+        convertedIndices += converted->indices.size();
         std::printf(
             "atomic %d: vertices=%d triangles=%d materials=%d flags=0x%08X native=%s "
-            "instPlatform=%d skinBones=%d\n",
+            "instPlatform=%d skinBones=%d neutralIndices=%zu submeshes=%zu\n",
             atomics,
             geometry->numVertices,
             geometry->numTriangles,
@@ -88,11 +90,14 @@ void printClump(rw::Clump *clump)
             static_cast<unsigned>(geometry->flags),
             native ? "yes" : "no",
             geometry->instData ? geometry->instData->platform : -1,
-            skin ? skin->numBones : 0);
+            skin ? skin->numBones : 0,
+            converted->indices.size(),
+            converted->submeshes.size());
         ++atomics;
     }
 
-    std::printf("summary: atomics=%d nativeGeometries=%d\n", atomics, nativeGeometries);
+    std::printf("summary: atomics=%d nativeGeometries=%d neutralVertices=%zu neutralIndices=%zu\n",
+                atomics, nativeGeometries, convertedVertices, convertedIndices);
 }
 } // namespace
 
@@ -136,10 +141,6 @@ int main(int argc, char **argv)
     std::uint8_t *rwData = file.data() + rwOffset;
     const std::size_t rwSize = file.size() - rwOffset;
 
-    rw::TexDictionary *dictionary = readTextureDictionary(rwData, rwSize);
-    if (dictionary)
-        rw::TexDictionary::setCurrent(dictionary);
-
     rw::Clump *clump = readClump(rwData, rwSize);
     if (clump == nullptr)
     {
@@ -152,8 +153,6 @@ int main(int argc, char **argv)
 
     printClump(clump);
     clump->destroy();
-    if (dictionary)
-        dictionary->destroy();
 
     rw::Engine::stop();
     rw::Engine::close();
