@@ -14,10 +14,13 @@ Included now:
 - `p3fes_rmd.py`: RMD/RWS RenderWare scene, model, skin and PS2-native texture decoding.
 - `p3fes_gltf.py`: glTF export for meshes, skeletons, skin weights and animations.
 - `p3fes_tmx.py`: Atlus TMX texture decoding.
+- `prepare_model.py`: extract one RMD directly from an existing CVM and prepare it as glTF
+  without unpacking the whole archive.
 
 For a quick native-render sanity check, build the desktop target `p3fes_native_viewer`,
-export one RMD with `p3fes_rmd.py gltf MODEL.RMD -o OUT`, and pass the generated
-`.gltf` to the viewer. The viewer is deliberately separate from the emulated GS so it
-can be used to compare a native asset path against the existing correctness fallback.
+prepare one model with `prepare_model.py DATA.CVM /PATH/MODEL.RMD -o OUT`, and pass
+the generated `.gltf` to the viewer. The viewer is deliberately separate from the
+emulated GS so it can be used to compare a native asset path against the existing
+correctness fallback.
 
 Do not commit extracted game assets or converted output.
