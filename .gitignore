@@ -33,3 +33,4 @@ memcards/
 *.ps2
 build-*/
 p3fes/output/
+__pycache__/

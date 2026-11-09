@@ -23,4 +23,10 @@ the generated `.gltf` to the viewer. The viewer is deliberately separate from th
 emulated GS so it can be used to compare a native asset path against the existing
 correctness fallback.
 
+For direct RenderWare compatibility checks, configure with `-DP3FES_BUILD_RW_PROBE=ON`
+and build `p3fes_rw_probe`. The probe fetches [aap/librw](https://github.com/aap/librw)
+at commit `18532c2e13efbc1aa43f0b00b4459831f9414de0` (MIT), uses its parser-only `NULL`
+platform, and reports the geometry/material/skin structure of one RMD without keeping
+converted game assets. It is diagnostic tooling, not a runtime dependency.
+
 Do not commit extracted game assets or converted output.
