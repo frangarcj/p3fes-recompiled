@@ -213,7 +213,9 @@ def read_geometry(data, geo):
     if flags & 0x80 and not info["ntex"]:
         ntex = 2
     info["ntex"] = ntex
+    colors = []
     if flags & GEO_PRELIT:
+        colors = [struct.unpack_from("<4B", data, p + 4 * i) for i in range(nvert)]
         p += 4 * nvert
     uvs = []
     for t in range(ntex):
@@ -237,7 +239,8 @@ def read_geometry(data, geo):
     if hasn:
         normals = [struct.unpack_from("<3f", data, p + 12 * i) for i in range(nvert)]
         p += 12 * nvert
-    info.update(verts=verts, normals=normals, uvs=uvs, tris=tris, used=p - st.data_start, block=st.size)
+    info.update(verts=verts, normals=normals, colors=colors, uvs=uvs, tris=tris,
+                used=p - st.data_start, block=st.size)
     return info
 
 

@@ -1,6 +1,7 @@
 #include <rw.h>
 
 #include "mesh_convert.h"
+#include "../native_renderer/native_model.h"
 #include "../native_renderer/renderer.h"
 
 #include <algorithm>
@@ -95,6 +96,13 @@ bool parseArgs(int argc, char **argv, Options &out)
     return true;
 }
 
+bool hasSuffix(const char *path, const char *suffix)
+{
+    const std::string_view value(path ? path : "");
+    const std::string_view ending(suffix);
+    return value.size() >= ending.size() && value.substr(value.size() - ending.size()) == ending;
+}
+
 struct Bounds
 {
     std::array<float, 3> min{
@@ -127,55 +135,78 @@ int main(int argc, char **argv)
     Options options;
     if (!parseArgs(argc, argv, options))
     {
-        std::fprintf(stderr, "Usage: %s MODEL.RMD [--frames N]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s MODEL.RMD|MODEL.p3n [--frames N]\n", argv[0]);
         return 2;
     }
 
-    std::vector<std::uint8_t> file = readFile(options.modelPath);
-    const std::size_t rwOffset = findRwOffset(file);
-    if (file.empty() || rwOffset == file.size())
-    {
-        std::fprintf(stderr, "Could not find a RenderWare stream in %s\n", options.modelPath);
-        return 1;
-    }
-
-    rw::Engine::init();
-    rw::registerHAnimPlugin();
-    rw::registerSkinPlugin();
-    rw::registerMatFXPlugin();
-    rw::ps2::registerPlatformPlugins();
-    rw::ps2::registerNativeDataPlugin();
-    rw::ps2::registerADCPlugin();
-    if (!rw::Engine::open(nullptr) || !rw::Engine::start())
-        return 1;
-
-    rw::Clump *clump = readClump(file.data() + rwOffset, file.size() - rwOffset);
-    if (clump == nullptr)
-        return 1;
-
     std::vector<p3fes::native_renderer::MeshData> neutralMeshes;
-    Bounds bounds;
-    FORLIST(lnk, clump->atomics)
+    std::size_t preparedTextureCount = 0;
+    if (hasSuffix(options.modelPath, ".p3n"))
     {
-        rw::Atomic *atomic = rw::Atomic::fromClump(lnk);
-        if (atomic->geometry == nullptr)
-            continue;
+        p3fes::native_renderer::NativeModel model;
         std::string error;
-        auto mesh = p3fes::native_rw::convertGeometry(*atomic->geometry, error);
-        if (!mesh)
+        if (!p3fes::native_renderer::loadNativeModel(options.modelPath, model, error))
         {
-            std::fprintf(stderr, "Could not convert an atomic: %s\n", error.c_str());
-            continue;
+            std::fprintf(stderr, "Could not load native model pack: %s\n", error.c_str());
+            return 1;
         }
-        include(bounds, *mesh);
-        neutralMeshes.push_back(std::move(*mesh));
+        preparedTextureCount = model.textures.size();
+        neutralMeshes = std::move(model.meshes);
     }
-    clump->destroy();
-    rw::Engine::stop();
-    rw::Engine::close();
-    rw::Engine::term();
+    else
+    {
+        std::vector<std::uint8_t> file = readFile(options.modelPath);
+        const std::size_t rwOffset = findRwOffset(file);
+        if (file.empty() || rwOffset == file.size())
+        {
+            std::fprintf(stderr, "Could not find a RenderWare stream in %s\n", options.modelPath);
+            return 1;
+        }
+
+        rw::Engine::init();
+        rw::registerHAnimPlugin();
+        rw::registerSkinPlugin();
+        rw::registerMatFXPlugin();
+        rw::ps2::registerPlatformPlugins();
+        rw::ps2::registerNativeDataPlugin();
+        rw::ps2::registerADCPlugin();
+        if (!rw::Engine::open(nullptr) || !rw::Engine::start())
+            return 1;
+
+        rw::Clump *clump = readClump(file.data() + rwOffset, file.size() - rwOffset);
+        if (clump == nullptr)
+            return 1;
+
+        FORLIST(lnk, clump->atomics)
+        {
+            rw::Atomic *atomic = rw::Atomic::fromClump(lnk);
+            if (atomic->geometry == nullptr)
+                continue;
+            std::string error;
+            auto mesh = p3fes::native_rw::convertGeometry(*atomic->geometry, error);
+            if (!mesh)
+            {
+                std::fprintf(stderr, "Could not convert an atomic: %s\n", error.c_str());
+                continue;
+            }
+            neutralMeshes.push_back(std::move(*mesh));
+        }
+        clump->destroy();
+        rw::Engine::stop();
+        rw::Engine::close();
+        rw::Engine::term();
+    }
+
     if (neutralMeshes.empty())
         return 1;
+
+    Bounds bounds;
+    for (const auto &mesh : neutralMeshes)
+        include(bounds, mesh);
+
+    if (preparedTextureCount != 0)
+        std::fprintf(stderr, "[p3fes-native] loaded %zu prepared texture(s); renderer binding is the next step\n",
+                     preparedTextureCount);
 
     std::unique_ptr<p3fes::native_renderer::Renderer> renderer =
         p3fes::native_renderer::createDesktopRenderer();

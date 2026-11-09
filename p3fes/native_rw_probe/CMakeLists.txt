@@ -17,6 +17,11 @@ add_executable(p3fes_rw_probe main.cpp mesh_convert.cpp)
 target_link_libraries(p3fes_rw_probe PRIVATE librw::librw)
 target_compile_features(p3fes_rw_probe PRIVATE cxx_std_20)
 
+add_library(p3fes_native_model STATIC
+    ../native_renderer/native_model.cpp)
+target_include_directories(p3fes_native_model PUBLIC ..)
+target_compile_features(p3fes_native_model PUBLIC cxx_std_20)
+
 add_library(p3fes_native_renderer_desktop STATIC
     ../native_renderer/renderer_raylib.cpp)
 target_include_directories(p3fes_native_renderer_desktop PUBLIC ..)
@@ -24,5 +29,5 @@ target_link_libraries(p3fes_native_renderer_desktop PUBLIC raylib)
 target_compile_features(p3fes_native_renderer_desktop PUBLIC cxx_std_20)
 
 add_executable(p3fes_rw_viewer viewer.cpp mesh_convert.cpp)
-target_link_libraries(p3fes_rw_viewer PRIVATE librw::librw p3fes_native_renderer_desktop)
+target_link_libraries(p3fes_rw_viewer PRIVATE librw::librw p3fes_native_model p3fes_native_renderer_desktop)
 target_compile_features(p3fes_rw_viewer PRIVATE cxx_std_20)

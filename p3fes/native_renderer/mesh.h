@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace p3fes::native_renderer
@@ -22,6 +23,7 @@ struct Vertex
 struct Material
 {
     std::array<std::uint8_t, 4> color{255, 255, 255, 255};
+    std::string textureName;
 };
 
 struct Submesh
@@ -41,5 +43,14 @@ struct MeshData
     bool hasNormals = false;
     bool hasPrelight = false;
     bool skinned = false;
+    std::uint32_t boneCount = 0;
+};
+
+struct TextureData
+{
+    std::string name;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::vector<std::uint8_t> rgba;
 };
 } // namespace p3fes::native_renderer

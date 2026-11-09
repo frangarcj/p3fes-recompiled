@@ -16,6 +16,10 @@ Included now:
 - `p3fes_tmx.py`: Atlus TMX texture decoding.
 - `prepare_model.py`: extract one RMD directly from an existing CVM and prepare it as glTF
   without unpacking the whole archive.
+- `prepare_native_model.py`: extract one RMD directly from a CVM and write one compact
+  `.p3n` runtime package containing simple mesh/skin/material data plus decoded RGBA
+  textures. This follows the same broad strategy as RECV Vita: console-specific asset
+  decoding happens on the user's PC/Mac, not on the handheld.
 
 For a quick native-render sanity check, build the desktop target `p3fes_native_viewer`,
 prepare one model with `prepare_model.py DATA.CVM /PATH/MODEL.RMD -o OUT`, and pass
@@ -39,4 +43,11 @@ uses raylib/OpenGL; a Vita backend can implement the same upload/draw contract o
 The viewer therefore renders an RMD without the emulated GS or an intermediate glTF file.
 It is intentionally untextured while the PS2 raster path remains separate.
 
-Do not commit extracted game assets or converted output.
+`p3fes_rw_viewer` also accepts a `.p3n` package. That path does not parse RenderWare at
+runtime: `p3fes/native_renderer/native_model.*` validates and loads the already-prepared
+vertices, indices, submeshes, skin weights and RGBA textures. The texture payload is
+loaded but not yet bound by the proof renderer; material/texture binding is the next
+native-renderer step.
+
+`.p3n` files are derived from the user's game data. Do not commit, publish, or distribute
+them, extracted game assets, or converted output.

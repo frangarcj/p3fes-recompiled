@@ -80,9 +80,12 @@ void printClump(rw::Clump *clump)
         }
         convertedVertices += converted->vertices.size();
         convertedIndices += converted->indices.size();
+        const std::size_t texturedMaterials = static_cast<std::size_t>(std::count_if(
+            converted->materials.begin(), converted->materials.end(),
+            [](const p3fes::native_renderer::Material &material) { return !material.textureName.empty(); }));
         std::printf(
             "atomic %d: vertices=%d triangles=%d materials=%d flags=0x%08X native=%s "
-            "instPlatform=%d skinBones=%d neutralIndices=%zu submeshes=%zu\n",
+            "instPlatform=%d skinBones=%d neutralIndices=%zu submeshes=%zu texturedMaterials=%zu\n",
             atomics,
             geometry->numVertices,
             geometry->numTriangles,
@@ -92,7 +95,8 @@ void printClump(rw::Clump *clump)
             geometry->instData ? geometry->instData->platform : -1,
             skin ? skin->numBones : 0,
             converted->indices.size(),
-            converted->submeshes.size());
+            converted->submeshes.size(),
+            texturedMaterials);
         ++atomics;
     }
 

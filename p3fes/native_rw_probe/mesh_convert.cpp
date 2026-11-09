@@ -35,6 +35,7 @@ std::optional<native_renderer::MeshData> convertGeometry(rw::Geometry &geometry,
     out.hasNormals = target.normals != nullptr;
     out.hasPrelight = geometry.colors != nullptr;
     out.skinned = skin != nullptr;
+    out.boneCount = skin ? static_cast<std::uint32_t>(skin->numBones) : 0u;
     out.triangleStrip = (geometry.meshHeader->flags & rw::MeshHeader::TRISTRIP) != 0;
     out.vertices.resize(static_cast<std::size_t>(geometry.numVertices));
 
@@ -68,8 +69,13 @@ std::optional<native_renderer::MeshData> convertGeometry(rw::Geometry &geometry,
     out.materials.reserve(static_cast<std::size_t>(geometry.matList.numMaterials));
     for (rw::int32 i = 0; i < geometry.matList.numMaterials; ++i)
     {
-        const rw::RGBA &color = geometry.matList.materials[i]->color;
-        out.materials.push_back({{color.red, color.green, color.blue, color.alpha}});
+        const rw::Material *material = geometry.matList.materials[i];
+        const rw::RGBA &color = material->color;
+        native_renderer::Material converted;
+        converted.color = {color.red, color.green, color.blue, color.alpha};
+        if (material->texture && material->texture->name[0] != '\0')
+            converted.textureName = material->texture->name;
+        out.materials.push_back(std::move(converted));
     }
 
     const rw::Mesh *meshes = geometry.meshHeader->getMeshes();
