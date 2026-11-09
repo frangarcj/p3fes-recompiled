@@ -486,7 +486,17 @@ extern "C" void ps2x_vita_present_hist(uint32_t *out8)
 }
 
 
-extern "C" void vglCeloSetUniformPoolSize(uint32_t size); // celosia.patch (round 65c)
+#if defined(__GNUC__)
+#define PS2X_VITA_WEAK __attribute__((weak))
+#else
+#define PS2X_VITA_WEAK
+#endif
+extern "C" void vglCeloSetUniformPoolSize(uint32_t size) PS2X_VITA_WEAK; // celosia.patch (round 65c)
+extern "C" void vglCeloUniformGuard(int enabled, uint32_t maxSize) PS2X_VITA_WEAK;
+extern "C" void vglCeloDepthTiled(int enabled) PS2X_VITA_WEAK;
+extern "C" void vglCeloMemStats(size_t *used, size_t *spillBytes, size_t *spillCount,
+                                 size_t *spillTotal, size_t *spillPeak) PS2X_VITA_WEAK;
+extern "C" void vglCeloMemDump(const char *tag) PS2X_VITA_WEAK;
 
 // vitaGL is one GL state for the whole process: the host (between
 // BeginDrawing and EndDrawing, and in texture calls) and the GPU GS renderer
@@ -778,7 +788,8 @@ void InitWindow(int, int, const char *)
     // hard shadows, see the renderer's doShadow), kept as a size to try.
     // SOTC_VGL_UNIFORM_KB: its size (default 2048, as vitaGL).
     const int uniformKb = kb("SOTC_VGL_UNIFORM_KB", 2048);
-    vglCeloSetUniformPoolSize(static_cast<uint32_t>(uniformKb) * 1024u);
+    if (vglCeloSetUniformPoolSize)
+        vglCeloSetUniformPoolSize(static_cast<uint32_t>(uniformKb) * 1024u);
     // 2026-11-07 (the 5th colossus): the pool came round onto uniforms the
     // GPU had not read. The console keeps ~3 frames of scenes queued
     // ([gpu86] backlog ~80 scenes) and Avion's frames reserve 0.75-0.8 MB:
@@ -793,8 +804,10 @@ void InitWindow(int, int, const char *)
     const int uniformMaxKb = kb("SOTC_VGL_UNIFORM_MAX_KB", 8192);
     const char *guardEnv = std::getenv("SOTC_VGL_UNIFORM_GUARD");
     const bool uniformGuard = !guardEnv || std::atoi(guardEnv) != 0;
-    vglCeloUniformGuard(uniformGuard ? 1 : 0, static_cast<uint32_t>(std::max(uniformMaxKb, uniformKb)) * 1024u);
-    std::fprintf(stderr, "[vita] vitaGL uniform pool %d KB, guard %s (up to %d KB)\n", uniformKb, uniformGuard ? "on" : "off", std::max(uniformMaxKb, uniformKb));
+    if (vglCeloUniformGuard)
+        vglCeloUniformGuard(uniformGuard ? 1 : 0, static_cast<uint32_t>(std::max(uniformMaxKb, uniformKb)) * 1024u);
+    std::fprintf(stderr, "[vita] vitaGL uniform pool %d KB, guard %s%s\n", uniformKb,
+                 uniformGuard ? "on" : "off", vglCeloUniformGuard ? "" : " (stock vitaGL: extension unavailable)");
     vglSetCircularPoolSize(static_cast<uint32_t>(circularKb) * 1024u);
     std::fprintf(stderr, "[vita] vitaGL circular pool %d KB, immediate pool %d KB\n", circularKb, immediateKb);
     // Round 92 (a console experiment, off by default): vitaGL's depth /
@@ -802,7 +815,7 @@ void InitWindow(int, int, const char *)
     // depth tests; the ~9 MB a frame of depth / stencil the picture's
     // scenes load and store moved in whole tiles). Set before vglInit (the
     // display's depth is made there). SOTC_VGL_DEPTH_TILED=0/1.
-    if (const char *e = std::getenv("SOTC_VGL_DEPTH_TILED"))
+    if (const char *e = std::getenv("SOTC_VGL_DEPTH_TILED"); e && vglCeloDepthTiled)
     {
         vglCeloDepthTiled(std::atoi(e) != 0 ? 1 : 0);
         std::fprintf(stderr, "[vita] vitaGL depth / stencil surfaces %s (SOTC_VGL_DEPTH_TILED=%s)\n", std::atoi(e) != 0 ? "tiled" : "linear", e);
@@ -852,6 +865,8 @@ void CloseWindow(void)
 bool WindowShouldClose(void) { return g_quit; }
 bool IsWindowReady(void) { return g_glReady; }
 void SetConfigFlags(unsigned int) {}
+void SetExitKey(int) {}
+void SetWindowTitle(const char *) {}
 // Presentation follows the display's vsync: 30 or less shows each picture
 // for at least two vblanks (interval 2), 20 or less three (round 107's
 // Steady 20), else every vblank.
@@ -894,8 +909,6 @@ void BeginDrawing(void)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 }
-
-extern "C" void vglCeloMemStats(size_t *used, size_t *spillBytes, size_t *spillCount, size_t *spillTotal, size_t *spillPeak); // celosia.patch (round 34)
 
 // Round 86: the time spent in vglSwapBuffers (its display queue waits while
 // two frames are still on the GPU), summed; read by the renderer's [gpu86].
@@ -942,7 +955,8 @@ void EndDrawing(void)
         // Vita3K's mspace statistics are not real) and the GPU objects vitaGL
         // put in the newlib heap because its pools had no room.
         size_t used[VGL_MEM_ALL] = {}, spill = 0, spills = 0, spillTotal = 0, spillPeak = 0;
-        vglCeloMemStats(used, &spill, &spills, &spillTotal, &spillPeak);
+        if (vglCeloMemStats)
+            vglCeloMemStats(used, &spill, &spills, &spillTotal, &spillPeak);
         const double MB = 1048576.0;
         std::fprintf(stderr, "[vita:mem] t=%.0f heap used=%.1f MB arena=%.1f MB | vgl vram=%.1f/%.1f ram=%.1f/%.1f MB | system free user=%.1f cdram=%.1f phycont=%.1f MB"
                              " | vgl used vram %.1f/%.1f ram %.1f/%.1f phycont %.1f/%.1f budget %.1f/%.1f MB, GPU objects in the heap %u (%.1f MB, peak %.1f, %.1f MB put there in all)\n",
@@ -962,7 +976,7 @@ void EndDrawing(void)
             return e ? std::atof(e) : 0.0;
         }();
         static double nextDump = 0.0;
-        if (dumpEvery > 0.0 && now >= nextDump)
+        if (vglCeloMemDump && dumpEvery > 0.0 && now >= nextDump)
         {
             nextDump = now + dumpEvery;
             char tag[32];
@@ -1276,6 +1290,18 @@ void UpdateTexture(Texture2D texture, const void *pixels)
     std::lock_guard<std::recursive_mutex> lock(ps2xVitaGlMutex());
     glBindTexture(GL_TEXTURE_2D, it->second.texture);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texture.width, texture.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+}
+
+void SetTextureFilter(Texture2D texture, int filter)
+{
+    const auto it = g_textures.find(texture.id);
+    if (it == g_textures.end() || !it->second.texture)
+        return;
+    std::lock_guard<std::recursive_mutex> lock(ps2xVitaGlMutex());
+    glBindTexture(GL_TEXTURE_2D, it->second.texture);
+    const GLint mode = filter == TEXTURE_FILTER_POINT ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mode);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mode);
 }
 
 void UnloadTexture(Texture2D texture)

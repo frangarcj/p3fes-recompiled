@@ -205,7 +205,7 @@ int main(int argc, char **argv)
         include(bounds, mesh);
 
     std::unique_ptr<p3fes::native_renderer::Renderer> renderer =
-        p3fes::native_renderer::createDesktopRenderer();
+        p3fes::native_renderer::createPlatformRenderer();
     std::string renderError;
     if (!renderer->open(960, 544, "Persona 3 FES direct RenderWare viewer", renderError))
     {

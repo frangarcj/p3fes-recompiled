@@ -1390,7 +1390,7 @@ __fi static bool mpeg2_slice()
 					d += 32;
 				}
 #elif defined(ARCH_ARM64)
-				uint8x16_t zeroreg = vmovq_n_u8(0);
+					uint8x16_t zeroreg = vmovq_n_u8(0);
 
 				for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
 				{
@@ -1402,8 +1402,16 @@ __fi static bool mpeg2_slice()
 					vst1q_u8((uint8_t*)d + 32, vzip1q_u8(woot2, zeroreg));
 					vst1q_u8((uint8_t*)d + 48, vzip2q_u8(woot2, zeroreg));
 					s += 32;
-					d += 32;
-				}
+						d += 32;
+					}
+#elif defined(ARCH_ARM32)
+					for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
+					{
+						for (uint j = 0; j < 32; ++j)
+							d[j] = s[j];
+						s += 32;
+						d += 32;
+					}
 #else
 #error Unsupported arch
 #endif

@@ -18,5 +18,5 @@ target_link_libraries(p3fes_rw_probe PRIVATE librw::librw)
 target_compile_features(p3fes_rw_probe PRIVATE cxx_std_20)
 
 add_executable(p3fes_rw_viewer viewer.cpp mesh_convert.cpp)
-target_link_libraries(p3fes_rw_viewer PRIVATE librw::librw p3fes_native_model p3fes_native_renderer_desktop)
+target_link_libraries(p3fes_rw_viewer PRIVATE librw::librw p3fes_native_model p3fes_native_renderer_platform)
 target_compile_features(p3fes_rw_viewer PRIVATE cxx_std_20)

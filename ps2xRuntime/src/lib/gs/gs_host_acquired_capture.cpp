@@ -58,6 +58,15 @@ GSHostAcquiredCapture::GSHostAcquiredCapture(Options selected) : options(std::mo
 bool GSHostAcquiredCapture::capture(const GSSharedPresent::Frame &frame, uint64_t hostTick,
                                     const char *source) noexcept
 {
+#if defined(PLATFORM_VITA)
+    // The Vita shim deliberately has no in-memory PNG encoder. This private
+    // diagnostic is desktop-only; disabling it avoids dragging an image codec
+    // into the handheld runtime while leaving normal presentation untouched.
+    (void)frame;
+    (void)hostTick;
+    (void)source;
+    return false;
+#else
     // with no option, outside the window or with a held sequence there are no GL calls and no I/O.
     if (options.directory.empty() || attempts >= options.limit || hostTick < options.fromTick ||
         frame.sequence == 0u || frame.sequence <= lastSequence || frame.blank ||
@@ -114,4 +123,5 @@ bool GSHostAcquiredCapture::capture(const GSSharedPresent::Frame &frame, uint64_
                      (unsigned long long)frame.sequence, error.what());
         return false;
     }
+#endif
 }

@@ -87,10 +87,17 @@ enum
     PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 = 7,
 };
 
+enum TextureFilter
+{
+    TEXTURE_FILTER_POINT = 0,
+    TEXTURE_FILTER_BILINEAR = 1,
+};
+
 // Keyboard: the Vita has none; IsKeyDown() is always false.
 enum KeyboardKey
 {
     KEY_NULL = 0,
+    KEY_SPACE = 32,
     KEY_ONE = 49,
     KEY_THREE = 51,
     KEY_A = 65,
@@ -111,9 +118,14 @@ enum KeyboardKey
     KEY_X = 88,
     KEY_Y = 89,
     KEY_Z = 90,
+    KEY_ESCAPE = 256,
     KEY_ENTER = 257,
+    KEY_TAB = 258,
     KEY_BACKSPACE = 259,
     KEY_F1 = 290,
+    KEY_KP_0 = 320,
+    KEY_KP_1 = 321,
+    KEY_LEFT_SHIFT = 340,
     KEY_RIGHT = 262,
     KEY_LEFT = 263,
     KEY_DOWN = 264,
@@ -161,6 +173,8 @@ void CloseWindow(void);
 bool WindowShouldClose(void);
 bool IsWindowReady(void);
 void SetConfigFlags(unsigned int flags);
+void SetExitKey(int key);
+void SetWindowTitle(const char *title);
 void SetTargetFPS(int fps);
 int GetFPS(void);
 double GetTime(void);
@@ -183,6 +197,7 @@ bool ExportImage(Image image, const char *fileName);
 Texture2D LoadTextureFromImage(Image image);
 Image LoadImageFromTexture(Texture2D texture);
 void UpdateTexture(Texture2D texture, const void *pixels);
+void SetTextureFilter(Texture2D texture, int filter);
 void UnloadTexture(Texture2D texture);
 
 // Input

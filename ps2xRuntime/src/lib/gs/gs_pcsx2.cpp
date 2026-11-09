@@ -26,7 +26,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
+#elif !defined(PLATFORM_VITA)
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
@@ -62,6 +62,8 @@ namespace
         if (bytes > 1)
             WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, out.data(), bytes, nullptr, nullptr);
         return out;
+#elif defined(PLATFORM_VITA)
+        return "app0:";
 #else
         char path[4096] = {};
         const ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
@@ -555,14 +557,25 @@ namespace ps2_pcsx2gs
 {
     bool Requested()
     {
+#if defined(PLATFORM_VITA)
+        // The PCSX2 GS plugin is a desktop shared library. Vita keeps the
+        // built-in GS as the correctness fallback and uses the native path
+        // selectively instead of loading a desktop plugin.
+        return false;
+#else
         // PCSX2's GS is the default whenever its library sits next to the executable (Install falls back to the
         // built-in renderer when it does not); PS2X_GS_RENDERER=builtin keeps the built-in one.
         const char *v = std::getenv("PS2X_GS_RENDERER");
         return !v || !*v || std::strncmp(v, "pcsx2", 5) == 0;
+#endif
     }
 
     bool Install(GS &gs)
     {
+#if defined(PLATFORM_VITA)
+        (void)gs;
+        return false;
+#else
         if (g_renderer)
             return true;
         const std::string dir = ExecutableDir();
@@ -618,6 +631,7 @@ namespace ps2_pcsx2gs
         g_active = true;
         std::fprintf(stderr, "[pcsx2-gs] attached (%s renderer)\n", renderer ? "software" : "hardware");
         return true;
+#endif
     }
 
     bool Active()

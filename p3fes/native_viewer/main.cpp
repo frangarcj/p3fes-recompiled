@@ -111,7 +111,7 @@ int runNativePack(const Options &options)
     }
 
     std::unique_ptr<p3fes::native_renderer::Renderer> renderer =
-        p3fes::native_renderer::createDesktopRenderer();
+        p3fes::native_renderer::createPlatformRenderer();
     if (!renderer->open(960, 544, "Persona 3 FES native model viewer", error))
     {
         std::fprintf(stderr, "Could not open native renderer: %s\n", error.c_str());

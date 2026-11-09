@@ -535,6 +535,7 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+set(PS2X_REGISTER_FUNCTIONS_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
 
 if(EXISTS "${RUNNER_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
@@ -596,10 +597,24 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     # Keep the hand-written runner entry point out of the generated-code unity
     # batches so editing it does not recompile recompiled game functions.
     set_source_files_properties("${ROOT_MAIN_CPP}" "${RUNNER_MAIN_CPP}" "${PS2X_PROFILER_CPP}" "${PS2X_GAME_MAIN_CPP}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    if(PS2X_IS_VITA AND EXISTS "${PS2X_REGISTER_FUNCTIONS_CPP}")
+        # The generated registration table can be hundreds of thousands of
+        # straight-line assignments. On GCC ARM, keeping it out of a unity
+        # batch avoids making unrelated game functions share that compile.
+        set_source_files_properties("${PS2X_REGISTER_FUNCTIONS_CPP}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    endif()
     set_target_properties(ps2EntryRunner PROPERTIES
         UNITY_BUILD ON
         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
     )
+endif()
+
+if(PS2X_IS_VITA AND EXISTS "${PS2X_REGISTER_FUNCTIONS_CPP}")
+    # This file only fills the generated function-pointer lookup table during
+    # startup; it is not a runtime hot path. GCC ARM spends an excessive amount
+    # of time optimizing its ~300k assignments at -O3. Compile this one startup
+    # initializer without optimization while the recompiled game code stays -O3.
+    set_source_files_properties("${PS2X_REGISTER_FUNCTIONS_CPP}" PROPERTIES COMPILE_OPTIONS "-O0")
 endif()
 
 if(PS2X_ENABLE_RUNNER_PCH)
@@ -639,7 +654,10 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop ${CMAKE_DL_LIBS})
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(NOT PS2X_IS_VITA)
+    target_link_libraries(ps2_runtime PUBLIC ${CMAKE_DL_LIBS})
+endif()
 if(TARGET kzvu)
     target_link_libraries(ps2_runtime PRIVATE kzvu)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_KZVU=1)
@@ -749,21 +767,23 @@ if(PS2X_IS_VITA)
     if(PS2X_VITA_CREATE_PACKAGE)
         set(PS2X_VITA_VPK_FILES "")
 
-        foreach(PS2X_VITA_MODULE IN ITEMS
-            libgpu_es4_ext.suprx
-            libIMGEGL.suprx
-            libGLESv2.suprx
-            libpvrPSP2_WSEGL.suprx
-            libGL.suprx)
-            set(PS2X_VITA_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vita/module/${PS2X_VITA_MODULE}")
+        if(NOT PS2X_VITA_SDL2_SHIM)
+            foreach(PS2X_VITA_MODULE IN ITEMS
+                libgpu_es4_ext.suprx
+                libIMGEGL.suprx
+                libGLESv2.suprx
+                libpvrPSP2_WSEGL.suprx
+                libGL.suprx)
+                set(PS2X_VITA_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vita/module/${PS2X_VITA_MODULE}")
 
-            if(EXISTS "${PS2X_VITA_MODULE_PATH}")
-                list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_MODULE_PATH}" "module/${PS2X_VITA_MODULE}")
-            else()
-                message(WARNING
-                    "Missing ${PS2X_VITA_MODULE_PATH}; the vpk will rely on ur0:data/external/ for it")
-            endif()
-        endforeach()
+                if(EXISTS "${PS2X_VITA_MODULE_PATH}")
+                    list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_MODULE_PATH}" "module/${PS2X_VITA_MODULE}")
+                else()
+                    message(WARNING
+                        "Missing ${PS2X_VITA_MODULE_PATH}; the vpk will rely on ur0:data/external/ for it")
+                endif()
+            endforeach()
+        endif()
 
         vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
         vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin

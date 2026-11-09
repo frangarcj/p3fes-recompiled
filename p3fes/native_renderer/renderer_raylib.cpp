@@ -306,7 +306,7 @@ private:
 };
 } // namespace
 
-std::unique_ptr<Renderer> createDesktopRenderer()
+std::unique_ptr<Renderer> createPlatformRenderer()
 {
     return std::make_unique<RaylibRenderer>();
 }

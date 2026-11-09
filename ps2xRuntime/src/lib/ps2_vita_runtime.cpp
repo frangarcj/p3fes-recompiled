@@ -8,6 +8,13 @@
 extern "C" unsigned int _newlib_heap_size_user = 96u * 1024u * 1024u;
 extern "C" unsigned int sceLibcHeapSize = 8u * 1024u * 1024u;
 
+// Celosia's host shim calls this optional runtime hook once every few seconds.
+// Persona 3 does not yet have Celosia's emergency-heap controller, so keep the
+// ABI and make the stock path a no-op rather than leaving an unresolved symbol.
+extern "C" void ps2x_vita_heap_tick(double, size_t)
+{
+}
+
 namespace
 {
     void ttyPuts(const char *text)

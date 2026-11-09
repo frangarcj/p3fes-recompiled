@@ -23,7 +23,7 @@ The game's MIPS R5900 code is statically recompiled to C++ and run on a reimplem
 >
 > | File | SHA-1 |
 > |---|---|
-> | `SLUS_216.21` | `7ca061aac239e53e86bcd4c0ce8e19e987d8a75f` |
+> | `SLUS_216.21` | `3929cd7c02be944f25ec6b924e5f1eab9bc5e9cb` |
 
 ## Status
 
@@ -135,6 +135,25 @@ See [`p3fes/README.md`](p3fes/README.md). In short:
 2. Copy the generated C++ into `ps2xRuntime/src/runner/` and its two headers into `ps2xRuntime/include/`.
 3. Build `ps2xRuntime` (Windows: llvm-mingw or MSVC).
 4. Put the executable, `run.bat`, `SLUS_216.21`, `SYSTEM.CNF`, `LIB31\` and the `.CVM` files in one folder.
+
+### PS Vita cross-build
+
+With VitaSDK installed (the default toolchain path is `/usr/local/vitasdk` on the development setup used here):
+
+```sh
+VITASDK=/usr/local/vitasdk cmake -S . -B build-vita -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=/usr/local/vitasdk/share/vita.toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DPS2X_ENABLE_FFMPEG=OFF
+VITASDK=/usr/local/vitasdk cmake --build build-vita --target ps2xRuntime/ps2EntryRunner.vpk
+```
+
+Fresh Vita builds use the title id `P3FES0001` and expect the user's game files under
+`ux0:data/p3fes/`, with `SLUS_216.21` as the boot ELF. Keep `DATA.CVM`, `BTL.CVM`, `BGM.CVM`,
+`SYSTEM.CNF` and `LIB31/` there as well. These files are not packaged into the VPK and must not
+be committed or redistributed.
+
+The Vita build uses the built-in GS as the correctness fallback. The native RenderWare path is
+being brought up separately through the portable `.p3n` asset/renderer interface.
 
 <details>
 <summary><b>Runtime options</b></summary>

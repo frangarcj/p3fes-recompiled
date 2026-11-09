@@ -18,8 +18,14 @@
 
 #if defined(USE_SSE2NEON)
 #include "sse2neon.h"
+#if defined(__aarch64__) || defined(_M_ARM64)
 #if !defined(ARCH_ARM64)
 #define ARCH_ARM64 1
+#endif
+#else
+#if !defined(ARCH_ARM32)
+#define ARCH_ARM32 1
+#endif
 #endif
 #else
 #include <emmintrin.h>
@@ -68,7 +74,9 @@ using mem128_t = u128;
 #if defined(_MSC_VER) && !defined(__clang__)
 #define __noinline __declspec(noinline)
 #else
+#ifndef __noinline
 #define __noinline __attribute__((noinline))
+#endif
 #endif
 #define __ri
 

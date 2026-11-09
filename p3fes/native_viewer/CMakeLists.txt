@@ -1,3 +1,3 @@
 add_executable(p3fes_native_viewer main.cpp)
-target_link_libraries(p3fes_native_viewer PRIVATE raylib p3fes_native_model p3fes_native_renderer_desktop)
+target_link_libraries(p3fes_native_viewer PRIVATE raylib p3fes_native_model p3fes_native_renderer_platform)
 target_compile_features(p3fes_native_viewer PRIVATE cxx_std_20)

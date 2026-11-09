@@ -51,7 +51,7 @@ public:
     virtual void endFrame() = 0;
 };
 
-// Desktop proof backend. Vita intentionally gets its own vitaGL implementation
-// instead of growing the Celosia raylib shim into a second 3D API.
-std::unique_ptr<Renderer> createDesktopRenderer();
+// One platform backend behind the same asset/draw contract: raylib/OpenGL on
+// desktop, vitaGL on Vita. The asset path stays free of either graphics API.
+std::unique_ptr<Renderer> createPlatformRenderer();
 } // namespace p3fes::native_renderer
