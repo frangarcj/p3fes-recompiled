@@ -88,6 +88,11 @@ if(PS2X_BUILD_RUNTIME)
     endif()
     add_subdirectory("ps2xIOP")
     add_subdirectory("ps2xRuntime")
+    option(P3FES_BUILD_NATIVE_VIEWER "Build the Persona 3 native asset viewer on desktop" ON)
+    if(P3FES_BUILD_NATIVE_VIEWER AND NOT ANDROID AND
+       NOT CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi")
+        add_subdirectory("p3fes/native_viewer")
+    endif()
     # PCSX2's GS as pcsx2gs.so / pcsx2gs.dll next to the executable (PS2X_GS_RENDERER=pcsx2).
     option(PS2X_BUILD_PCSX2GS "Build PCSX2's GS as a shared library" ON)
     if(PS2X_BUILD_PCSX2GS AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
