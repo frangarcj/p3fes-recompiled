@@ -19,8 +19,6 @@ if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
    (CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi"))
     set(PS2X_VITA_APP_NAME "Persona 3 FES" CACHE STRING "Display name for the Vita bubble")
     set(PS2X_VITA_TITLEID "P3FES0001" CACHE STRING "9-character Vita title id")
-    set(PS2X_DEFAULT_BOOT_ELF "ux0:data/p3fes/SLUS_216.21" CACHE STRING
-        "Guest ELF path passed directly to main() when argv is unavailable")
 endif()
 
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)

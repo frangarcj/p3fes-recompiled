@@ -252,12 +252,15 @@ namespace
             std::cout << "Using argv boot path" << std::endl;
             return std::filesystem::path(argv[1]);
         }
-#if defined(PS2X_DEFAULT_BOOT_ELF)
+#if defined(PLATFORM_VITA)
+        // Keep Persona 3's user-owned data outside the VPK. This fallback is
+        // intentionally local to the Vita entry point so changing the data
+        // path does not invalidate the giant recompiled-code PCH/unity build.
+        std::cout << "Using Vita Persona 3 data path" << std::endl;
+        return std::filesystem::path("ux0:data/p3fes/SLUS_216.21");
+#elif defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
         const std::filesystem::path configuredPath = std::filesystem::path(PS2X_DEFAULT_BOOT_ELF);
-#if defined(PLATFORM_VITA)
-        return configuredPath;
-#endif
         if (configuredPath.is_absolute())
         {
             return configuredPath;
