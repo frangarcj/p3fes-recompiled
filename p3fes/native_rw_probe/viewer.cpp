@@ -140,7 +140,7 @@ int main(int argc, char **argv)
     }
 
     std::vector<p3fes::native_renderer::MeshData> neutralMeshes;
-    std::size_t preparedTextureCount = 0;
+    std::vector<p3fes::native_renderer::TextureData> preparedTextures;
     if (hasSuffix(options.modelPath, ".p3n"))
     {
         p3fes::native_renderer::NativeModel model;
@@ -150,7 +150,7 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "Could not load native model pack: %s\n", error.c_str());
             return 1;
         }
-        preparedTextureCount = model.textures.size();
+        preparedTextures = std::move(model.textures);
         neutralMeshes = std::move(model.meshes);
     }
     else
@@ -204,10 +204,6 @@ int main(int argc, char **argv)
     for (const auto &mesh : neutralMeshes)
         include(bounds, mesh);
 
-    if (preparedTextureCount != 0)
-        std::fprintf(stderr, "[p3fes-native] loaded %zu prepared texture(s); renderer binding is the next step\n",
-                     preparedTextureCount);
-
     std::unique_ptr<p3fes::native_renderer::Renderer> renderer =
         p3fes::native_renderer::createDesktopRenderer();
     std::string renderError;
@@ -215,6 +211,14 @@ int main(int argc, char **argv)
     {
         std::fprintf(stderr, "Could not open native renderer: %s\n", renderError.c_str());
         return 1;
+    }
+    for (const auto &texture : preparedTextures)
+    {
+        if (!renderer->uploadTexture(texture, renderError))
+        {
+            std::fprintf(stderr, "Could not upload texture %s: %s\n", texture.name.c_str(), renderError.c_str());
+            return 1;
+        }
     }
     for (std::size_t i = 0; i < neutralMeshes.size(); ++i)
     {

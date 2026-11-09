@@ -46,8 +46,9 @@ It is intentionally untextured while the PS2 raster path remains separate.
 `p3fes_rw_viewer` also accepts a `.p3n` package. That path does not parse RenderWare at
 runtime: `p3fes/native_renderer/native_model.*` validates and loads the already-prepared
 vertices, indices, submeshes, skin weights and RGBA textures. The texture payload is
-loaded but not yet bound by the proof renderer; material/texture binding is the next
-native-renderer step.
+uploaded once by the native renderer and bound per RenderWare material/submesh by its
+logical texture name. Direct `.RMD` viewing remains intentionally texture-free because
+the target-oriented path is the preprocessed `.p3n` package.
 
 `.p3n` files are derived from the user's game data. Do not commit, publish, or distribute
 them, extracted game assets, or converted output.

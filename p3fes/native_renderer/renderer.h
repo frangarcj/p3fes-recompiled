@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace p3fes::native_renderer
 {
@@ -40,6 +41,8 @@ public:
     virtual bool shouldClose() const = 0;
     virtual void setTargetFps(int fps) = 0;
 
+    virtual bool uploadTexture(const TextureData &texture, std::string &error) = 0;
+    virtual void removeTexture(std::string_view name) = 0;
     virtual bool uploadMesh(MeshId id, const MeshData &mesh, std::string &error) = 0;
     virtual void removeMesh(MeshId id) = 0;
 
