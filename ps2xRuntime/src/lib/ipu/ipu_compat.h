@@ -16,8 +16,21 @@
 #include <limits>
 #include <string>
 
+#if defined(USE_SSE2NEON)
+#include "sse2neon.h"
+#if !defined(ARCH_ARM64)
+#define ARCH_ARM64 1
+#endif
+#else
 #include <emmintrin.h>
 #include <smmintrin.h>
+#if !defined(ARCH_X86)
+#define ARCH_X86 1
+#endif
+#if !defined(_M_X86)
+#define _M_X86 1
+#endif
+#endif
 
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -48,13 +61,6 @@ union alignas(16) u128
     };
 };
 using mem128_t = u128;
-
-#ifndef ARCH_X86
-#define ARCH_X86 1
-#endif
-#ifndef _M_X86
-#define _M_X86 1
-#endif
 
 // PCSX2 marks out-of-line definitions in .cpp files with __fi; they must stay
 // externally visible here, so __fi is a no-op (in-class bodies are inline anyway).

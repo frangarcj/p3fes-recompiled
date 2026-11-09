@@ -1,4 +1,4 @@
-// explicit, bounded capture of the acquired texture; off by default.
+// explicit, bounded capture of the host presentation texture; off by default.
 #pragma once
 #include "runtime/gs/gs_shared_present.h"
 #include <cstdint>
@@ -15,9 +15,10 @@ public:
     };
     GSHostAcquiredCapture();
     explicit GSHostAcquiredCapture(Options options);
-    // The caller keeps the Acquire reservation and the current host context.
+    // The caller owns/borrows the texture and keeps the current host context.
     // It does not acquire another slot or query the GS/VRAM; failures do not interrupt the game.
-    bool capture(const GSSharedPresent::Frame &frame, uint64_t hostTick) noexcept;
+    bool capture(const GSSharedPresent::Frame &frame, uint64_t hostTick,
+                 const char *source = "acquired_texture") noexcept;
 
 private:
     Options options;

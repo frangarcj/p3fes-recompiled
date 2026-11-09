@@ -2,6 +2,7 @@
 // Source: PS2Recomp sotc-port, ac9efa070638ad3b3accd284de6f898d5ab271d1.
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_shared_present.h"
+#include "runtime/gs/gs_host_fenv.h"
 #include "runtime/gs/gs_swizzle.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "../gs_gpu_helpers.h"
@@ -30,7 +31,6 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
-#include <xmmintrin.h>
 
 using namespace GSGL;
 using namespace GSCpuInternal;
@@ -38,21 +38,7 @@ using namespace GSCpuInternal;
 namespace
 {
     // GS setup keeps the EE/VU producer's rounding.
-    class GSGpuRoundingScope
-    {
-        const unsigned rounding = _mm_getcsr() & _MM_ROUND_MASK;
-    public:
-        GSGpuRoundingScope()
-        {
-            if (rounding != _MM_ROUND_NEAREST)
-                _mm_setcsr(_mm_getcsr() & ~_MM_ROUND_MASK);
-        }
-        ~GSGpuRoundingScope()
-        {
-            if (rounding != _MM_ROUND_NEAREST)
-                _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | rounding);
-        }
-    };
+    using GSGpuRoundingScope = GSHostFenv::NearestRoundingScope;
     // the existing frontend consumes 640-pixel rows, even with a smaller CRTC.
     PresentationFrame presentationRows(PresentationFrame frame)
     {

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <bit>
+#include <cfenv>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -470,20 +471,40 @@ constexpr uint32_t PS2_FCR31_SD = 0x00000020u;
 
 inline float ps2FpuDivideNearest(float dividend, float divisor)
 {
+#if defined(USE_SSE2NEON)
+    const int rounding = std::fegetround();
+    const bool changed = rounding != -1 && rounding != FE_TONEAREST &&
+                         std::fesetround(FE_TONEAREST) == 0;
+    const float result = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(dividend), _mm_set_ss(divisor)));
+    if (changed)
+        std::fesetround(rounding);
+    return result;
+#else
     const uint32_t csr = _mm_getcsr();
     _mm_setcsr(csr & ~0x6000u);
     const float result = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(dividend), _mm_set_ss(divisor)));
     _mm_setcsr(csr);
     return result;
+#endif
 }
 
 inline float ps2FpuSqrtNearest(float value)
 {
+#if defined(USE_SSE2NEON)
+    const int rounding = std::fegetround();
+    const bool changed = rounding != -1 && rounding != FE_TONEAREST &&
+                         std::fesetround(FE_TONEAREST) == 0;
+    const float result = _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value)));
+    if (changed)
+        std::fesetround(rounding);
+    return result;
+#else
     const uint32_t csr = _mm_getcsr();
     _mm_setcsr(csr & ~0x6000u);
     const float result = _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value)));
     _mm_setcsr(csr);
     return result;
+#endif
 }
 
 inline float ps2FpuDivide(uint32_t &fcr31, float dividend, float divisor)

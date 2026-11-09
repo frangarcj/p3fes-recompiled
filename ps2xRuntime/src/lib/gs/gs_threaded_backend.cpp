@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_host_fenv.h"
 #include "runtime/gs/gs_shared_present.h"
 #include "ThreadPriority.h"
 #include "ThreadNaming.h"
@@ -12,13 +13,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
-#include <xmmintrin.h>
 
 namespace
 {
     constexpr size_t kPublishBytes = 64u * 1024u;
     constexpr size_t kMaxPendingChunks = 256u;
+    // The software GS is the main bottleneck on Apple Silicon. Keeping it on
+    // its own thread materially improves throughput while the native GPU path
+    // is still unavailable on macOS.
+#if defined(__APPLE__) && defined(__aarch64__)
+    std::atomic<bool> s_enabledByDefault{true};
+#else
     std::atomic<bool> s_enabledByDefault{false};
+#endif
     std::atomic<bool> s_gpuByDefault{false};
 
     bool discardDraws()
@@ -108,7 +115,7 @@ void GSThreadedBackend::SetGpuByDefault(bool enabled)
 void GSThreadedBackend::Enqueue(Op op, const void *payload, uint32_t size)
 {
     std::lock_guard<std::mutex> lock(m_producerMutex);
-    const uint32_t csr = _mm_getcsr();
+    const uint32_t csr = GSHostFenv::GetControlState();
     if (csr != m_lastMxcsr)
     {
         m_lastMxcsr = csr;
@@ -231,7 +238,7 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
         switch (op)
         {
         case Op::Mxcsr:
-            _mm_setcsr(readAt<uint32_t>(payload));
+            GSHostFenv::SetControlState(readAt<uint32_t>(payload));
             break;
         case Op::Submit:
             if (!discardDraws())

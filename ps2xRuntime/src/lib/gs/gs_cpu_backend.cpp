@@ -5,6 +5,7 @@
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/gs/gs_host_fenv.h"
 #include "gs_triangle_rules.h"
 #include "gs_sprite_rules.h"
 #include "ps2_log.h"
@@ -21,29 +22,14 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
-#include <xmmintrin.h>
 
 using namespace GSInternal;
 
 namespace
 {
     // The GS is independent of the SSE mode the EE/VU use when submitting. Keep the usual rounding of the
-    // approximate rasterizer, also with the thread; do not change FTZ/DAZ, masks or the caller's rounding.
-    class GSCpuRoundingScope
-    {
-        const unsigned rounding = _mm_getcsr() & _MM_ROUND_MASK;
-    public:
-        GSCpuRoundingScope()
-        {
-            if (rounding != _MM_ROUND_NEAREST)
-                _mm_setcsr(_mm_getcsr() & ~_MM_ROUND_MASK);
-        }
-        ~GSCpuRoundingScope()
-        {
-            if (rounding != _MM_ROUND_NEAREST)
-                _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | rounding);
-        }
-    };
+    // approximate rasterizer, also with the thread, and restore the caller's rounding afterwards.
+    using GSCpuRoundingScope = GSHostFenv::NearestRoundingScope;
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;

@@ -237,6 +237,16 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
     current.height = height;
     current.borrowed = current.blank = false;
     current.frame = {};
+    GSSharedPresent::Frame captured{};
+    captured.texture = fallback.id;
+    captured.width = width;
+    captured.height = height;
+    captured.sequence = vsyncTick != 0u ? vsyncTick : 1u;
+    captured.displayFbp = displayFbp;
+    captured.sourceFbp = sourceFbp;
+    captured.usedPreferred = preferred;
+    captured.vsyncTick = vsyncTick;
+    acquiredCapture.capture(captured, vsyncTick, "ram_upload");
     return current;
 }
 

@@ -55,7 +55,8 @@ GSHostAcquiredCapture::GSHostAcquiredCapture(Options selected) : options(std::mo
     if (options.limit == 0u || options.limit > 16u) options.directory.clear();
 }
 
-bool GSHostAcquiredCapture::capture(const GSSharedPresent::Frame &frame, uint64_t hostTick) noexcept
+bool GSHostAcquiredCapture::capture(const GSSharedPresent::Frame &frame, uint64_t hostTick,
+                                    const char *source) noexcept
 {
     // with no option, outside the window or with a held sequence there are no GL calls and no I/O.
     if (options.directory.empty() || attempts >= options.limit || hostTick < options.fromTick ||
@@ -92,7 +93,7 @@ bool GSHostAcquiredCapture::capture(const GSSharedPresent::Frame &frame, uint64_
         imageOutput.close();
         if (!imageOutput) throw std::runtime_error("No se pudo escribir PNG completo");
         std::ofstream metadata(metadataPath, std::ios::binary);
-        metadata << "{\n  \"source\": \"acquired_texture\",\n  \"seq\": " << frame.sequence
+        metadata << "{\n  \"source\": \"" << (source ? source : "host_texture") << "\",\n  \"seq\": " << frame.sequence
                  << ",\n  \"render\": " << frame.renderSequence << ",\n  \"hostTick\": " << hostTick
                  << ",\n  \"frameTick\": " << frame.vsyncTick << ",\n  \"displayFbp\": " << frame.displayFbp
                  << ",\n  \"sourceFbp\": " << frame.sourceFbp << ",\n  \"preferred\": " << unsigned(frame.usedPreferred)
