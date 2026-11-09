@@ -32,8 +32,11 @@ representation. The conversion follows the approach used by
 `eb07fc0f9d69e62c7aeee6307be5c2ef162f4ee6` (GPL-3.0-or-later). PS2 texture decoding
 stays on the existing offline Virtual-AK path for now; the probe deliberately does not
 load the RMD texture dictionary. It is diagnostic tooling, not a runtime dependency.
-The same option also builds `p3fes_rw_viewer`, which uploads that neutral geometry
-directly to raylib/OpenGL and renders an RMD without the emulated GS or an intermediate
-glTF file. It is intentionally untextured while the PS2 raster path remains separate.
+The same option also builds `p3fes_rw_viewer`. Its RMD path now talks to the small
+platform-neutral interface in `p3fes/native_renderer/` (inspired by Celosia's
+`native_renderer` boundary), rather than to raylib directly. The current desktop backend
+uses raylib/OpenGL; a Vita backend can implement the same upload/draw contract on vitaGL.
+The viewer therefore renders an RMD without the emulated GS or an intermediate glTF file.
+It is intentionally untextured while the PS2 raster path remains separate.
 
 Do not commit extracted game assets or converted output.

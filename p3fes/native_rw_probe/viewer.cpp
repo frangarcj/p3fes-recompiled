@@ -1,8 +1,7 @@
 #include <rw.h>
-#include <raylib.h>
-#include <raymath.h>
 
 #include "mesh_convert.h"
+#include "../native_renderer/renderer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -95,79 +95,29 @@ bool parseArgs(int argc, char **argv, Options &out)
     return true;
 }
 
-std::vector<std::uint16_t> triangleList(const p3fes::native_rw::MeshData &mesh)
-{
-    std::vector<std::uint16_t> out;
-    if (!mesh.triangleStrip)
-    {
-        out.reserve(mesh.indices.size());
-        for (std::uint32_t index : mesh.indices)
-            out.push_back(static_cast<std::uint16_t>(index));
-        return out;
-    }
-
-    for (const p3fes::native_rw::Submesh &submesh : mesh.submeshes)
-    {
-        const std::size_t begin = submesh.firstIndex;
-        const std::size_t end = begin + submesh.indexCount;
-        for (std::size_t i = begin + 2; i < end; ++i)
-        {
-            std::uint32_t a = mesh.indices[i - 2];
-            std::uint32_t b = mesh.indices[i - 1];
-            const std::uint32_t c = mesh.indices[i];
-            if (a == b || b == c || a == c)
-                continue;
-            if (((i - begin) & 1u) != 0u)
-                std::swap(a, b);
-            out.push_back(static_cast<std::uint16_t>(a));
-            out.push_back(static_cast<std::uint16_t>(b));
-            out.push_back(static_cast<std::uint16_t>(c));
-        }
-    }
-    return out;
-}
-
-Mesh makeRaylibMesh(const p3fes::native_rw::MeshData &source)
-{
-    Mesh mesh{};
-    mesh.vertexCount = static_cast<int>(source.vertices.size());
-    const std::vector<std::uint16_t> indices = triangleList(source);
-    mesh.triangleCount = static_cast<int>(indices.size() / 3);
-    mesh.vertices = static_cast<float *>(MemAlloc(sizeof(float) * source.vertices.size() * 3));
-    mesh.normals = static_cast<float *>(MemAlloc(sizeof(float) * source.vertices.size() * 3));
-    mesh.texcoords = static_cast<float *>(MemAlloc(sizeof(float) * source.vertices.size() * 2));
-    mesh.colors = static_cast<unsigned char *>(MemAlloc(sizeof(unsigned char) * source.vertices.size() * 4));
-    mesh.indices = static_cast<unsigned short *>(MemAlloc(sizeof(unsigned short) * indices.size()));
-
-    for (std::size_t i = 0; i < source.vertices.size(); ++i)
-    {
-        const auto &vertex = source.vertices[i];
-        std::memcpy(mesh.vertices + i * 3, vertex.position.data(), sizeof(float) * 3);
-        std::memcpy(mesh.normals + i * 3, vertex.normal.data(), sizeof(float) * 3);
-        std::memcpy(mesh.texcoords + i * 2, vertex.texCoord.data(), sizeof(float) * 2);
-        std::memcpy(mesh.colors + i * 4, vertex.color.data(), 4);
-    }
-    std::memcpy(mesh.indices, indices.data(), sizeof(unsigned short) * indices.size());
-    UploadMesh(&mesh, false);
-    return mesh;
-}
-
 struct Bounds
 {
-    Vector3 min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
-    Vector3 max{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
+    std::array<float, 3> min{
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+    };
+    std::array<float, 3> max{
+        -std::numeric_limits<float>::max(),
+        -std::numeric_limits<float>::max(),
+        -std::numeric_limits<float>::max(),
+    };
 };
 
-void include(Bounds &bounds, const p3fes::native_rw::MeshData &mesh)
+void include(Bounds &bounds, const p3fes::native_renderer::MeshData &mesh)
 {
     for (const auto &vertex : mesh.vertices)
     {
-        bounds.min.x = std::min(bounds.min.x, vertex.position[0]);
-        bounds.min.y = std::min(bounds.min.y, vertex.position[1]);
-        bounds.min.z = std::min(bounds.min.z, vertex.position[2]);
-        bounds.max.x = std::max(bounds.max.x, vertex.position[0]);
-        bounds.max.y = std::max(bounds.max.y, vertex.position[1]);
-        bounds.max.z = std::max(bounds.max.z, vertex.position[2]);
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            bounds.min[axis] = std::min(bounds.min[axis], vertex.position[axis]);
+            bounds.max[axis] = std::max(bounds.max[axis], vertex.position[axis]);
+        }
     }
 }
 } // namespace
@@ -203,7 +153,7 @@ int main(int argc, char **argv)
     if (clump == nullptr)
         return 1;
 
-    std::vector<p3fes::native_rw::MeshData> neutralMeshes;
+    std::vector<p3fes::native_renderer::MeshData> neutralMeshes;
     Bounds bounds;
     FORLIST(lnk, clump->atomics)
     {
@@ -227,57 +177,53 @@ int main(int argc, char **argv)
     if (neutralMeshes.empty())
         return 1;
 
-    SetTraceLogLevel(LOG_WARNING);
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
-    InitWindow(960, 544, "Persona 3 FES direct RenderWare viewer");
+    std::unique_ptr<p3fes::native_renderer::Renderer> renderer =
+        p3fes::native_renderer::createDesktopRenderer();
+    std::string renderError;
+    if (!renderer->open(960, 544, "Persona 3 FES direct RenderWare viewer", renderError))
+    {
+        std::fprintf(stderr, "Could not open native renderer: %s\n", renderError.c_str());
+        return 1;
+    }
+    for (std::size_t i = 0; i < neutralMeshes.size(); ++i)
+    {
+        if (!renderer->uploadMesh(static_cast<p3fes::native_renderer::MeshId>(i + 1), neutralMeshes[i], renderError))
+        {
+            std::fprintf(stderr, "Could not upload atomic %zu: %s\n", i, renderError.c_str());
+            return 1;
+        }
+    }
 
-    std::vector<Mesh> meshes;
-    meshes.reserve(neutralMeshes.size());
-    for (const auto &mesh : neutralMeshes)
-        meshes.push_back(makeRaylibMesh(mesh));
-    Material material = LoadMaterialDefault();
-
-    const Vector3 center{
-        (bounds.min.x + bounds.max.x) * 0.5f,
-        (bounds.min.y + bounds.max.y) * 0.5f,
-        (bounds.min.z + bounds.max.z) * 0.5f,
+    const std::array<float, 3> center{
+        (bounds.min[0] + bounds.max[0]) * 0.5f,
+        (bounds.min[1] + bounds.max[1]) * 0.5f,
+        (bounds.min[2] + bounds.max[2]) * 0.5f,
     };
-    const float dx = bounds.max.x - bounds.min.x;
-    const float dy = bounds.max.y - bounds.min.y;
-    const float dz = bounds.max.z - bounds.min.z;
+    const float dx = bounds.max[0] - bounds.min[0];
+    const float dy = bounds.max[1] - bounds.min[1];
+    const float dz = bounds.max[2] - bounds.min[2];
     const float radius = std::max({dx, dy, dz, 1.0f}) * 0.75f;
 
-    Camera3D camera{};
+    p3fes::native_renderer::Camera camera{};
     camera.target = center;
-    camera.position = {center.x + radius * 1.6f, center.y + radius * 0.8f, center.z + radius * 1.6f};
-    camera.up = {0.0f, 1.0f, 0.0f};
+    camera.position = {center[0] + radius * 1.6f, center[1] + radius * 0.8f, center[2] + radius * 1.6f};
     camera.fovy = 45.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
-    SetTargetFPS(60);
+    renderer->setTargetFps(60);
 
     int frame = 0;
-    while (!WindowShouldClose() && (options.frames <= 0 || frame < options.frames))
+    while (!renderer->shouldClose() && (options.frames <= 0 || frame < options.frames))
     {
         const float phase = static_cast<float>(frame) * 0.008f;
-        camera.position.x = center.x + std::cos(phase) * radius * 2.2f;
-        camera.position.z = center.z + std::sin(phase) * radius * 2.2f;
+        camera.position[0] = center[0] + std::cos(phase) * radius * 2.2f;
+        camera.position[2] = center[2] + std::sin(phase) * radius * 2.2f;
 
-        BeginDrawing();
-        ClearBackground(BLACK);
-        BeginMode3D(camera);
-        for (const Mesh &mesh : meshes)
-            DrawMesh(mesh, material, MatrixIdentity());
-        DrawGrid(20, std::max(radius * 0.1f, 1.0f));
-        EndMode3D();
-        DrawText(TextFormat("%s  atomics:%d", GetFileName(options.modelPath), static_cast<int>(meshes.size())),
-                 12, 12, 20, RAYWHITE);
-        EndDrawing();
+        renderer->beginFrame(camera, {});
+        for (std::size_t i = 0; i < neutralMeshes.size(); ++i)
+            renderer->drawMesh(static_cast<p3fes::native_renderer::MeshId>(i + 1));
+        renderer->endFrame();
         ++frame;
     }
 
-    UnloadMaterial(material);
-    for (Mesh &mesh : meshes)
-        UnloadMesh(mesh);
-    CloseWindow();
+    renderer->close();
     return 0;
 }

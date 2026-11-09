@@ -9,7 +9,7 @@
 
 namespace p3fes::native_rw
 {
-std::optional<MeshData> convertGeometry(rw::Geometry &geometry, std::string &error)
+std::optional<native_renderer::MeshData> convertGeometry(rw::Geometry &geometry, std::string &error)
 {
     if ((geometry.flags & rw::Geometry::NATIVE) != 0)
     {
@@ -31,7 +31,7 @@ std::optional<MeshData> convertGeometry(rw::Geometry &geometry, std::string &err
 
     const rw::MorphTarget &target = geometry.morphTargets[0];
     const rw::Skin *skin = rw::Skin::get(&geometry);
-    MeshData out;
+    native_renderer::MeshData out;
     out.hasNormals = target.normals != nullptr;
     out.hasPrelight = geometry.colors != nullptr;
     out.skinned = skin != nullptr;
@@ -40,7 +40,7 @@ std::optional<MeshData> convertGeometry(rw::Geometry &geometry, std::string &err
 
     for (std::size_t i = 0; i < out.vertices.size(); ++i)
     {
-        Vertex &vertex = out.vertices[i];
+        native_renderer::Vertex &vertex = out.vertices[i];
         const rw::V3d &position = target.vertices[i];
         vertex.position = {position.x, position.y, position.z};
         if (out.hasNormals)
