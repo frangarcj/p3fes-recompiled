@@ -140,7 +140,65 @@ if(PS2X_DEFAULT_BOOT_ELF)
     string(REPLACE "\"" "\\\"" PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF_DEFINE}")
 endif()
 
-if(PS2X_IS_VITA)
+option(PS2X_VITA_SDL2_SHIM
+    "Vita: implement the raylib subset on SDL2/GXM instead of raylib-vita + PVR GLES"
+    ON)
+
+if(PS2X_IS_VITA AND PS2X_VITA_SDL2_SHIM)
+    # Reused from HenryKun55/celosia (GPL-3.0): keep the host-facing raylib
+    # surface while rendering through vitaGL/GXM and using SDL2 for audio.
+    set(PS2X_VITA_PREFIX "${PS2X_VITASDK}/arm-vita-eabi")
+    set(PS2X_VITA_VITAGL_DIR "" CACHE PATH
+        "vitaGL source tree with libvitaGL.a built (empty: use the VitaSDK copy)")
+    set(PS2X_VITA_VITAGL vitaGL)
+    if(PS2X_VITA_VITAGL_DIR)
+        set(PS2X_VITA_VITAGL "${PS2X_VITA_VITAGL_DIR}/libvitaGL.a")
+    endif()
+
+    add_library(ps2x_vita_raylib STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/raylib/raylib_vita.cpp")
+    if(PS2X_VITA_VITAGL_DIR)
+        target_include_directories(ps2x_vita_raylib BEFORE PUBLIC
+            "${PS2X_VITA_VITAGL_DIR}/source")
+    endif()
+    target_include_directories(ps2x_vita_raylib PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/raylib"
+        "${PS2X_VITA_PREFIX}/include")
+    target_link_libraries(ps2x_vita_raylib PUBLIC
+        SDL2
+        ${PS2X_VITA_VITAGL}
+        vitashark
+        SceShaccCgExt
+        mathneon
+        SceShaccCg_stub
+        taihen_stub
+        SceDisplay_stub
+        SceCtrl_stub
+        SceTouch_stub
+        SceGxm_stub
+        SceAudio_stub
+        SceAudioIn_stub
+        SceSysmodule_stub
+        SceHid_stub
+        SceMotion_stub
+        SceAppMgr_stub
+        SceAppUtil_stub
+        SceCommonDialog_stub
+        SceIme_stub
+        ScePower_stub
+        SceLibKernel_stub
+        SceProcessmgr_stub
+        SceKernelDmacMgr_stub
+        SceIofilemgr_stub
+        SceRtc_stub
+        -Wl,--whole-archive pthread -Wl,--no-whole-archive
+        m
+        c)
+    target_compile_definitions(ps2_host_backend INTERFACE
+        PLATFORM_VITA
+        PS2X_VITA_SDL2_SHIM=1)
+    target_link_libraries(ps2_host_backend INTERFACE ps2x_vita_raylib)
+elseif(PS2X_IS_VITA)
     set(PS2X_VITA_PREFIX "${PS2X_VITASDK}/arm-vita-eabi")
     set(PS2X_VITA_EXTRA_INCLUDE_DIRS "" CACHE STRING "Extra include directories for Vita host dependencies")
     set(PS2X_VITA_LIBRARY_DIR "${PS2X_VITA_PREFIX}/lib")

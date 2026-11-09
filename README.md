@@ -172,6 +172,8 @@ Debug traces: `PS2X_SPU2_DIAG`, `PS2X_GS_DIAG`, `PS2X_IPU_TRACE`, `PS2X_DMA_LOG`
 - [god-of-war-recomp](https://github.com/KIexster/god-of-war-recomp) by KIexster: SPU2, SIO2, IOP and VU1 work and many
   EE/GS fixes, merged here, plus the status map design.
 - Taylor N. Albarnaz / LightVelox's Shadow of the Colossus fork of PS2Recomp: the OpenGL GS backend (via god-of-war-recomp).
+- [Celosia](https://github.com/HenryKun55/celosia) by HenryKun55: the Vita SDL2/vitaGL host shim and
+  reference architecture for sharing a PS2Recomp runtime between Apple Silicon and PS Vita.
 - [urban-reign-recomp](https://github.com/thiagordsfx/urban-reign-recomp) by thiagordsfx: the PCSX2 GS bridge design.
 - [PCSX2](https://github.com/PCSX2/pcsx2): the IPU, the GS and microVU (VU1 recompiler), and the accuracy reference.
 - [KillzoneRecomp](https://github.com/drakolordx7/KillzoneRecomp) by drakolordx7: kzvu, PCSX2's microVU packaged for
