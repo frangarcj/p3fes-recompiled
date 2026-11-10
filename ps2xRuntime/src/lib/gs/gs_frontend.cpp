@@ -2,6 +2,7 @@
 #include "runtime/gs/gs_cpu_backend.h"
 // CPU reference renderer by default; OpenGL/queue selectable.
 #include "runtime/gs/gs_threaded_backend.h"
+#include "runtime/gs/gs_direct_frame.h"
 #include "runtime/gs/gs_shared_present.h"
 #include "ps2_log.h"
 #include "runtime/ps2_perf.h"
@@ -32,6 +33,22 @@ namespace
         if (outDisplayFbp) *outDisplayFbp = 0u;
         if (outSourceFbp) *outSourceFbp = 0u;
         if (outUsedPreferred) *outUsedPreferred = false;
+
+        // Celosia's hardware GS can return a shared GL texture record instead
+        // of CPU RGBA rows. Preserve that tiny transport record verbatim; the
+        // host presentation layer knows how to wait for and sample it.
+        GSDirectFrame direct{};
+        if (width != 0u && height != 0u && GSDirectFrame::load(pixels, direct))
+        {
+            outPixels = pixels;
+            outWidth = width;
+            outHeight = height;
+            if (outDisplayFbp) *outDisplayFbp = displayFbp;
+            if (outSourceFbp) *outSourceFbp = sourceFbp;
+            if (outUsedPreferred) *outUsedPreferred = usedPreferred;
+            return true;
+        }
+
         const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
         const size_t packedRowBytes = static_cast<size_t>(width) * 4u;
         if (width == 0u || height == 0u || width > kHostFrameWidth ||

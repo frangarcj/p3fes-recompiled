@@ -1,5 +1,6 @@
 // host context, frame selection and raylib drawing used by the port.
 #include "runtime/gs/gs_host_present.h"
+#include "runtime/gs/gs_direct_frame.h"
 #include "runtime/gs/gs_host_present_diag.h" // window without extra GPU reads.
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_pcsx2.h"
@@ -13,6 +14,11 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
+
+#if defined(__APPLE__) && !defined(PLATFORM_VITA)
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl3.h>
+#endif
 
 namespace
 {
@@ -35,6 +41,16 @@ namespace
     constexpr uint32_t kWidth = 640u;
     constexpr uint32_t kHeight = 512u;
     constexpr uint32_t kDisplayHeight = 448u;
+
+    void waitDirectFrame(uint64_t fence)
+    {
+#if defined(__APPLE__) && !defined(PLATFORM_VITA)
+        if (fence != 0u)
+            glWaitSync(reinterpret_cast<GLsync>(static_cast<uintptr_t>(fence)), 0u, GL_TIMEOUT_IGNORED);
+#else
+        (void)fence;
+#endif
+    }
 }
 
 void GSHostPresentation::captureHostContext()
@@ -273,6 +289,23 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
     lastPreferred = preferred;
     lastWidth = width;
     lastHeight = height;
+
+    GSDirectFrame direct{};
+    if (GSDirectFrame::load(scratch, direct))
+    {
+        waitDirectFrame(direct.fence);
+        current = {};
+        current.texture = Texture2D{direct.texture, static_cast<int>(width), static_cast<int>(height),
+                                    1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        current.width = width;
+        current.height = height;
+        current.borrowed = true;
+        current.blank = false;
+        uploaded = true;
+        uploadedBlank = false;
+        return current;
+    }
+
     std::fill(upload.begin(), upload.end(), 0u);
     const uint32_t copyWidth = std::min(width, kWidth);
     const uint32_t copyHeight = std::min(height, kHeight);

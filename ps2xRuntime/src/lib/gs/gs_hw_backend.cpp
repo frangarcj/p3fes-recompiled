@@ -2799,6 +2799,8 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
     std::array<PresentSlot, 12> presentRing{}; // more than the frames GSAsyncBackend keeps
     uint32_t presentNext = 0;
     std::array<uint64_t, 4> lastPresentKey{};
+    GSDirectFrame lastDirectFrame{};
+    uint32_t lastDirectWidth = 0u, lastDirectHeight = 0u, lastDirectFbp = 0u;
 
     // PS2X_SNAPSHOT_FRAMES=<n>,<n>,...: save the first picture shown from
     // game frame n on, as <PS2X_SNAPSHOT_DIR>/gameframe_<n>.ppm (same moment of a
@@ -2869,11 +2871,6 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
     // picture did not change (no new frame).
     bool presentDirect(const GSPresentationRequest &request, PresentationFrame &frame)
     {
-#if !defined(PS2X_GS_HW_VITA)
-        (void)request;
-        (void)frame;
-        return false;
-#else
         // Keep zero-copy behind a second opt-in while the Celosia backend is
         // being brought up on Persona 3. CPU readback remains the correctness
         // fallback whenever the current display configuration is unsupported.
@@ -2914,11 +2911,20 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         const std::array<uint64_t, 4> key{static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(width) << 16) | (static_cast<uint64_t>(height) << 32),
                                           rt.version, dispfb, display};
         // P3FES latches at most once per guest vsync, so an identical target
-        // version/CRTC tuple means the already-presented GPU texture is still
-        // current. Celosia gates this with a request flag that this runtime's
-        // presentation contract does not carry.
+        // version/CRTC tuple can reuse the previous direct texture. Returning
+        // its transport record matters on desktop, where the host consumes it
+        // after Present(); Vita already showed that texture from the GS hook.
         if (key == lastPresentKey)
+        {
+            if (lastDirectFrame.texture == 0u)
+                return false;
+            lastDirectFrame.store(frame.pixels);
+            frame.width = lastDirectWidth;
+            frame.height = lastDirectHeight;
+            frame.displayFbp = lastDirectFbp;
+            frame.sourceFbp = lastDirectFbp;
             return true;
+        }
         lastPresentKey = key;
 
         PresentSlot &slot = presentRing[presentNext++ % presentRing.size()];
@@ -2976,9 +2982,12 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         frame.height = height;
         frame.displayFbp = fbp;
         frame.sourceFbp = fbp;
+        lastDirectFrame = direct;
+        lastDirectWidth = width;
+        lastDirectHeight = height;
+        lastDirectFbp = fbp;
         ++stats.directPresents;
         return true;
-#endif
     }
 
     // A draw sampling a render target the queued draws write: draw those first.
