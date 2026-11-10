@@ -378,12 +378,15 @@ public:
         glLoadMatrixf(view.data());
     }
 
-    void drawMesh(MeshId id) override
+    void drawMesh(MeshId id, const Matrix4 &model) override
     {
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
             return;
 
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glMultMatrixf(model.data());
         glEnableClientState(GL_VERTEX_ARRAY);
         glEnableClientState(GL_COLOR_ARRAY);
         for (const DrawPart &part : found->second)
@@ -414,6 +417,7 @@ public:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glDisable(GL_TEXTURE_2D);
+        glPopMatrix();
     }
 
     void endFrame() override

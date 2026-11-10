@@ -97,6 +97,14 @@ if(PS2X_BUILD_RUNTIME)
     add_subdirectory("ps2xIOP")
     add_subdirectory("ps2xRuntime")
     add_subdirectory("p3fes/native_renderer")
+    if(TARGET p3fes_native_renderer_platform)
+        # The opt-in Persona 3 HLE renderer runs inside the runtime's existing
+        # host graphics context; keep the renderer itself as a small reusable
+        # platform library rather than duplicating it in game-overrides code.
+        target_link_libraries(ps2_runtime PRIVATE
+            p3fes_native_model
+            p3fes_native_renderer_platform)
+    endif()
     option(P3FES_BUILD_NATIVE_VIEWER "Build the Persona 3 native asset viewer on desktop" ON)
     if(P3FES_BUILD_NATIVE_VIEWER AND NOT ANDROID AND
        NOT CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi")

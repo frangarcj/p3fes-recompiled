@@ -276,7 +276,7 @@ public:
         BeginMode3D(m_camera);
     }
 
-    void drawMesh(MeshId id) override
+    void drawMesh(MeshId id, const Matrix4 &model) override
     {
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
@@ -296,7 +296,15 @@ public:
                 if (texture != m_textures.end())
                     diffuse.texture = texture->second;
             }
-            DrawMesh(part.mesh, drawMaterial, MatrixIdentity());
+            // Matrix4 uses the normal OpenGL column-major order. raylib's
+            // Matrix struct names are laid out by rows, so spell the mapping
+            // out rather than relying on the struct's memory layout.
+            const Matrix transform{
+                model[0], model[4], model[8], model[12],
+                model[1], model[5], model[9], model[13],
+                model[2], model[6], model[10], model[14],
+                model[3], model[7], model[11], model[15]};
+            DrawMesh(part.mesh, drawMaterial, transform);
         }
     }
 

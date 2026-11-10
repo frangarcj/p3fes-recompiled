@@ -30,6 +30,7 @@ namespace
         uint32_t width = 0u, height = 0u;
         uint64_t serial = 0u;
     } s_pcsx2;
+    std::atomic<bool> s_externalPresentationActive{false};
 
     void releasePcsx2View()
     {
@@ -57,6 +58,11 @@ namespace
         (void)fence;
 #endif
     }
+}
+
+void ps2xSetExternalPresentationActive(bool active)
+{
+    s_externalPresentationActive.store(active, std::memory_order_release);
 }
 
 void GSHostPresentation::captureHostContext()
@@ -369,6 +375,14 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
 
 GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncTick, const std::function<void()> &overlay)
 {
+    if (s_externalPresentationActive.load(std::memory_order_acquire))
+    {
+        // The HLE/native renderer already swapped a progressive host frame.
+        // Keep input/window events moving, but never paint an interlaced GS
+        // fallback over that native picture.
+        PollInputEvents();
+        return current;
+    }
     View selected;
     {
         ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
@@ -428,6 +442,7 @@ void GSHostPresentation::shutdown(GS &gs)
     workerDirectHeight.store(0u, std::memory_order_relaxed);
     workerDirectLastNs.store(0u, std::memory_order_relaxed);
     workerDirectActive.store(false, std::memory_order_release);
+    s_externalPresentationActive.store(false, std::memory_order_release);
     started = captureRequested = hasLatched = uploaded = uploadedBlank = modeKnown = sharedMode = false;
     lastTick = lastSharedSequence = 0u;
     current = {};

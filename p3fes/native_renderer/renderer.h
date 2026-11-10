@@ -14,6 +14,14 @@
 namespace p3fes::native_renderer
 {
 using MeshId = std::uint64_t;
+using Matrix4 = std::array<float, 16>;
+
+inline constexpr Matrix4 kIdentityMatrix{
+    1.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 1.0f,
+};
 
 struct Camera
 {
@@ -47,7 +55,8 @@ public:
     virtual void removeMesh(MeshId id) = 0;
 
     virtual void beginFrame(const Camera &camera, ClearColor clear) = 0;
-    virtual void drawMesh(MeshId id) = 0;
+    virtual void drawMesh(MeshId id, const Matrix4 &model) = 0;
+    void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix); }
     virtual void endFrame() = 0;
 };
 
