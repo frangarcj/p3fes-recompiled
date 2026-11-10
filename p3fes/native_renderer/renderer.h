@@ -70,7 +70,8 @@ public:
     virtual void drawMesh(MeshId id, const Matrix4 &model) = 0;
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix); }
     virtual void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
-                                     float sourceWidth, float sourceHeight) = 0;
+                                     float sourceWidth, float sourceHeight,
+                                     std::string_view textureName = {}) = 0;
     virtual void endFrame() = 0;
 };
 

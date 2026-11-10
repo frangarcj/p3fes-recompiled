@@ -40,6 +40,7 @@ struct GpuVertex
 struct ScreenGpuVertex
 {
     float x, y, z;
+    float u, v;
     std::uint8_t r, g, b, a;
 };
 
@@ -418,18 +419,32 @@ public:
     }
 
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
-                             float sourceWidth, float sourceHeight) override
+                             float sourceWidth, float sourceHeight,
+                             std::string_view textureName) override
     {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
         std::vector<ScreenGpuVertex> gpu;
         gpu.reserve(vertices.size());
         for (const ScreenVertex &v : vertices)
-            gpu.push_back({v.x, v.y, v.z, v.color[0], v.color[1], v.color[2], v.color[3]});
+            gpu.push_back({v.x, v.y, v.z, v.u, v.v, v.color[0], v.color[1], v.color[2], v.color[3]});
 
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
-        glDisable(GL_TEXTURE_2D);
+        GLuint texture = 0u;
+        if (!textureName.empty())
+        {
+            const auto found = m_textures.find(textureKey(textureName));
+            if (found != m_textures.end())
+                texture = found->second;
+        }
+        if (texture)
+        {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, texture);
+        }
+        else
+            glDisable(GL_TEXTURE_2D);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         glOrthof(0.0f, sourceWidth, sourceHeight, 0.0f, -1.0f, 1.0f);
@@ -439,12 +454,21 @@ public:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glEnableClientState(GL_VERTEX_ARRAY);
         glEnableClientState(GL_COLOR_ARRAY);
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        if (texture)
+        {
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(ScreenGpuVertex), &gpu[0].u);
+        }
+        else
+            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glVertexPointer(3, GL_FLOAT, sizeof(ScreenGpuVertex), &gpu[0].x);
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenGpuVertex), &gpu[0].r);
         glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(gpu.size()));
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);
         glDisableClientState(GL_VERTEX_ARRAY);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_TEXTURE_2D);
         m_in3D = false;
     }
 

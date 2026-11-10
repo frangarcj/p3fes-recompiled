@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -54,6 +56,7 @@ namespace
     constexpr uint32_t kSkyIm2DRenderIndexedPrimitive = 0x004EEB50u;
     constexpr uint32_t kRwGp = 0x007D2CF0u;
     constexpr uint32_t kRwRenderFlags = kRwGp - 20272u;
+    constexpr uint32_t kRwCurrentRaster = kRwGp - 16948u;
     constexpr uint64_t kGsPrimTextureEnable = 0x10u;
     constexpr float kRwScreenWidth = 640.0f;
     constexpr float kRwScreenHeight = 448.0f;
@@ -66,6 +69,7 @@ namespace
     std::atomic<bool> g_diagEnabled{false};
     std::atomic<bool> g_diagPrinted{false};
     std::atomic<bool> g_im2dDiagPrinted{false};
+    std::atomic<bool> g_im2dTextureDiagPrinted{false};
 
     template <typename T>
     bool readGuest(const uint8_t *rdram, uint32_t address, T &value)
@@ -165,9 +169,11 @@ namespace
     using p3fes::native_renderer::MeshId;
     using p3fes::native_renderer::ScreenVertex;
     using p3fes::native_renderer::Submesh;
+    using p3fes::native_renderer::TextureData;
     using p3fes::native_renderer::Vertex;
 
     std::unordered_set<MeshId> g_definedMeshes;
+    std::unordered_map<uint32_t, uint64_t> g_rasterRevisions;
     bool g_nativeFrameActive = false;
     uint32_t g_nativeErrors = 0u;
 
@@ -367,10 +373,204 @@ namespace
         return readGuest(rdram, kRwRenderFlags, flags) && (flags & kGsPrimTextureEnable) != 0u;
     }
 
+    struct RasterSummary
+    {
+        uint32_t raster = 0u;
+        uint32_t pixels = 0u;
+        uint32_t palette = 0u;
+        int32_t width = 0;
+        int32_t height = 0;
+        int32_t depth = 0;
+        int32_t stride = 0;
+        uint8_t type = 0u;
+        uint8_t cache = 0u;
+        uint8_t lock = 0u;
+        uint8_t format = 0u;
+    };
+
+    bool inspectRaster(const uint8_t *rdram, uint32_t raster, RasterSummary &summary)
+    {
+        if (!guestPointer(raster, 52u))
+            return false;
+        summary.raster = raster;
+        return readGuest(rdram, raster + 4u, summary.pixels) &&
+               readGuest(rdram, raster + 8u, summary.palette) &&
+               readGuest(rdram, raster + 12u, summary.width) &&
+               readGuest(rdram, raster + 16u, summary.height) &&
+               readGuest(rdram, raster + 20u, summary.depth) &&
+               readGuest(rdram, raster + 24u, summary.stride) &&
+               readGuest(rdram, raster + 32u, summary.type) &&
+               readGuest(rdram, raster + 33u, summary.cache) &&
+               readGuest(rdram, raster + 34u, summary.lock) &&
+               readGuest(rdram, raster + 35u, summary.format);
+    }
+
+    uint64_t hashBytes(uint64_t hash, const uint8_t *bytes, size_t size)
+    {
+        constexpr uint64_t kPrime = 1099511628211ull;
+        for (size_t i = 0; i < size; ++i)
+        {
+            hash ^= bytes[i];
+            hash *= kPrime;
+        }
+        return hash;
+    }
+
+    std::string rasterTextureName(uint32_t raster)
+    {
+        char name[24];
+        std::snprintf(name, sizeof(name), "rw-raster-%08X", raster);
+        return name;
+    }
+
+    std::array<uint8_t, 4> decodeRasterColor16(uint16_t value, uint8_t format)
+    {
+        switch (format & 0x0Fu)
+        {
+        case 2u: // rwRASTERFORMAT565
+            return {static_cast<uint8_t>(((value >> 0u) & 31u) * 255u / 31u),
+                    static_cast<uint8_t>(((value >> 5u) & 63u) * 255u / 63u),
+                    static_cast<uint8_t>(((value >> 11u) & 31u) * 255u / 31u), 255u};
+        case 3u: // rwRASTERFORMAT4444
+            return {static_cast<uint8_t>(((value >> 0u) & 15u) * 17u),
+                    static_cast<uint8_t>(((value >> 4u) & 15u) * 17u),
+                    static_cast<uint8_t>(((value >> 8u) & 15u) * 17u),
+                    static_cast<uint8_t>(((value >> 12u) & 15u) * 17u)};
+        default: // rwRASTERFORMAT1555 (the title's ordinary 16-bit direct colour)
+            return {static_cast<uint8_t>(((value >> 0u) & 31u) * 255u / 31u),
+                    static_cast<uint8_t>(((value >> 5u) & 31u) * 255u / 31u),
+                    static_cast<uint8_t>(((value >> 10u) & 31u) * 255u / 31u),
+                    static_cast<uint8_t>((value & 0x8000u) ? 255u : 0u)};
+        }
+    }
+
+    bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture, uint64_t &revision)
+    {
+        RasterSummary info;
+        if (!inspectRaster(rdram, raster, info) || info.width <= 0 || info.height <= 0 ||
+            info.width > 4096 || info.height > 4096 || info.stride <= 0)
+            return false;
+
+        const uint32_t type = info.type & 0x07u;
+        if (type != 4u && type != 5u) // texture / camera-texture only
+            return false;
+
+        size_t rowBytes = 0u;
+        switch (info.depth)
+        {
+        case 4: rowBytes = (static_cast<size_t>(info.width) + 1u) / 2u; break;
+        case 8: rowBytes = static_cast<size_t>(info.width); break;
+        case 16: rowBytes = static_cast<size_t>(info.width) * 2u; break;
+        case 24: rowBytes = static_cast<size_t>(info.width) * 3u; break;
+        case 32: rowBytes = static_cast<size_t>(info.width) * 4u; break;
+        default: return false;
+        }
+        if (static_cast<size_t>(info.stride) < rowBytes)
+            return false;
+        const uint64_t pixelEnd = static_cast<uint64_t>(info.pixels) +
+                                  static_cast<uint64_t>(info.stride) * static_cast<uint64_t>(info.height - 1) + rowBytes;
+        if (!guestPointer(info.pixels, 1u) || pixelEnd > PS2_RAM_SIZE)
+            return false;
+
+        const uint32_t paletteEntries = info.depth == 4 ? 16u : (info.depth == 8 ? 256u : 0u);
+        const uint32_t paletteEntryBytes = (info.format & 0x0Fu) == 1u ? 2u : 4u;
+        if (paletteEntries && !guestPointer(info.palette, paletteEntries * paletteEntryBytes))
+            return false;
+
+        texture.name = rasterTextureName(raster);
+        texture.width = static_cast<uint32_t>(info.width);
+        texture.height = static_cast<uint32_t>(info.height);
+        texture.rgba.resize(static_cast<size_t>(info.width) * static_cast<size_t>(info.height) * 4u);
+
+        constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+        uint64_t hash = kFnvOffset;
+        for (int32_t y = 0; y < info.height; ++y)
+        {
+            const uint64_t rowOffset = static_cast<uint64_t>(static_cast<uint32_t>(y)) *
+                                       static_cast<uint32_t>(info.stride);
+            const uint8_t *src = rdram + info.pixels + static_cast<uint32_t>(rowOffset);
+            hash = hashBytes(hash, src, rowBytes);
+            for (int32_t x = 0; x < info.width; ++x)
+            {
+                std::array<uint8_t, 4> color{};
+                if (info.depth == 4 || info.depth == 8)
+                {
+                    uint32_t index = info.depth == 8 ? src[x]
+                        : ((x & 1) ? (src[x >> 1] >> 4u) : (src[x >> 1] & 0x0Fu));
+                    // The sky driver keeps 256-entry CLUTs in GS CSM1 order
+                    // (middle index bits swapped); 16-entry CLUTs stay linear.
+                    if (info.depth == 8)
+                        index = (index & 0xE7u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
+                    if (paletteEntryBytes == 2u)
+                    {
+                        uint16_t packed = 0u;
+                        std::memcpy(&packed, rdram + info.palette + index * 2u, sizeof(packed));
+                        color = decodeRasterColor16(packed, 1u);
+                    }
+                    else
+                    {
+                        std::memcpy(color.data(), rdram + info.palette + index * 4u, 4u);
+                        // skyRasterWritePalette stores GS alpha (0..0x80), not
+                        // RenderWare's host alpha (0..0xFF).
+                        color[3] = static_cast<uint8_t>(std::min(255u, static_cast<uint32_t>(color[3]) * 2u));
+                    }
+                }
+                else if (info.depth == 16)
+                {
+                    uint16_t packed = 0u;
+                    std::memcpy(&packed, src + x * 2, sizeof(packed));
+                    color = decodeRasterColor16(packed, info.format);
+                }
+                else if (info.depth == 24)
+                    color = {src[x * 3u + 0u], src[x * 3u + 1u], src[x * 3u + 2u], 255u};
+                else
+                {
+                    std::memcpy(color.data(), src + x * 4u, 4u);
+                    // Direct RGBA8888 rasters are stored in GS colour form too.
+                    color[3] = static_cast<uint8_t>(std::min(255u, static_cast<uint32_t>(color[3]) * 2u));
+                }
+                std::memcpy(texture.rgba.data() + (static_cast<size_t>(y) * info.width + x) * 4u,
+                            color.data(), 4u);
+            }
+        }
+        if (paletteEntries)
+            hash = hashBytes(hash, rdram + info.palette, paletteEntries * paletteEntryBytes);
+        hash ^= (static_cast<uint64_t>(static_cast<uint32_t>(info.width)) << 32u) |
+                static_cast<uint32_t>(info.height);
+        revision = hash ? hash : 1u;
+
+        if (!g_im2dTextureDiagPrinted.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[p3fes-native] first native texture: raster=0x%08X type=%u fmt=0x%02X %dx%d depth=%d\n",
+                         raster, type, info.format, info.width, info.height, info.depth);
+        return true;
+    }
+
+    bool prepareNativeIm2DTexture(const uint8_t *rdram, std::string &textureName)
+    {
+        uint32_t raster = 0u;
+        if (!readGuest(rdram, kRwCurrentRaster, raster) || !raster)
+            return false;
+        TextureData texture;
+        uint64_t revision = 0u;
+        if (!decodeNativeRaster(rdram, raster, texture, revision))
+            return false;
+        textureName = texture.name;
+        const auto known = g_rasterRevisions.find(raster);
+        if (known == g_rasterRevisions.end() || known->second != revision)
+        {
+            p3fes_native_present::defineTexture(texture, revision);
+            g_rasterRevisions[raster] = revision;
+        }
+        return true;
+    }
+
     bool drawNativeIm2DTriangles(uint8_t *rdram, uint32_t vertices, uint32_t vertexCount,
                                  const std::vector<uint16_t> &triangles)
     {
-        if (vertexCount == 0u || vertexCount > 65535u || triangles.empty() || nativeIm2DTextured(rdram))
+        if (vertexCount == 0u || vertexCount > 65535u || triangles.empty())
+            return false;
+        std::string textureName;
+        if (nativeIm2DTextured(rdram) && !prepareNativeIm2DTexture(rdram, textureName))
             return false;
         std::vector<ScreenVertex> out;
         out.reserve(triangles.size());
@@ -385,7 +585,8 @@ namespace
         }
         if (!ensureNativeFrame(rdram))
             return false;
-        p3fes_native_present::drawScreenTriangles(std::move(out), kRwScreenWidth, kRwScreenHeight);
+        p3fes_native_present::drawScreenTriangles(std::move(out), kRwScreenWidth, kRwScreenHeight,
+                                                  std::move(textureName));
         return true;
     }
 
@@ -578,6 +779,7 @@ namespace
         g_nativeEnabled.store(nativeEnabled, std::memory_order_relaxed);
         g_diagPrinted.store(false, std::memory_order_relaxed);
         g_im2dDiagPrinted.store(false, std::memory_order_relaxed);
+        g_im2dTextureDiagPrinted.store(false, std::memory_order_relaxed);
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
         if (diagEnabled)

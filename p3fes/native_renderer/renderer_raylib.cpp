@@ -316,7 +316,8 @@ public:
     }
 
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
-                             float sourceWidth, float sourceHeight) override
+                             float sourceWidth, float sourceHeight,
+                             std::string_view textureName) override
     {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
@@ -327,7 +328,14 @@ public:
         }
         const float sx = static_cast<float>(std::max(GetScreenWidth(), 1)) / sourceWidth;
         const float sy = static_cast<float>(std::max(GetScreenHeight(), 1)) / sourceHeight;
-        rlSetTexture(0);
+        unsigned int textureId = 0u;
+        if (!textureName.empty())
+        {
+            const auto texture = m_textures.find(textureKey(textureName));
+            if (texture != m_textures.end())
+                textureId = texture->second.id;
+        }
+        rlSetTexture(textureId);
         rlDisableBackfaceCulling();
         rlBegin(RL_TRIANGLES);
         for (const ScreenVertex &v : vertices)
@@ -337,6 +345,7 @@ public:
             rlVertex3f(v.x * sx, v.y * sy, v.z);
         }
         rlEnd();
+        rlSetTexture(0);
     }
 
     void endFrame() override

@@ -13,6 +13,7 @@ inline void shutdownHost() {}
 
 #include "native_renderer/renderer.h"
 
+#include <string>
 #include <vector>
 
 namespace p3fes_native_present
@@ -24,8 +25,10 @@ void setActive(bool active);
 bool active();
 void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
 void defineMesh(nr::MeshId id, const nr::MeshData &mesh);
+void defineTexture(const nr::TextureData &texture, uint64_t revision);
 void drawMesh(nr::MeshId id, const nr::Matrix4 &model);
-void drawScreenTriangles(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight);
+void drawScreenTriangles(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight,
+                         std::string textureName = {});
 void endFrame();
 
 // Consumer side (host presentation thread): owns every graphics API call.
