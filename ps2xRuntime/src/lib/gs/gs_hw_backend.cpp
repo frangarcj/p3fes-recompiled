@@ -348,6 +348,99 @@ void main()
 }
 )";
 
+#if !defined(PS2X_GS_HW_VITA)
+    // Direct CRTC compositor. The layout/blend rules mirror GSGpuBackend's
+    // kPresent path, but sample the hardware renderer's live render-target
+    // textures instead of the raw GS-memory SSBO. This keeps the common dual
+    // circuit field setup off the CPU/write-back path.
+    const char *kPresentVertexShader = R"(#version 330 core
+void main()
+{
+    vec2 p = vec2((gl_VertexID & 1) != 0 ? 3.0 : -1.0, (gl_VertexID & 2) != 0 ? 3.0 : -1.0);
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+)";
+    const char *kPresentFragmentShader = R"(#version 330 core
+uniform sampler2D uTex1;
+uniform sampler2D uTex2;
+uniform ivec4 uOut;   // x0, y0, hstep, vstep
+uniform ivec2 uSize;  // output width, height
+uniform ivec4 uC1a;   // enabled, dbx, dby, psm
+uniform ivec4 uC1b;   // dx, dy, dw, dh
+uniform ivec2 uC1c;   // hdiv, vdiv
+uniform ivec4 uC2a;
+uniform ivec4 uC2b;
+uniform ivec2 uC2c;
+uniform ivec4 uMode;  // bgcolor RGB, (SLBG | MMOD << 1), ALP, field flags
+out vec4 oColor;
+
+bool covers(ivec4 a, ivec4 b, int rx, int ry)
+{
+    return a.x != 0 && rx >= b.x && rx < b.x + b.z && ry >= b.y && ry < b.y + b.w;
+}
+
+vec4 read1(int rx, int ry)
+{
+    ivec2 p = ivec2((rx - uC1b.x) / uC1c.x + uC1a.y,
+                    (ry - uC1b.y) / uC1c.y + uC1a.z);
+    return texelFetch(uTex1, p, 0);
+}
+
+vec4 read2(int rx, int ry)
+{
+    ivec2 p = ivec2((rx - uC2b.x) / uC2c.x + uC2a.y,
+                    (ry - uC2b.y) / uC2c.y + uC2a.z);
+    return texelFetch(uTex2, p, 0);
+}
+
+float ps2Alpha(vec4 c, int psm)
+{
+    // Render targets store GS alpha as A / 0x80. CT24 display reads force
+    // alpha to 0x80, matching GSCpuBackend/GSGpuBackend presentation.
+    return psm == 1 ? 128.0 : min(255.0, floor(c.a * 128.0 + 0.5));
+}
+
+vec3 byteRgb(vec4 c)
+{
+    return floor(c.rgb * 255.0 + 0.5);
+}
+
+void main()
+{
+    int ox = int(gl_FragCoord.x);
+    int oy = int(gl_FragCoord.y);
+    if (ox >= uSize.x || oy >= uSize.y)
+        discard;
+    int sourceY = oy;
+    if ((uMode.w & 1) != 0)
+        sourceY = min(((oy >> 1) << 1) + ((uMode.w >> 1) & 1), uSize.y - 1);
+    int rx = uOut.x + ox * uOut.z + uOut.z / 2;
+    int ry = uOut.y + sourceY * uOut.w + uOut.w / 2;
+    bool in1 = covers(uC1a, uC1b, rx, ry);
+    bool in2 = covers(uC2a, uC2b, rx, ry);
+
+    vec3 rgb = vec3(float(uMode.x & 255), float((uMode.x >> 8) & 255), float((uMode.x >> 16) & 255));
+    bool slbg = (uMode.y & 1) != 0;
+    bool mmod = (uMode.y & 2) != 0;
+    if (in2 && (!slbg || uC1a.x == 0))
+        rgb = byteRgb(read2(rx, ry));
+    if (in1)
+    {
+        vec4 c = read1(rx, ry);
+        vec3 src = byteRgb(c);
+        if (uC2a.x == 0)
+            rgb = src;
+        else
+        {
+            float factor = mmod ? float(uMode.z) : min(255.0, ps2Alpha(c, uC1a.w) * 2.0);
+            rgb = floor(rgb + ((src - rgb) * factor) / 255.0);
+        }
+    }
+    oColor = vec4(clamp(rgb, 0.0, 255.0) / 255.0, 1.0);
+}
+)";
+#endif
+
 #if defined(PS2X_GS_HW_VITA)
     // The same renderer in CG (vitaGL compiles it with libshacccg). Depth is
     // the position's z (glDepthRange(-1, 1) keeps it as is): no gl_FragDepth.
@@ -684,6 +777,9 @@ struct GSHwBackend::Impl
     std::vector<float> vuConstants; // 4 per batch: fog base, fog scale, XYOFFSET
     std::vector<float> vuNear; // 4 per batch: the near plane (Mac; the Vita gets batches that stay in front of it)
     GLuint wrapProgram = 0; // float sums -> 8-bit values modulo 256
+#if !defined(PS2X_GS_HW_VITA)
+    GLuint presentProgram = 0; // direct dual-CRTC composition into PresentSlot
+#endif
     struct WrapTarget
     {
         GLuint texture = 0;
@@ -862,6 +958,19 @@ struct GSHwBackend::Impl
             glAttachShader(wrapProgram, wvs);
             glAttachShader(wrapProgram, wfs);
             glLinkProgram(wrapProgram);
+
+            GLuint pvs = compile(GL_VERTEX_SHADER, kPresentVertexShader), pfs = compile(GL_FRAGMENT_SHADER, kPresentFragmentShader);
+            presentProgram = glCreateProgram();
+            glAttachShader(presentProgram, pvs);
+            glAttachShader(presentProgram, pfs);
+            glLinkProgram(presentProgram);
+            GLint presentLinked = 0;
+            glGetProgramiv(presentProgram, GL_LINK_STATUS, &presentLinked);
+            if (!presentLinked)
+            {
+                std::cerr << "[gs:hw] direct CRTC program link failed; using CPU presentation fallback" << std::endl;
+                presentProgram = 0;
+            }
         }
 #endif
         glReady = true;
@@ -2901,6 +3010,192 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         const bool en1 = (request.pmode & 1u) != 0u, en2 = (request.pmode & 2u) != 0u;
         if (!en1 && !en2)
             return false;
+#if !defined(PS2X_GS_HW_VITA)
+        if (!presentProgram || request.forceReadback)
+            return false;
+
+        // Reuse the same CRTC decode/layout model as GSGpuBackend::Present.
+        // Here each enabled circuit samples a live hardware render target, so
+        // no GPU->GS-memory write-back is needed for ordinary presentation.
+        struct Circuit
+        {
+            bool enabled = false;
+            uint32_t fbp = 0u, fbw = 1u, psm = 0u, dbx = 0u, dby = 0u;
+            int32_t dx = 0, dy = 0, dw = 0, dh = 0, hdiv = 1, vdiv = 1;
+            RenderTarget *target = nullptr;
+        };
+        const bool halfHeightBuffer = (request.smode2 & 0x3ull) == 0x3ull;
+        auto decodeCircuit = [&](bool enabledCircuit, uint64_t dispfb, uint64_t display)
+        {
+            Circuit c{};
+            c.fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+            c.fbw = std::max<uint32_t>(1u, static_cast<uint32_t>((dispfb >> 9) & 0x3Fu));
+            c.psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+            c.dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu);
+            c.dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
+            c.dx = static_cast<int32_t>(display & 0xFFFu);
+            c.dy = static_cast<int32_t>((display >> 12) & 0x7FFu);
+            c.hdiv = static_cast<int32_t>((display >> 23) & 0xFu) + 1;
+            c.vdiv = (static_cast<int32_t>((display >> 27) & 0x3u) + 1) * (halfHeightBuffer ? 2 : 1);
+            c.dw = static_cast<int32_t>((display >> 32) & 0xFFFu) + 1;
+            c.dh = static_cast<int32_t>((display >> 44) & 0x7FFu) + 1;
+            c.enabled = enabledCircuit && display != 0u && c.dw >= c.hdiv && c.dh >= c.vdiv;
+            return c;
+        };
+        Circuit circuits[2] = {decodeCircuit(en1, request.dispfb1, request.display1),
+                               decodeCircuit(en2, request.dispfb2, request.display2)};
+        if (!circuits[0].enabled && !circuits[1].enabled)
+            return false;
+
+        auto findTarget = [&](Circuit &c) -> bool
+        {
+            if (!c.enabled)
+                return true;
+            auto it = targets.find(makeTargetKey(c.fbp, c.fbw, c.psm));
+            if (it == targets.end() && (c.psm == GS_PSM_CT24 || c.psm == GS_PSM_CT32))
+                it = targets.find(makeTargetKey(c.fbp, c.fbw, c.psm == GS_PSM_CT24 ? GS_PSM_CT32 : GS_PSM_CT24));
+            if (it == targets.end())
+                return false;
+            RenderTarget &rt = it->second;
+            const bool psmOk = rt.psm == c.psm || (c.psm == GS_PSM_CT24 && rt.psm == GS_PSM_CT32) ||
+                               (c.psm == GS_PSM_CT32 && rt.psm == GS_PSM_CT24);
+            const uint32_t sourceWidth = static_cast<uint32_t>((c.dw + c.hdiv - 1) / c.hdiv);
+            const uint32_t sourceHeight = static_cast<uint32_t>((c.dh + c.vdiv - 1) / c.vdiv);
+            if (rt.fbw != c.fbw || !psmOk || c.dbx + sourceWidth > rt.width || c.dby + sourceHeight > rt.height)
+                return false;
+            c.target = &rt;
+            return true;
+        };
+        if (!findTarget(circuits[0]) || !findTarget(circuits[1]))
+            return false;
+
+        // A single-circuit preferred TEX0 source needs the CPU/GSGpuBackend
+        // selection rules until the hardware-target equivalent is explicit.
+        if (circuits[0].enabled != circuits[1].enabled && request.hasPreferredSource)
+        {
+            const Circuit &c = circuits[0].enabled ? circuits[0] : circuits[1];
+            if (request.preferredDestFbp == c.fbp &&
+                (request.preferredSource.fbw != 0u || request.preferredSource.fbp != c.fbp * 32u))
+                return false;
+        }
+
+        int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+        int32_t hstep = INT32_MAX, vstep = INT32_MAX;
+        for (const Circuit &c : circuits)
+        {
+            if (!c.enabled)
+                continue;
+            x0 = std::min(x0, c.dx);
+            y0 = std::min(y0, c.dy);
+            x1 = std::max(x1, c.dx + c.dw);
+            y1 = std::max(y1, c.dy + c.dh);
+            hstep = std::min(hstep, c.hdiv);
+            vstep = std::min(vstep, c.vdiv);
+        }
+        if (x1 <= x0 || y1 <= y0 || hstep <= 0 || vstep <= 0)
+            return false;
+        const uint32_t width = static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep);
+        const uint32_t height = static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep);
+        if (width == 0u || height == 0u || width > 2048u || height > 2048u)
+            return false;
+
+        flushPending();
+        for (Circuit &c : circuits)
+        {
+            if (!c.enabled)
+                continue;
+            const uint32_t sourceWidth = static_cast<uint32_t>((c.dw + c.hdiv - 1) / c.hdiv);
+            const uint32_t sourceHeight = static_cast<uint32_t>((c.dh + c.vdiv - 1) / c.vdiv);
+            resolveAliases(*c.target, c.dbx, c.dby, c.dbx + sourceWidth, c.dby + sourceHeight);
+            loadStalePages(*c.target, c.dbx, c.dby, c.dbx + sourceWidth, c.dby + sourceHeight);
+        }
+
+        PresentSlot &slot = presentRing[presentNext++ % presentRing.size()];
+        if (slot.fence)
+        {
+            glDeleteSync(slot.fence);
+            slot.fence = nullptr;
+        }
+        if (slot.texture == 0 || slot.width != width || slot.height != height)
+        {
+            if (slot.texture == 0)
+            {
+                glGenTextures(1, &slot.texture);
+                glGenFramebuffers(1, &slot.fbo);
+            }
+            glBindTexture(GL_TEXTURE_2D, slot.texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindFramebuffer(GL_FRAMEBUFFER, slot.fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
+            slot.width = width;
+            slot.height = height;
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, slot.fbo);
+        glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+        setScissor(nullptr, false);
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glUseProgram(presentProgram);
+        glBindVertexArray(vao);
+        const auto set4i = [&](const char *name, GLint a, GLint b, GLint c, GLint d)
+        {
+            glUniform4i(glGetUniformLocation(presentProgram, name), a, b, c, d);
+        };
+        const auto set2i = [&](const char *name, GLint a, GLint b)
+        {
+            glUniform2i(glGetUniformLocation(presentProgram, name), a, b);
+        };
+        const auto bindCircuit = [&](const Circuit &c, int index)
+        {
+            const std::string base = index == 0 ? "uC1" : "uC2";
+            set4i((base + "a").c_str(), c.enabled ? 1 : 0, static_cast<GLint>(c.dbx), static_cast<GLint>(c.dby), c.psm == GS_PSM_CT24 ? 1 : 0);
+            set4i((base + "b").c_str(), c.dx, c.dy, c.dw, c.dh);
+            set2i((base + "c").c_str(), c.hdiv, c.vdiv);
+            glActiveTexture(index == 0 ? GL_TEXTURE0 : GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, c.enabled ? c.target->texture : 0u);
+        };
+        glUniform1i(glGetUniformLocation(presentProgram, "uTex1"), 0);
+        glUniform1i(glGetUniformLocation(presentProgram, "uTex2"), 1);
+        set4i("uOut", x0, y0, hstep, vstep);
+        set2i("uSize", static_cast<GLint>(width), static_cast<GLint>(height));
+        bindCircuit(circuits[0], 0);
+        bindCircuit(circuits[1], 1);
+        const uint32_t fieldFlags = (request.smode2 & 3u) == 1u
+                                        ? 1u | (static_cast<uint32_t>(request.vsyncTick & 1u) << 1u)
+                                        : 0u;
+        set4i("uMode", static_cast<GLint>(request.bgcolor & 0xFFFFFFu),
+              static_cast<GLint>(((request.pmode >> 7u) & 1u) | (((request.pmode >> 5u) & 1u) << 1u)),
+              static_cast<GLint>((request.pmode >> 8u) & 0xFFu), static_cast<GLint>(fieldFlags));
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDepthMask(GL_TRUE);
+        glActiveTexture(GL_TEXTURE0);
+        activeProgram = 0;
+
+        snapshotIfDue(slot.fbo, width, height);
+        GSDirectFrame direct{};
+        direct.texture = slot.texture;
+        slot.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+        direct.fence = reinterpret_cast<uint64_t>(slot.fence);
+        direct.store(frame.pixels);
+        frame.width = width;
+        frame.height = height;
+        frame.displayFbp = circuits[0].enabled ? circuits[0].fbp : circuits[1].fbp;
+        frame.sourceFbp = frame.displayFbp;
+        lastDirectFrame = direct;
+        lastDirectWidth = width;
+        lastDirectHeight = height;
+        lastDirectFbp = frame.displayFbp;
+        ++stats.directPresents;
+        return true;
+#else
         // Both on the same buffer and size; DX/DY may differ (a field offset).
         const uint64_t sizeMask = ~0x7FFFFFull; // DW, DH, MAGH, MAGV
         if (en1 && en2 && (request.dispfb1 != request.dispfb2 || (request.display1 & sizeMask) != (request.display2 & sizeMask)))
@@ -3005,6 +3300,7 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         lastDirectFbp = fbp;
         ++stats.directPresents;
         return true;
+#endif
     }
 
     // A draw sampling a render target the queued draws write: draw those first.
