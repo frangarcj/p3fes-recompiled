@@ -460,6 +460,10 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
     src/lib/gs/gs_host_acquired_capture.cpp # optional, bounded download of Acquire.
     src/lib/gs/gs_pcsx2.cpp # PCSX2's GS (third_party/pcsx2-gs), loaded at run time
     src/lib/gs/gs_cpu_backend.cpp
+    # Hardware GS renderer reused from Celosia (GPL-3.0): OpenGL 3.3 on macOS,
+    # the same subset on vitaGL/GXM for Vita. Selection remains opt-in while
+    # P3FES brings it up against the CPU correctness backend.
+    src/lib/gs/gs_hw_backend.cpp
     # OpenGL GS backend and command queue from the SotC fork ac9efa0 (GPL-3.0).
     src/lib/gs/gs_threaded_backend.cpp
     src/lib/gs/gs_swizzle.cpp

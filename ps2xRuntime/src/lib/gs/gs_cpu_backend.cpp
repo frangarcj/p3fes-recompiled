@@ -32,6 +32,38 @@ using namespace GSInternal;
 
 namespace
 {
+    void hwShadowPageRange(uint32_t baseBlocks, uint32_t bufferWidthPixels,
+                           uint32_t y0, uint32_t y1, uint32_t psm,
+                           uint64_t &begin, uint64_t &end)
+    {
+        uint32_t pageWidth = 64u, pageHeight = 32u;
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            pageHeight = 64u;
+            break;
+        case GS_PSM_T8:
+            pageWidth = 128u;
+            pageHeight = 64u;
+            break;
+        case GS_PSM_T4:
+            pageWidth = 128u;
+            pageHeight = 128u;
+            break;
+        default:
+            break;
+        }
+        const uint64_t pagesPerRow = std::max<uint64_t>(1u,
+            (std::max<uint32_t>(1u, bufferWidthPixels) + pageWidth - 1u) / pageWidth);
+        const uint64_t basePage = baseBlocks / 32u;
+        begin = (basePage + (y0 / pageHeight) * pagesPerRow) * GSMem::TexturePageCache::kPageSize;
+        end = (basePage + (y1 / pageHeight + 1u) * pagesPerRow + ((baseBlocks % 32u) ? 1u : 0u)) *
+              GSMem::TexturePageCache::kPageSize;
+    }
+
     // The GS is independent of the SSE mode the EE/VU use when submitting. Keep the usual rounding of the
     // approximate rasterizer, also with the thread, and restore the caller's rounding afterwards.
     using GSCpuRoundingScope = GSHostFenv::NearestRoundingScope;
@@ -750,6 +782,9 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     std::lock_guard<std::mutex> lock(m_mutex);
     m_vram = vram;
     m_vramSize = vramSize;
+    m_hwTextures.clear();
+    m_hwPageEpoch.fill(0u);
+    m_hwEpoch = 1u;
     ResetUnlocked();
 }
 
@@ -908,6 +943,9 @@ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     WriteVramUnlocked(psm, base, bw, x, y, value);
+    // Direct host writes are rare; conservatively invalidate the GS memory
+    // epochs rather than duplicating every PSM's swizzled byte-address math.
+    MarkHwRangeWritten(0u, m_vramSize);
 }
 
 void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
@@ -915,6 +953,137 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
     if (!m_vram)
         return;
     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
+}
+
+size_t GSCpuBackend::HwTextureKeyHash::operator()(const HwTextureKey &key) const noexcept
+{
+    uint64_t hash = key.clutHash ^ 0x9E3779B97F4A7C15ull;
+    for (const uint32_t value : {key.tbp0, key.tbw, key.psm, key.tw, key.th,
+                                 key.cpsm, key.csm, key.csa, key.texa})
+        hash = (hash ^ value) * 1099511628211ull;
+    return static_cast<size_t>(hash);
+}
+
+void GSCpuBackend::MarkHwRangeWritten(uint64_t begin, uint64_t end)
+{
+    if (end <= begin || m_hwPageEpoch.empty())
+        return;
+    const uint64_t memoryBytes = std::max<uint64_t>(1u, m_vramSize);
+    begin %= memoryBytes;
+    end = std::min<uint64_t>(end, memoryBytes);
+    if (end <= begin)
+    {
+        // Wrapped or full-range conservative invalidation.
+        const uint64_t epoch = ++m_hwEpoch;
+        m_hwPageEpoch.fill(epoch);
+        return;
+    }
+    const uint64_t epoch = ++m_hwEpoch;
+    const uint64_t firstPage = begin / GSMem::TexturePageCache::kPageSize;
+    const uint64_t lastPage = (end - 1u) / GSMem::TexturePageCache::kPageSize;
+    for (uint64_t page = firstPage; page <= lastPage && page < m_hwPageEpoch.size(); ++page)
+        m_hwPageEpoch[page] = epoch;
+}
+
+uint64_t GSCpuBackend::newestWrite(uint64_t begin, uint64_t end) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (end <= begin || m_hwPageEpoch.empty())
+        return 0u;
+    const uint64_t firstPage = (begin / GSMem::TexturePageCache::kPageSize) % m_hwPageEpoch.size();
+    const uint64_t pageCount = std::min<uint64_t>(m_hwPageEpoch.size(),
+        (end - begin + GSMem::TexturePageCache::kPageSize - 1u) / GSMem::TexturePageCache::kPageSize);
+    uint64_t newest = 0u;
+    for (uint64_t i = 0; i < pageCount; ++i)
+        newest = std::max(newest, m_hwPageEpoch[(firstPage + i) % m_hwPageEpoch.size()]);
+    return newest;
+}
+
+void GSCpuBackend::noteExternalWrite(uint64_t begin, uint64_t end)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    MarkHwRangeWritten(begin, end);
+    m_texturePageCache.Invalidate();
+}
+
+void GSCpuBackend::fillPage(uint32_t page, uint32_t psm, uint32_t color)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram || m_vramSize < GSMem::TexturePageCache::kPageSize)
+        return;
+    const uint64_t base = (static_cast<uint64_t>(page) % m_hwPageEpoch.size()) * GSMem::TexturePageCache::kPageSize;
+    if (base + GSMem::TexturePageCache::kPageSize > m_vramSize)
+        return;
+    if (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S)
+    {
+        auto *dst = reinterpret_cast<uint16_t *>(m_vram + base);
+        std::fill(dst, dst + GSMem::TexturePageCache::kPageSize / sizeof(uint16_t), static_cast<uint16_t>(color));
+    }
+    else
+    {
+        auto *dst = reinterpret_cast<uint32_t *>(m_vram + base);
+        const size_t count = GSMem::TexturePageCache::kPageSize / sizeof(uint32_t);
+        if (psm == GS_PSM_CT24)
+            for (size_t i = 0; i < count; ++i)
+                dst[i] = (dst[i] & 0xFF000000u) | (color & 0x00FFFFFFu);
+        else
+            std::fill(dst, dst + count, color);
+    }
+    MarkHwRangeWritten(base, base + GSMem::TexturePageCache::kPageSize);
+    m_texturePageCache.Invalidate();
+}
+
+const std::vector<uint32_t> *GSCpuBackend::textureForHw(const GSDrawState &state,
+                                                        uint32_t &width, uint32_t &height,
+                                                        uint64_t &epoch)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    width = state.textureWidth;
+    height = state.textureHeight;
+    epoch = 0u;
+    if (!m_vram || width == 0u || height == 0u)
+        return nullptr;
+
+    const auto &tex = state.context.tex0;
+    uint64_t clutHash = 1469598103934665603ull;
+    if (isFourBitIndexedPsm(tex.psm) || isEightBitIndexedPsm(tex.psm))
+        for (const uint16_t value : m_clut)
+            clutHash = (clutHash ^ value) * 1099511628211ull;
+    else
+        clutHash = 0u;
+
+    HwTextureKey key{};
+    key.tbp0 = tex.tbp0;
+    key.tbw = tex.tbw;
+    key.psm = tex.psm;
+    key.tw = tex.tw;
+    key.th = tex.th;
+    key.cpsm = tex.cpsm;
+    key.csm = tex.csm;
+    key.csa = tex.csa;
+    key.texa = static_cast<uint32_t>(state.texa.ta0) |
+               (static_cast<uint32_t>(state.texa.ta1) << 8u) |
+               (state.texa.aem ? 0x10000u : 0u);
+    key.clutHash = clutHash;
+
+    std::vector<uint32_t> decoded(static_cast<size_t>(width) * height);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+            decoded[static_cast<size_t>(y) * width + x] =
+                ConvertTexel(state, ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, x, y));
+
+    HwDecodedTexture &entry = m_hwTextures[key];
+    if (entry.width != width || entry.height != height || entry.texels != decoded)
+    {
+        entry.texels = std::move(decoded);
+        entry.width = width;
+        entry.height = height;
+        ++entry.version;
+        if (entry.version == 0u)
+            entry.version = 1u;
+    }
+    epoch = entry.version;
+    return &entry.texels;
 }
 
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
@@ -1924,6 +2093,15 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         });
     else
         UploadImageUnlocked(data, sizeBytes);
+
+    uint64_t begin = 0u, end = 0u;
+    hwShadowPageRange(m_transfer.bitbltbuf.dbp,
+                      std::max<uint32_t>(1u, m_transfer.bitbltbuf.dbw) * 64u,
+                      m_transfer.trxpos.dsay,
+                      m_transfer.trxpos.dsay + std::max<uint32_t>(1u, m_transfer.trxreg.rrh) - 1u,
+                      m_transfer.bitbltbuf.dpsm, begin, end);
+    MarkHwRangeWritten(begin, end);
+    m_texturePageCache.Invalidate();
 }
 
 // the wrapper keeps the partial pixel under the same lock as the write.
@@ -2071,6 +2249,14 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
 
     m_transferState.copiedPixels = total;
     m_transferState.direction = 3u;
+    uint64_t begin = 0u, end = 0u;
+    hwShadowPageRange(m_transfer.bitbltbuf.dbp,
+                      std::max<uint32_t>(1u, m_transfer.bitbltbuf.dbw) * 64u,
+                      m_transfer.trxpos.dsay,
+                      m_transfer.trxpos.dsay + std::max<uint32_t>(1u, rrh) - 1u,
+                      m_transfer.bitbltbuf.dpsm, begin, end);
+    MarkHwRangeWritten(begin, end);
+    m_texturePageCache.Invalidate();
 }
 
 void GSCpuBackend::PerformLocalToHostTransfer()
@@ -2191,6 +2377,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                 }
                 WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
             }
+        uint64_t begin = 0u, end = 0u;
+        hwShadowPageRange(fbp, fbw * 64u, y0, y1, context.frame.psm, begin, end);
+        MarkHwRangeWritten(begin, end);
+        m_texturePageCache.Invalidate();
         return true;
     }
 
@@ -2209,6 +2399,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                 }
                 WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
             }
+        uint64_t begin = 0u, end = 0u;
+        hwShadowPageRange(fbp, fbw * 64u, y0, y1, context.frame.psm, begin, end);
+        MarkHwRangeWritten(begin, end);
+        m_texturePageCache.Invalidate();
         return true;
     }
     return false;

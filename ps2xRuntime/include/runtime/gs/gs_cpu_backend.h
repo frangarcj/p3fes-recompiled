@@ -7,6 +7,7 @@
 
 #include <array>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 class GSCpuBackend final : public GSRasterBackend, public GSBackendStateAccess
@@ -38,13 +39,23 @@ public:
     bool ExportState(GSBackendState &out) override;
     bool ImportState(const GSBackendState &state) override;
 
+    // Hardware-GS shadow access. Reused from Celosia's GSHwBackend contract:
+    // the CPU backend remains authoritative for GS memory/transfers while a
+    // GPU renderer owns raster targets and synchronizes them by 8 KiB pages.
+    std::mutex &vramMutex() { return m_mutex; }
+    uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+    void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+    const std::vector<uint32_t> *textureForHw(const GSDrawState &state, uint32_t &width, uint32_t &height, uint64_t &epoch);
+    uint64_t newestWrite(uint64_t begin, uint64_t end) const;
+    void noteExternalWrite(uint64_t begin, uint64_t end);
+    void fillPage(uint32_t page, uint32_t psm, uint32_t color);
+
 private:
     void ResetUnlocked();
     void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
-    uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
-    void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+    void MarkHwRangeWritten(uint64_t begin, uint64_t end);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch);
@@ -80,6 +91,28 @@ private:
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
+
+    struct HwTextureKey
+    {
+        uint32_t tbp0 = 0, tbw = 0, psm = 0, tw = 0, th = 0;
+        uint32_t cpsm = 0, csm = 0, csa = 0;
+        uint32_t texa = 0;
+        uint64_t clutHash = 0;
+        bool operator==(const HwTextureKey &) const = default;
+    };
+    struct HwTextureKeyHash
+    {
+        size_t operator()(const HwTextureKey &key) const noexcept;
+    };
+    struct HwDecodedTexture
+    {
+        std::vector<uint32_t> texels;
+        uint32_t width = 0, height = 0;
+        uint64_t version = 0;
+    };
+    std::unordered_map<HwTextureKey, HwDecodedTexture, HwTextureKeyHash> m_hwTextures;
+    std::array<uint64_t, 512> m_hwPageEpoch{};
+    uint64_t m_hwEpoch = 1u;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
