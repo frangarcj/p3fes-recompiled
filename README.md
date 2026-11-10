@@ -171,7 +171,7 @@ being brought up separately through the portable `.p3n` asset/renderer interface
 | `PS2X_AUDIO_STRETCH=0` | Play the sound unstretched when the game runs below full speed (it runs dry instead) |
 | `PS2X_GS_GPU=1` | Built-in OpenGL GS backend instead of the CPU rasterizer |
 | `PS2X_GS_HW=1` | Experimental Celosia hardware GS (shared OpenGL context on macOS, vitaGL on Vita); CPU GS remains the default fallback |
-| `PS2X_GS_HW_DIRECT=1` | With the experimental Celosia GS, present its GPU texture directly on Vita instead of readback/upload |
+| `PS2X_GS_HW_DIRECT=1` | With the experimental Celosia GS, present its shared GPU texture directly on macOS/Vita instead of readback/upload |
 | `PS2X_GS_THREAD=1` | Run the GS backend on its own thread |
 | `PS2X_GS_RASTER_THREADS=1..4` | Experimental: split large independent P3 PSMT4 triangle rows across CPU workers (off by default) |
 | `PS2X_MEMCARD1=<path>` / `none` | Memory card for slot 1 (default `memcards/Mcd001.ps2`) |

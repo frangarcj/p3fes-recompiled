@@ -42,6 +42,12 @@ namespace
     constexpr uint32_t kHeight = 512u;
     constexpr uint32_t kDisplayHeight = 448u;
 
+    uint64_t steadyNowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
     void waitDirectFrame(uint64_t fence)
     {
 #if defined(__APPLE__) && !defined(PLATFORM_VITA)
@@ -77,6 +83,7 @@ void GSHostPresentation::presentDirectTexture(uint32_t texture, uint32_t width, 
     {
         workerDirectWidth.store(0u, std::memory_order_relaxed);
         workerDirectHeight.store(0u, std::memory_order_relaxed);
+        workerDirectLastNs.store(0u, std::memory_order_relaxed);
         workerDirectActive.store(false, std::memory_order_release);
         return;
     }
@@ -104,6 +111,7 @@ void GSHostPresentation::presentDirectTexture(uint32_t texture, uint32_t width, 
     EndDrawing();
     workerDirectWidth.store(width, std::memory_order_relaxed);
     workerDirectHeight.store(height, std::memory_order_relaxed);
+    workerDirectLastNs.store(steadyNowNs(), std::memory_order_relaxed);
     workerDirectActive.store(true, std::memory_order_release);
 #else
     (void)texture;
@@ -203,15 +211,28 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
 #if defined(PLATFORM_VITA)
     if (workerDirectActive.load(std::memory_order_acquire))
     {
+        // Celosia gives the worker a grace window: if hardware presentation
+        // stops for several seconds, let the host resume drawing rather than
+        // leaving the last GPU frame frozen forever.
+        constexpr uint64_t kDirectWorkerGraceNs = 3000000000ull;
+        const uint64_t last = workerDirectLastNs.load(std::memory_order_relaxed);
+        const uint64_t now = steadyNowNs();
+        if (last != 0u && now - last <= kDirectWorkerGraceNs)
+        {
         // The worker has already presented the GPU texture. Do not interpret
         // GSDirectFrame's tiny transport record as RGBA pixels or touch the
         // fallback texture; renderFrame() will only poll input for this tick.
-        current = {};
-        current.width = workerDirectWidth.load(std::memory_order_relaxed);
-        current.height = workerDirectHeight.load(std::memory_order_relaxed);
-        current.borrowed = true;
-        current.blank = false;
-        return current;
+            current = {};
+            current.width = workerDirectWidth.load(std::memory_order_relaxed);
+            current.height = workerDirectHeight.load(std::memory_order_relaxed);
+            current.borrowed = true;
+            current.blank = false;
+            return current;
+        }
+        workerDirectWidth.store(0u, std::memory_order_relaxed);
+        workerDirectHeight.store(0u, std::memory_order_relaxed);
+        workerDirectLastNs.store(0u, std::memory_order_relaxed);
+        workerDirectActive.store(false, std::memory_order_release);
     }
 #endif
     current.shared = shared;
@@ -295,7 +316,12 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
     {
         waitDirectFrame(direct.fence);
         current = {};
-        current.texture = Texture2D{direct.texture, static_cast<int>(width), static_cast<int>(height),
+#if defined(PLATFORM_VITA)
+        const uint32_t directTextureId = direct.texture | 0x80000000u;
+#else
+        const uint32_t directTextureId = direct.texture;
+#endif
+        current.texture = Texture2D{directTextureId, static_cast<int>(width), static_cast<int>(height),
                                     1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
         current.width = width;
         current.height = height;
@@ -400,6 +426,7 @@ void GSHostPresentation::shutdown(GS &gs)
         GSSharedPresent::ShutdownHost();
     workerDirectWidth.store(0u, std::memory_order_relaxed);
     workerDirectHeight.store(0u, std::memory_order_relaxed);
+    workerDirectLastNs.store(0u, std::memory_order_relaxed);
     workerDirectActive.store(false, std::memory_order_release);
     started = captureRequested = hasLatched = uploaded = uploadedBlank = modeKnown = sharedMode = false;
     lastTick = lastSharedSequence = 0u;
