@@ -1,9 +1,11 @@
 // Persona 3 FES RenderWare integration point.
 //
-// The guest layouts and RpClumpRender walk match RenderWare 3.7 as recovered
-// by Raikaru/Persona4-Decompilation. This wrapper is opt-in and always calls
-// the original recompiled function, so the existing GS remains the
-// correctness fallback while native drawing is brought up incrementally.
+// Guest offsets below are cross-checked against C-GBL/P3FES-Decompilation
+// (render_view.h/render_rw5.h/render_rw6.h, commit 78bb5776). In particular,
+// the game's normal model path does not go through RpClumpRender: every atomic
+// reaches AtomicDefaultRenderCallBack, which is the useful native-renderer seam.
+// The hook is opt-in and still calls the original until the native path can
+// submit the corresponding geometry itself.
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
@@ -16,16 +18,27 @@
 
 namespace
 {
-    constexpr uint32_t kRpClumpRender = 0x00491630u;
-    constexpr uint32_t kAtomicListOffset = 0x08u;
-    constexpr uint32_t kAtomicLinkOffset = 0x40u;
+    constexpr uint32_t kAtomicDefaultRenderCallBack = 0x00490860u;
     constexpr uint32_t kAtomicFlagsOffset = 0x02u;
     constexpr uint32_t kAtomicFrameOffset = 0x04u;
-    constexpr uint32_t kAtomicGeometryOffset = 0x0Cu;
+    constexpr uint32_t kAtomicGeometryOffset = 0x18u;
     constexpr uint8_t kAtomicRenderFlag = 0x04u;
-    constexpr uint32_t kMaxAtomicsPerClump = 4096u;
 
-    std::atomic<PS2Runtime::RecompiledFunction> g_originalRpClumpRender{nullptr};
+    constexpr uint32_t kGeometryFlagsOffset = 0x08u;
+    constexpr uint32_t kGeometryNumTrianglesOffset = 0x10u;
+    constexpr uint32_t kGeometryNumVerticesOffset = 0x14u;
+    constexpr uint32_t kGeometryNumMorphTargetsOffset = 0x18u;
+    constexpr uint32_t kGeometryTrianglesOffset = 0x2Cu;
+    constexpr uint32_t kGeometryPrelitOffset = 0x30u;
+    constexpr uint32_t kGeometryUv0Offset = 0x34u;
+    constexpr uint32_t kGeometryMorphTargetsOffset = 0x5Cu;
+    constexpr uint32_t kMorphVerticesOffset = 0x14u;
+    constexpr uint32_t kMorphNormalsOffset = 0x18u;
+    constexpr uint32_t kMorphSize = 0x1Cu;
+    constexpr uint32_t kMaxVertices = 1u << 20;
+    constexpr uint32_t kMaxTriangles = 1u << 20;
+
+    std::atomic<PS2Runtime::RecompiledFunction> g_originalAtomicRender{nullptr};
     std::atomic<bool> g_diagEnabled{false};
     std::atomic<bool> g_diagPrinted{false};
 
@@ -43,69 +56,100 @@ namespace
         return size <= PS2_RAM_SIZE && address <= PS2_RAM_SIZE - size;
     }
 
-    struct ClumpSummary
+    struct AtomicSummary
     {
-        uint32_t address = 0u;
-        uint32_t atomics = 0u;
-        uint32_t renderable = 0u;
-        uint32_t frames = 0u;
-        uint32_t geometries = 0u;
+        uint32_t atomic = 0u;
+        uint32_t frame = 0u;
+        uint32_t geometry = 0u;
+        uint32_t flags = 0u;
+        uint32_t geometryFlags = 0u;
+        uint32_t triangles = 0u;
+        uint32_t vertices = 0u;
+        uint32_t morphTargets = 0u;
+        uint32_t triangleData = 0u;
+        uint32_t vertexData = 0u;
+        uint32_t normalData = 0u;
+        uint32_t prelitData = 0u;
+        uint32_t uv0Data = 0u;
     };
 
-    bool inspectClump(const uint8_t *rdram, uint32_t clumpAddress, ClumpSummary &summary)
+    bool inspectAtomic(const uint8_t *rdram, uint32_t atomic, AtomicSummary &summary)
     {
-        if (!guestPointer(clumpAddress, kAtomicListOffset + 8u))
+        if (!guestPointer(atomic, 0x70u))
             return false;
 
-        const uint32_t sentinel = clumpAddress + kAtomicListOffset;
-        uint32_t link = 0u;
-        if (!readGuest(rdram, sentinel, link))
+        uint8_t flags = 0u;
+        uint32_t frame = 0u, geometry = 0u;
+        if (!readGuest(rdram, atomic + kAtomicFlagsOffset, flags) ||
+            !readGuest(rdram, atomic + kAtomicFrameOffset, frame) ||
+            !readGuest(rdram, atomic + kAtomicGeometryOffset, geometry) ||
+            !guestPointer(geometry, 0x60u))
             return false;
 
-        summary.address = clumpAddress;
-        while (link != sentinel)
+        int32_t triangles = 0, vertices = 0, morphTargets = 0;
+        uint32_t geometryFlags = 0u, triangleData = 0u, morphData = 0u;
+        uint32_t prelitData = 0u, uv0Data = 0u;
+        if (!readGuest(rdram, geometry + kGeometryFlagsOffset, geometryFlags) ||
+            !readGuest(rdram, geometry + kGeometryNumTrianglesOffset, triangles) ||
+            !readGuest(rdram, geometry + kGeometryNumVerticesOffset, vertices) ||
+            !readGuest(rdram, geometry + kGeometryNumMorphTargetsOffset, morphTargets) ||
+            !readGuest(rdram, geometry + kGeometryTrianglesOffset, triangleData) ||
+            !readGuest(rdram, geometry + kGeometryMorphTargetsOffset, morphData) ||
+            !readGuest(rdram, geometry + kGeometryPrelitOffset, prelitData) ||
+            !readGuest(rdram, geometry + kGeometryUv0Offset, uv0Data) ||
+            triangles < 0 || vertices < 0 || morphTargets < 0 ||
+            static_cast<uint32_t>(triangles) > kMaxTriangles || static_cast<uint32_t>(vertices) > kMaxVertices)
+            return false;
+
+        uint32_t vertexData = 0u, normalData = 0u;
+        if (morphTargets > 0)
         {
-            if (++summary.atomics > kMaxAtomicsPerClump || link < kAtomicLinkOffset || !guestPointer(link, 8u))
+            if (!guestPointer(morphData, kMorphSize) ||
+                !readGuest(rdram, morphData + kMorphVerticesOffset, vertexData) ||
+                !readGuest(rdram, morphData + kMorphNormalsOffset, normalData))
                 return false;
-
-            const uint32_t atomic = link - kAtomicLinkOffset;
-            uint8_t flags = 0u;
-            uint32_t frame = 0u;
-            uint32_t geometry = 0u;
-            uint32_t next = 0u;
-            if (!readGuest(rdram, atomic + kAtomicFlagsOffset, flags) ||
-                !readGuest(rdram, atomic + kAtomicFrameOffset, frame) ||
-                !readGuest(rdram, atomic + kAtomicGeometryOffset, geometry) ||
-                !readGuest(rdram, link, next))
-                return false;
-
-            if ((flags & kAtomicRenderFlag) != 0u)
-                ++summary.renderable;
-            if (guestPointer(frame, 1u))
-                ++summary.frames;
-            if (guestPointer(geometry, 1u))
-                ++summary.geometries;
-            link = next;
         }
+
+        const uint32_t vertexBytes = static_cast<uint32_t>(vertices) * 12u;
+        const uint32_t triangleBytes = static_cast<uint32_t>(triangles) * 8u;
+        if ((vertices && !guestPointer(vertexData, vertexBytes)) ||
+            (triangles && !guestPointer(triangleData, triangleBytes)))
+            return false;
+
+        summary.atomic = atomic;
+        summary.frame = frame;
+        summary.geometry = geometry;
+        summary.flags = flags;
+        summary.geometryFlags = geometryFlags;
+        summary.triangles = static_cast<uint32_t>(triangles);
+        summary.vertices = static_cast<uint32_t>(vertices);
+        summary.morphTargets = static_cast<uint32_t>(morphTargets);
+        summary.triangleData = triangleData;
+        summary.vertexData = vertexData;
+        summary.normalData = normalData;
+        summary.prelitData = prelitData;
+        summary.uv0Data = uv0Data;
         return true;
     }
 
-    void p3fesRpClumpRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void p3fesAtomicDefaultRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (ctx && ctx->pc == kRpClumpRender)
+        if (ctx && ctx->pc == kAtomicDefaultRenderCallBack)
         {
-            const uint32_t clump = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
-            ClumpSummary summary;
-            if (inspectClump(rdram, clump, summary) && g_diagEnabled.load(std::memory_order_relaxed) &&
+            const uint32_t atomic = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+            AtomicSummary summary;
+            if (inspectAtomic(rdram, atomic, summary) && g_diagEnabled.load(std::memory_order_relaxed) &&
                 !g_diagPrinted.exchange(true, std::memory_order_relaxed))
             {
                 std::fprintf(stderr,
-                             "[p3fes-rw] RpClumpRender clump=0x%08X atomics=%u renderable=%u frames=%u geometries=%u\n",
-                             summary.address, summary.atomics, summary.renderable, summary.frames, summary.geometries);
+                             "[p3fes-rw] AtomicDefaultRender atomic=0x%08X frame=0x%08X geometry=0x%08X flags=0x%02X "
+                             "gflags=0x%08X vertices=%u triangles=%u morphs=%u verts=0x%08X tris=0x%08X\n",
+                             summary.atomic, summary.frame, summary.geometry, summary.flags, summary.geometryFlags,
+                             summary.vertices, summary.triangles, summary.morphTargets, summary.vertexData, summary.triangleData);
             }
         }
 
-        if (PS2Runtime::RecompiledFunction original = g_originalRpClumpRender.load(std::memory_order_acquire))
+        if (PS2Runtime::RecompiledFunction original = g_originalAtomicRender.load(std::memory_order_acquire))
             original(rdram, ctx, runtime);
     }
 
@@ -118,17 +162,17 @@ namespace
         if (!nativeEnabled && !diagEnabled)
             return;
 
-        PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kRpClumpRender);
-        if (!original || original == &p3fesRpClumpRender)
+        PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kAtomicDefaultRenderCallBack);
+        if (!original || original == &p3fesAtomicDefaultRender)
             return;
 
         g_diagEnabled.store(diagEnabled, std::memory_order_relaxed);
         g_diagPrinted.store(false, std::memory_order_relaxed);
-        g_originalRpClumpRender.store(original, std::memory_order_release);
-        const bool replaced = runtime.replaceFunction(kRpClumpRender, &p3fesRpClumpRender);
+        g_originalAtomicRender.store(original, std::memory_order_release);
+        const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
         if (diagEnabled)
-            std::fprintf(stderr, "[p3fes-rw] RpClumpRender hook %s at 0x%08X\n",
-                         replaced ? "installed" : "failed", kRpClumpRender);
+            std::fprintf(stderr, "[p3fes-rw] AtomicDefaultRender hook %s at 0x%08X\n",
+                         replaced ? "installed" : "failed", kAtomicDefaultRenderCallBack);
     }
 }
 
