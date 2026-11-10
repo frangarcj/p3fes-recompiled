@@ -1316,6 +1316,16 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     const uint16_t minV = static_cast<uint16_t>((clamp >> 24) & 0x3FFu);
     const uint16_t maxV = static_cast<uint16_t>((clamp >> 34) & 0x3FFu);
 
+    // Persona 3's fullscreen post-process fans are dominated by bilinear
+    // PSMT4 sampling. For page-aligned textures with TBW >= 2, the legacy
+    // PSMT4 address formula is bit-for-bit identical to the generic GS memory
+    // lookup but avoids the page-cache copy and generic table dispatch on each
+    // of the four bilinear taps. Keep this narrowly scoped so every other draw
+    // continues through the reference CPU GS path.
+    const bool directT4 = state.prim.type == GS_PRIM_TRIFAN && state.prim.tme && !state.prim.fst &&
+                          state.linearFilter && tex.psm == GS_PSM_T4 && tex.tbw >= 2u &&
+                          (tex.tbp0 & 31u) == 0u;
+
     float texUf, texVf;
     if (state.prim.fst)
     {
@@ -1333,6 +1343,16 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+
+        if (directT4)
+        {
+            const uint32_t nibbleAddress = GSPSMT4::addrPSMT4(tex.tbp0, tex.tbw,
+                                                              static_cast<uint32_t>(sampleU),
+                                                              static_cast<uint32_t>(sampleV));
+            const uint32_t byteAddress = (nibbleAddress >> 1u) & (GSMem::MEMORY_SIZE - 1u);
+            const uint32_t raw = (m_vram[byteAddress] >> ((nibbleAddress & 1u) * 4u)) & 0x0Fu;
+            return ConvertTexel(state, raw);
+        }
 
         return ConvertTexel(state, ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV));
     };
