@@ -171,8 +171,15 @@ public:
     {
         if (m_open)
             return true;
-        SetConfigFlags(FLAG_VSYNC_HINT);
-        InitWindow(width, height, title);
+        // In the Vita runtime vitaGL is already initialized by the host shim.
+        // Borrow that one global context; only the standalone viewer creates
+        // and later destroys its own window/context.
+        if (!IsWindowReady())
+        {
+            SetConfigFlags(FLAG_VSYNC_HINT);
+            InitWindow(width, height, title);
+            m_ownsWindow = true;
+        }
         if (!IsWindowReady())
         {
             error = "vitaGL host window did not initialize";
@@ -196,7 +203,9 @@ public:
                     glDeleteTextures(1, &texture);
             m_textures.clear();
         }
-        CloseWindow();
+        if (m_ownsWindow)
+            CloseWindow();
+        m_ownsWindow = false;
         m_open = false;
     }
 
@@ -434,6 +443,7 @@ private:
     }
 
     bool m_open = false;
+    bool m_ownsWindow = false;
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
     std::unordered_map<std::string, GLuint> m_textures;
 };

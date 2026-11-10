@@ -90,9 +90,16 @@ public:
     {
         if (m_open)
             return true;
-        SetTraceLogLevel(LOG_WARNING);
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
-        InitWindow(width, height, title);
+        // The standalone viewers own their window. The in-game HLE renderer
+        // instead borrows the runtime's already-open raylib/GL context so it
+        // can replace GS presentation without creating a second host window.
+        if (!IsWindowReady())
+        {
+            SetTraceLogLevel(LOG_WARNING);
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+            InitWindow(width, height, title);
+            m_ownsWindow = true;
+        }
         if (!IsWindowReady())
             return false;
         m_material = LoadMaterialDefault();
@@ -112,7 +119,9 @@ public:
             UnloadTexture(texture);
         m_textures.clear();
         UnloadMaterial(m_material);
-        CloseWindow();
+        if (m_ownsWindow)
+            CloseWindow();
+        m_ownsWindow = false;
         m_open = false;
     }
 
@@ -299,6 +308,7 @@ public:
 
 private:
     bool m_open = false;
+    bool m_ownsWindow = false;
     ::Material m_material{};
     Camera3D m_camera{};
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
