@@ -37,6 +37,11 @@ public:
     GSHwBackend();
     ~GSHwBackend() override;
 
+    // Must be called on the backend's owning worker after Initialize(). It
+    // creates/validates the GL programs so the wrapper can fall back to the
+    // CPU renderer before any game draw is lost.
+    bool IsReady();
+
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
     void Submit(const GSPrimitiveBatch &batch) override;

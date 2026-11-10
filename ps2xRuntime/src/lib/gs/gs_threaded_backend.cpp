@@ -314,6 +314,12 @@ void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
             m_inner = std::make_unique<GSCpuBackend>();
             m_inner->Initialize(vram, vramSize);
         }
+        else if (auto *hardware = dynamic_cast<GSHwBackend *>(m_inner.get()); hardware && !hardware->IsReady())
+        {
+            std::fprintf(stderr, "[gs:hw] hardware renderer initialization failed; using CPU GS on the worker\n");
+            m_inner = std::make_unique<GSCpuBackend>();
+            m_inner->Initialize(vram, vramSize);
+        }
         m_sharedPresentation.store(m_inner->UsesSharedPresentation(), std::memory_order_release);
     });
 }

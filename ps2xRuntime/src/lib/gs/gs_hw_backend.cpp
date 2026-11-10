@@ -3008,6 +3008,12 @@ void GSHwBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     m_impl->shadow->Initialize(vram, vramSize);
 }
 
+bool GSHwBackend::IsReady()
+{
+    PS2X_GS_GL_LOCK();
+    return m_impl->ensureGl();
+}
+
 void GSHwBackend::Reset() { m_impl->shadow->Reset(); }
 
 void GSHwBackend::Submit(const GSPrimitiveBatch &batch)
@@ -3152,6 +3158,7 @@ struct GSHwBackend::Impl
 };
 GSHwBackend::GSHwBackend() : m_impl(std::make_unique<Impl>()) {}
 GSHwBackend::~GSHwBackend() = default;
+bool GSHwBackend::IsReady() { return false; }
 void GSHwBackend::Initialize(uint8_t *vram, uint32_t vramSize) { m_impl->shadow->Initialize(vram, vramSize); }
 void GSHwBackend::Reset() { m_impl->shadow->Reset(); }
 void GSHwBackend::Submit(const GSPrimitiveBatch &batch) { m_impl->shadow->Submit(batch); }
