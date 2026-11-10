@@ -448,7 +448,34 @@ namespace
         std::memset(dst, 0, byteCount);
 #if defined(PLATFORM_VITA)
         const std::string nativePath = path.string();
-        const SceUID file = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
+        // CRI's CVM layer issues lots of small sector reads. Reopening a 3 GiB
+        // archive for every range is especially expensive on Vita (and very
+        // noisy in Vita3K's sceIoOpen trace), so keep the handful of archive
+        // descriptors alive and serialize seek+read on their shared offsets.
+        // Loose files keep the old open/read/close behaviour so this does not
+        // turn arbitrary disc contents into an unbounded descriptor cache.
+        const bool keepOpen = toLowerAscii(path.extension().string()) == ".cvm";
+        static std::mutex cachedFileMutex;
+        static std::unordered_map<std::string, SceUID> cachedFiles;
+        std::unique_lock<std::mutex> cachedLock(cachedFileMutex, std::defer_lock);
+
+        SceUID file = -1;
+        if (keepOpen)
+        {
+            cachedLock.lock();
+            const auto found = cachedFiles.find(nativePath);
+            if (found != cachedFiles.end())
+                file = found->second;
+            else
+            {
+                file = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
+                if (file >= 0)
+                    cachedFiles.emplace(nativePath, file);
+            }
+        }
+        else
+            file = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
+
         if (file < 0)
         {
             g_lastCdError = -1;
@@ -458,7 +485,13 @@ namespace
         const SceOff position = sceIoLseek(file, static_cast<SceOff>(offsetBytes), SCE_SEEK_SET);
         if (position < 0 || static_cast<uint64_t>(position) != offsetBytes)
         {
-            sceIoClose(file);
+            if (keepOpen)
+            {
+                sceIoClose(file);
+                cachedFiles.erase(nativePath);
+            }
+            else
+                sceIoClose(file);
             g_lastCdError = -1;
             return false;
         }
@@ -473,7 +506,15 @@ namespace
             }
             totalRead += static_cast<size_t>(read);
         }
-        sceIoClose(file);
+        if (!keepOpen)
+            sceIoClose(file);
+        else if (totalRead != byteCount)
+        {
+            // Drop a failed cached descriptor so the next request gets one
+            // clean reopen instead of repeatedly reusing a bad handle.
+            sceIoClose(file);
+            cachedFiles.erase(nativePath);
+        }
         g_lastCdError = totalRead == byteCount ? 0 : -1;
         return totalRead == byteCount;
 #else
