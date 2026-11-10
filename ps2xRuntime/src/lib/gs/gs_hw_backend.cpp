@@ -1473,6 +1473,23 @@ struct GSHwBackend::Impl
         }
     }
 
+    // Rare generic CPU-side GS-memory access (debug reads, backend snapshots,
+    // direct pixel writes) has no convenient rectangle/range in the hardware
+    // contract. Preserve correctness by draining every dirty GPU target before
+    // delegating it to the CPU shadow. Normal textures/transfers use the much
+    // narrower writeBackOverlapping path above.
+    void writeBackAllDirty(const char *reason)
+    {
+        flushPending();
+        wbReason = reason;
+        for (auto &[targetKey, rt] : targets)
+        {
+            (void)targetKey;
+            writeBackPages(rt);
+        }
+        wbReason = "other";
+    }
+
     // A transfer only waits for the queued draws when it writes or reads GS
     // memory they draw into (target, Z) or sample: otherwise uploads (many a
     // frame) would split the queue into small draws.
@@ -3145,9 +3162,27 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
 
 bool GSHwBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba) { return m_impl->shadow->ClearFramebuffer(context, rgba); }
 uint32_t GSHwBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) { return m_impl->shadow->ConsumeLocalToHostBytes(dst, maxBytes); }
-uint32_t GSHwBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const { return m_impl->shadow->ReadVram(psm, base, bw, x, y); }
-void GSHwBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) { m_impl->shadow->WriteVram(psm, base, bw, x, y, value); }
-void GSHwBackend::SnapshotVram(std::vector<uint8_t> &out) const { m_impl->shadow->SnapshotVram(out); }
+uint32_t GSHwBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+{
+    PS2X_GS_GL_LOCK();
+    if (m_impl->onGlThread())
+        m_impl->writeBackAllDirty("read");
+    return m_impl->shadow->ReadVram(psm, base, bw, x, y);
+}
+void GSHwBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+{
+    PS2X_GS_GL_LOCK();
+    if (m_impl->onGlThread())
+        m_impl->writeBackAllDirty("write");
+    m_impl->shadow->WriteVram(psm, base, bw, x, y, value);
+}
+void GSHwBackend::SnapshotVram(std::vector<uint8_t> &out) const
+{
+    PS2X_GS_GL_LOCK();
+    if (m_impl->onGlThread())
+        m_impl->writeBackAllDirty("snapshot");
+    m_impl->shadow->SnapshotVram(out);
+}
 GSTransferSnapshot GSHwBackend::GetTransferSnapshot() const { return m_impl->shadow->GetTransferSnapshot(); }
 
 #else // no GL on this platform: forward everything to the CPU backend
