@@ -1116,6 +1116,16 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
         m_asyncCallbackStackTop = PS2_RAM_SIZE;
 
+#if defined(PLATFORM_VITA)
+        // SetupThread(stack=-1) places Persona 3's main EE stack at the top of
+        // guest RAM. Vita cannot rely on the desktop launcher exporting
+        // PS2X_CALLBACK_STACK_TOP, so keep interrupt/RPC callback frames in the
+        // same known-safe low-memory window used by the Mac launch config.
+        // The ELF starts at 0x00100008, leaving 0x00090000-0x00100000 clear.
+        m_asyncCallbackStackFloor = 0x00090000u;
+        m_asyncCallbackStackTop = 0x00100000u;
+#endif
+
         // Experiment: by default callback/interrupt invocation stacks are carved
         // from the top of RAM, which is also where SetupThread(stack=-1) puts the
         // main thread's stack, so handler frames can overwrite live main-thread
