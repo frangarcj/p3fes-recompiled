@@ -10,10 +10,15 @@
 #include "gs_sprite_rules.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cfenv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -30,6 +35,173 @@ namespace
     // The GS is independent of the SSE mode the EE/VU use when submitting. Keep the usual rounding of the
     // approximate rasterizer, also with the thread, and restore the caller's rounding afterwards.
     using GSCpuRoundingScope = GSHostFenv::NearestRoundingScope;
+
+    // Adapted from SirBraga/black-recomp (GPL-3.0), commit
+    // 44843668321cd7bb4bfef33679e5491233acfb55. Keep this opt-in until the
+    // Persona 3 fullscreen passes have been checked visually on Mac/Vita.
+    class RasterPool
+    {
+    public:
+        static RasterPool &instance()
+        {
+            static RasterPool pool;
+            return pool;
+        }
+
+        template <typename Fn>
+        void forRows(int y0, int y1, Fn &&fn)
+        {
+            const int rows = y1 - y0 + 1;
+            if (m_threads.empty() || rows < 8)
+            {
+                for (int y = y0; y <= y1; ++y)
+                    fn(y);
+                return;
+            }
+
+            const int roundingMode = std::fegetround();
+            std::function<void(int)> job = [&fn](int y) { fn(y); };
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_job = &job;
+                m_roundingMode = roundingMode;
+                m_next.store(y0, std::memory_order_relaxed);
+                m_end = y1;
+                m_active = static_cast<unsigned>(m_threads.size());
+                ++m_generation;
+            }
+            m_wake.notify_all();
+            runRows(job, roundingMode);
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_done.wait(lock, [this] { return m_active == 0u; });
+            m_job = nullptr;
+        }
+
+        bool enabled() const noexcept { return !m_threads.empty(); }
+
+    private:
+        RasterPool()
+        {
+            unsigned count = 0u;
+            if (const char *env = std::getenv("PS2X_GS_RASTER_THREADS"))
+                count = static_cast<unsigned>(std::strtoul(env, nullptr, 10));
+            count = std::min(count, 4u);
+            for (unsigned i = 0; i < count; ++i)
+                m_threads.emplace_back([this] { workerLoop(); });
+        }
+
+        ~RasterPool()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_stop = true;
+                ++m_generation;
+            }
+            m_wake.notify_all();
+            for (std::thread &thread : m_threads)
+                if (thread.joinable())
+                    thread.join();
+        }
+
+        void runRows(const std::function<void(int)> &job, int roundingMode)
+        {
+            const int previousRounding = std::fegetround();
+            if (previousRounding != roundingMode)
+                std::fesetround(roundingMode);
+            for (;;)
+            {
+                const int y = m_next.fetch_add(1, std::memory_order_relaxed);
+                if (y > m_end)
+                    break;
+                job(y);
+            }
+            if (previousRounding != roundingMode)
+                std::fesetround(previousRounding);
+        }
+
+        void workerLoop()
+        {
+            uint64_t seen = 0u;
+            for (;;)
+            {
+                const std::function<void(int)> *job = nullptr;
+                int roundingMode = FE_TONEAREST;
+                {
+                    std::unique_lock<std::mutex> lock(m_mutex);
+                    m_wake.wait(lock, [&] { return m_stop || m_generation != seen; });
+                    if (m_stop)
+                        return;
+                    seen = m_generation;
+                    job = m_job;
+                    roundingMode = m_roundingMode;
+                }
+                if (job)
+                    runRows(*job, roundingMode);
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    --m_active;
+                }
+                m_done.notify_one();
+            }
+        }
+
+        std::vector<std::thread> m_threads;
+        std::mutex m_mutex;
+        std::condition_variable m_wake;
+        std::condition_variable m_done;
+        const std::function<void(int)> *m_job = nullptr;
+        std::atomic<int> m_next{0};
+        int m_end = 0;
+        int m_roundingMode = FE_TONEAREST;
+        unsigned m_active = 0u;
+        uint64_t m_generation = 0u;
+        bool m_stop = false;
+    };
+
+    bool isP3DirectT4Draw(const GSDrawState &state)
+    {
+        const auto &tex = state.context.tex0;
+        return state.prim.type == GS_PRIM_TRIFAN && state.prim.tme && !state.prim.fst &&
+               state.linearFilter && tex.psm == GS_PSM_T4 && tex.tbw >= 2u &&
+               (tex.tbp0 & 31u) == 0u;
+    }
+
+    bool p3T4RowsIndependent(const GSDrawState &state, int maxX, int maxY)
+    {
+        if (!isP3DirectT4Draw(state) || maxX < 0 || maxY < 0)
+            return false;
+        const auto &ctx = state.context;
+        if (ctx.frame.psm != GS_PSM_CT32 || ctx.zbuf.psm != GS_PSM_Z16S || ctx.frame.fbw == 0u)
+            return false;
+        if (static_cast<uint32_t>(maxX) >= static_cast<uint32_t>(ctx.frame.fbw) * 64u)
+            return false;
+
+        const uint64_t frameStart = static_cast<uint64_t>(ctx.frame.fbp) * 8192ull;
+        const uint64_t frameRows = static_cast<uint64_t>(maxY / 32 + 1);
+        const uint64_t frameEnd = frameStart + static_cast<uint64_t>(ctx.frame.fbw) * frameRows * 8192ull;
+        const uint64_t depthStart = static_cast<uint64_t>(ctx.zbuf.zbp) * 8192ull;
+        const uint64_t depthRows = static_cast<uint64_t>(maxY / 64 + 1);
+        const uint64_t depthEnd = depthStart + static_cast<uint64_t>(ctx.frame.fbw) * depthRows * 8192ull;
+
+        const uint64_t textureStart = static_cast<uint64_t>(ctx.tex0.tbp0) * 256ull;
+        const uint64_t texturePagesPerRow = std::max<uint64_t>(static_cast<uint64_t>(ctx.tex0.tbw) >> 1u, 1ull);
+        const uint64_t textureRows = (static_cast<uint64_t>(std::max<uint16_t>(state.textureHeight, 1u)) + 127ull) / 128ull;
+        const uint64_t textureEnd = textureStart + texturePagesPerRow * textureRows * 8192ull;
+        constexpr uint64_t vramBytes = GSMem::MEMORY_SIZE;
+        if (frameEnd > vramBytes || depthEnd > vramBytes || textureEnd > vramBytes)
+            return false;
+
+        const auto overlaps = [](uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1)
+        {
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlaps(frameStart, frameEnd, depthStart, depthEnd) ||
+            overlaps(textureStart, textureEnd, frameStart, frameEnd) ||
+            overlaps(textureStart, textureEnd, depthStart, depthEnd))
+            return false;
+        return true;
+    }
+
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -1322,9 +1494,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     // lookup but avoids the page-cache copy and generic table dispatch on each
     // of the four bilinear taps. Keep this narrowly scoped so every other draw
     // continues through the reference CPU GS path.
-    const bool directT4 = state.prim.type == GS_PRIM_TRIFAN && state.prim.tme && !state.prim.fst &&
-                          state.linearFilter && tex.psm == GS_PSM_T4 && tex.tbw >= 2u &&
-                          (tex.tbp0 & 31u) == 0u;
+    const bool directT4 = isP3DirectT4Draw(state);
 
     float texUf, texVf;
     if (state.prim.fst)
@@ -1565,7 +1735,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     if (minX > maxX || minY > maxY)
         return;
 
-    for (int y = minY; y <= maxY; ++y)
+    auto drawRow = [&](int y)
     {
         int64_t edge[3] = {gsTriangleEdge(triangle, 0, minX, y),
                            gsTriangleEdge(triangle, 1, minX, y),
@@ -1647,7 +1817,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * w1 + (v2.fog - v0.fog) * w2));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
-    }
+    };
+
+    const uint64_t boundingPixels = static_cast<uint64_t>(maxX - minX + 1) * static_cast<uint64_t>(maxY - minY + 1);
+    if (boundingPixels >= 8192u && p3T4RowsIndependent(state, maxX, maxY) && RasterPool::instance().enabled())
+        RasterPool::instance().forRows(minY, maxY, drawRow);
+    else
+        for (int y = minY; y <= maxY; ++y)
+            drawRow(y);
 }
 
 void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)

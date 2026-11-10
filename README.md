@@ -171,6 +171,7 @@ being brought up separately through the portable `.p3n` asset/renderer interface
 | `PS2X_AUDIO_STRETCH=0` | Play the sound unstretched when the game runs below full speed (it runs dry instead) |
 | `PS2X_GS_GPU=1` | Built-in OpenGL GS backend instead of the CPU rasterizer |
 | `PS2X_GS_THREAD=1` | Run the GS backend on its own thread |
+| `PS2X_GS_RASTER_THREADS=1..4` | Experimental: split large independent P3 PSMT4 triangle rows across CPU workers (off by default) |
 | `PS2X_MEMCARD1=<path>` / `none` | Memory card for slot 1 (default `memcards/Mcd001.ps2`) |
 | `PS2X_PAD_DEADZONE=0.15` | Analog stick deadzone |
 | `PS2X_HIDE_DEBUG_UI=1` | Hide the developer overlay |
@@ -193,6 +194,8 @@ Debug traces: `PS2X_SPU2_DIAG`, `PS2X_GS_DIAG`, `PS2X_IPU_TRACE`, `PS2X_DMA_LOG`
 - Taylor N. Albarnaz / LightVelox's Shadow of the Colossus fork of PS2Recomp: the OpenGL GS backend (via god-of-war-recomp).
 - [Celosia](https://github.com/HenryKun55/celosia) by HenryKun55: the Vita SDL2/vitaGL host shim and
   reference architecture for sharing a PS2Recomp runtime between Apple Silicon and PS Vita.
+- [black-recomp](https://github.com/SirBraga/black-recomp) by SirBraga: the conservative row-parallel CPU GS
+  raster-worker pattern reused for large independent Persona 3 post-process triangles.
 - [urban-reign-recomp](https://github.com/thiagordsfx/urban-reign-recomp) by thiagordsfx: the PCSX2 GS bridge design.
 - [PCSX2](https://github.com/PCSX2/pcsx2): the IPU, the GS and microVU (VU1 recompiler), and the accuracy reference.
 - [KillzoneRecomp](https://github.com/drakolordx7/KillzoneRecomp) by drakolordx7: kzvu, PCSX2's microVU packaged for
