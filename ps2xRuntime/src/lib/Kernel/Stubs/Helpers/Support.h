@@ -2,6 +2,11 @@
 #include <cstdio>
 #include <cctype>
 
+#if defined(PLATFORM_VITA)
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#endif
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -182,6 +187,32 @@ namespace
         return PS2Runtime::getIoPaths().cdImage;
     }
 
+    bool hostFileSize(const std::filesystem::path &path, uint64_t &sizeOut)
+    {
+#if defined(PLATFORM_VITA)
+        // newlib's std::filesystem::file_size() reaches a 32-bit stat path on
+        // Vita and reports 0xFFFFFFFF for DATA.CVM (> 2 GiB). The native I/O
+        // API exposes the real 64-bit SceOff size, which is what sceCdSearchFile
+        // must return to CRI ROFS/DVCI.
+        SceIoStat status{};
+        if (sceIoGetstat(path.string().c_str(), &status) < 0 || status.st_size < 0)
+        {
+            return false;
+        }
+        sizeOut = static_cast<uint64_t>(status.st_size);
+        return true;
+#else
+        std::error_code ec;
+        const uintmax_t size = std::filesystem::file_size(path, ec);
+        if (ec)
+        {
+            return false;
+        }
+        sizeOut = static_cast<uint64_t>(size);
+        return true;
+#endif
+    }
+
     bool tryGetCdImageTotalSectors(uint64_t &totalSectorsOut)
     {
         const std::filesystem::path imagePath = getCdImagePath();
@@ -192,10 +223,11 @@ namespace
 
         if (!g_cdImageSizeValid || g_cdImageSizePath != imagePath)
         {
-            std::error_code ec;
-            g_cdImageSizeBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, ec));
+            uint64_t sizeBytes = 0;
+            const bool valid = hostFileSize(imagePath, sizeBytes);
+            g_cdImageSizeBytes = sizeBytes;
             g_cdImageSizePath = imagePath;
-            g_cdImageSizeValid = !ec;
+            g_cdImageSizeValid = valid;
         }
         if (!g_cdImageSizeValid)
         {
@@ -380,8 +412,8 @@ namespace
             }
         }
 
-        const uint64_t sizeBytes = std::filesystem::file_size(path, ec);
-        if (ec)
+        uint64_t sizeBytes = 0;
+        if (!hostFileSize(path, sizeBytes))
         {
             g_lastCdError = -1;
             return false;
@@ -414,6 +446,37 @@ namespace
         }
 
         std::memset(dst, 0, byteCount);
+#if defined(PLATFORM_VITA)
+        const std::string nativePath = path.string();
+        const SceUID file = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
+        if (file < 0)
+        {
+            g_lastCdError = -1;
+            return false;
+        }
+
+        const SceOff position = sceIoLseek(file, static_cast<SceOff>(offsetBytes), SCE_SEEK_SET);
+        if (position < 0 || static_cast<uint64_t>(position) != offsetBytes)
+        {
+            sceIoClose(file);
+            g_lastCdError = -1;
+            return false;
+        }
+
+        size_t totalRead = 0;
+        while (totalRead < byteCount)
+        {
+            const int read = sceIoRead(file, dst + totalRead, byteCount - totalRead);
+            if (read <= 0)
+            {
+                break;
+            }
+            totalRead += static_cast<size_t>(read);
+        }
+        sceIoClose(file);
+        g_lastCdError = totalRead == byteCount ? 0 : -1;
+        return totalRead == byteCount;
+#else
         // C stdio with explicit 64-bit seeks: on Windows (llvm-mingw's libc++) ifstream::seekg fails past 2 GB, and
         // DATA.CVM is about 3.3 GB.
 #if defined(_WIN32)
@@ -442,6 +505,7 @@ namespace
         std::fclose(file);
         g_lastCdError = 0;
         return true;
+#endif
     }
 
     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
