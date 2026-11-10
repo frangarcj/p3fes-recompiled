@@ -36,6 +36,11 @@
 #include "audio/stretch.hpp"
 #include <cstdlib>
 
+#if defined(__APPLE__) && !defined(PLATFORM_VITA)
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+#endif
+
 #if !defined(PLATFORM_VITA)
 namespace
 {
@@ -171,6 +176,9 @@ void ps2AudioOnVBlank()
 void ps2AudioOnVBlank() {}
 #endif
 static std::string g_hostWindowTitle; // for the speed readout in the title bar
+#if defined(__APPLE__) && !defined(PLATFORM_VITA)
+static GLFWwindow *g_hwGsGlfwContext = nullptr;
+#endif
 #include "ps2_host_vu1.h"
 
 namespace ps2_stubs
@@ -850,6 +858,32 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to create the runtime host window" << std::endl;
             return false;
         }
+#if defined(__APPLE__) && !defined(PLATFORM_VITA)
+        // Reused from Celosia: the hardware GS runs on its worker thread, so
+        // give it a hidden OpenGL 3.3 core context sharing objects with the
+        // raylib/GLFW window. CPU GS remains the fallback if sharing fails.
+        if (const char *hardwareGs = std::getenv("PS2X_GS_HW");
+            hardwareGs && *hardwareGs && *hardwareGs != '0')
+        {
+            glfwSetErrorCallback([](int code, const char *text)
+                                 { std::cerr << "[gs:hw] GLFW error " << code << ": " << (text ? text : "") << std::endl; });
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+            glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+            GLFWwindow *mainWindow = glfwGetCurrentContext();
+            if (mainWindow)
+                g_hwGsGlfwContext = glfwCreateWindow(16, 16, "p3fes-gs", nullptr, mainWindow);
+            glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+            if (mainWindow)
+                glfwMakeContextCurrent(mainWindow);
+            if (g_hwGsGlfwContext)
+                GSHwBackend::setContextProvider([] { glfwMakeContextCurrent(g_hwGsGlfwContext); });
+            else
+                std::cerr << "[gs:hw] could not create the shared GS OpenGL context; using CPU GS" << std::endl;
+        }
+#endif
 #if defined(PLATFORM_VITA)
         // Celosia's hardware GS uses the one global vitaGL/GXM context. The
         // backend itself serializes GS/host access with ps2xVitaGlMutex(); the
@@ -909,7 +943,14 @@ void PS2Runtime::shutdownHostGraphics()
     if (!m_hostWindowOwned)
         return;
     m_hostPresentation->shutdown(m_gs);
-#if defined(PLATFORM_VITA)
+#if defined(__APPLE__) && !defined(PLATFORM_VITA)
+    GSHwBackend::setContextProvider({});
+    if (g_hwGsGlfwContext)
+    {
+        glfwDestroyWindow(g_hwGsGlfwContext);
+        g_hwGsGlfwContext = nullptr;
+    }
+#elif defined(PLATFORM_VITA)
     GSHwBackend::setPresentHook(nullptr);
 #endif
     if (IsWindowReady())

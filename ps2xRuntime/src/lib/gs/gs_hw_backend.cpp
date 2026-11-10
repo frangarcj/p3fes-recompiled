@@ -2869,6 +2869,11 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
     // picture did not change (no new frame).
     bool presentDirect(const GSPresentationRequest &request, PresentationFrame &frame)
     {
+#if !defined(PS2X_GS_HW_VITA)
+        (void)request;
+        (void)frame;
+        return false;
+#else
         // Keep zero-copy behind a second opt-in while the Celosia backend is
         // being brought up on Persona 3. CPU readback remains the correctness
         // fallback whenever the current display configuration is unsupported.
@@ -2973,6 +2978,7 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         frame.sourceFbp = fbp;
         ++stats.directPresents;
         return true;
+#endif
     }
 
     // A draw sampling a render target the queued draws write: draw those first.
