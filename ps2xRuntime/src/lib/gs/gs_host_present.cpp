@@ -7,10 +7,12 @@
 #include "ps2_log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 namespace
 {
@@ -50,6 +52,44 @@ void GSHostPresentation::restoreHostContext()
 {
     if (captureRequested)
         GSSharedPresent::RestoreHostContext();
+}
+
+void GSHostPresentation::presentDirectTexture(uint32_t texture, uint32_t width, uint32_t height)
+{
+#if defined(PLATFORM_VITA)
+    if (texture == 0u || width == 0u || height == 0u)
+    {
+        workerDirectActive.store(false, std::memory_order_release);
+        return;
+    }
+
+    // Reused from Celosia's Vita presentation model: the GS worker already
+    // owns vitaGL here, so present the GPU texture before handing GL back to
+    // the host loop. The high bit tells the Vita raylib shim this is a raw GL
+    // texture name rather than one of its managed textures.
+    BeginDrawing();
+    ClearBackground(BLACK);
+    const float sourceWidth = static_cast<float>(width);
+    const float sourceHeight = static_cast<float>(height);
+    const float screenWidth = static_cast<float>(GetScreenWidth());
+    const float screenHeight = static_cast<float>(GetScreenHeight());
+    const float aspect = sourceWidth / sourceHeight;
+    const float destinationHeight = std::min(screenHeight, screenWidth / aspect);
+    const float destinationWidth = destinationHeight * aspect;
+    const Rectangle source{0.0f, 0.0f, sourceWidth, sourceHeight};
+    const Rectangle destination{(screenWidth - destinationWidth) * 0.5f,
+                                (screenHeight - destinationHeight) * 0.5f,
+                                destinationWidth, destinationHeight};
+    DrawTexturePro(Texture2D{texture | 0x80000000u, static_cast<int>(width), static_cast<int>(height),
+                             1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8},
+                   source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    EndDrawing();
+    workerDirectActive.store(true, std::memory_order_release);
+#else
+    (void)texture;
+    (void)width;
+    (void)height;
+#endif
 }
 
 void GSHostPresentation::createFallback()
@@ -257,6 +297,17 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
         selected = prepare(gs, vsyncTick);
     }
+#if defined(PLATFORM_VITA)
+    if (workerDirectActive.load(std::memory_order_acquire))
+    {
+        // The GS worker already swapped this picture. Keep pad/window events
+        // moving without drawing another host frame over it or monopolizing
+        // the one vitaGL context between game frames.
+        PollInputEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        return selected;
+    }
+#endif
     BeginDrawing();
     ClearBackground(BLACK);
     const float sourceWidth = static_cast<float>(std::max<uint32_t>(1u, selected.width));
@@ -296,6 +347,7 @@ void GSHostPresentation::shutdown(GS &gs)
     fallback = {};
     if (captureRequested)
         GSSharedPresent::ShutdownHost();
+    workerDirectActive.store(false, std::memory_order_release);
     started = captureRequested = hasLatched = uploaded = uploadedBlank = modeKnown = sharedMode = false;
     lastTick = lastSharedSequence = 0u;
     current = {};

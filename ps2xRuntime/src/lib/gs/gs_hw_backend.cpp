@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_hw_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_direct_frame.h"
 
 // Reused from HenryKun55/celosia (GPL-3.0), commit
 // 059abbdf97097e5dbae3ca3e815364034cd31377. P3FES keeps Celosia's hardware
@@ -2868,17 +2869,14 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
     // picture did not change (no new frame).
     bool presentDirect(const GSPresentationRequest &request, PresentationFrame &frame)
     {
-        // P3FES' host presentation still consumes CPU RGBA frames. Keep
-        // Celosia's zero-copy GL presentation disabled in the first porting
-        // milestone; Present() will write the target back and ask the shadow
-        // CPU backend to pack it. The direct hook can be enabled separately
-        // once the hardware backend itself is verified.
-        (void)request;
-        (void)frame;
-        return false;
-#if 0
-        static const bool disabled = std::getenv("PS2X_GS_HW_DIRECT") && std::atoi(std::getenv("PS2X_GS_HW_DIRECT")) == 0;
-        if (disabled || verify)
+        // Keep zero-copy behind a second opt-in while the Celosia backend is
+        // being brought up on Persona 3. CPU readback remains the correctness
+        // fallback whenever the current display configuration is unsupported.
+        static const bool enabled = [] {
+            const char *value = std::getenv("PS2X_GS_HW_DIRECT");
+            return value && *value && *value != '0';
+        }();
+        if (!enabled || verify)
             return false;
         // One circuit (both enabled on the same buffer is what games do).
         const bool en1 = (request.pmode & 1u) != 0u, en2 = (request.pmode & 2u) != 0u;
@@ -2910,7 +2908,11 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         loadStalePages(rt, dbx, dby, dbx + width, dby + height);
         const std::array<uint64_t, 4> key{static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(width) << 16) | (static_cast<uint64_t>(height) << 32),
                                           rt.version, dispfb, display};
-        if (request.skipIfUnchanged && key == lastPresentKey)
+        // P3FES latches at most once per guest vsync, so an identical target
+        // version/CRTC tuple means the already-presented GPU texture is still
+        // current. Celosia gates this with a request flag that this runtime's
+        // presentation contract does not carry.
+        if (key == lastPresentKey)
             return true;
         lastPresentKey = key;
 
@@ -2971,7 +2973,6 @@ void main() { gl_FragDepth = texelFetch(uZ, ivec2(gl_FragCoord.xy), 0).r; oColor
         frame.sourceFbp = fbp;
         ++stats.directPresents;
         return true;
-#endif
     }
 
     // A draw sampling a render target the queued draws write: draw those first.
@@ -3113,6 +3114,10 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
         m_impl->presents = request.vsyncTick;
         if (directOk)
             return direct;
+#if defined(PS2X_GS_HW_VITA)
+        if (g_presentHook)
+            g_presentHook(0u, 0u, 0u); // resume the host/RAM fallback path
+#endif
     }
     return m_impl->shadow->Present(request);
 }

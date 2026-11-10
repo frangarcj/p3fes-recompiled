@@ -5,6 +5,7 @@
 #include "runtime/gs/gs_shared_present.h"
 #include "runtime/gs/gs_host_acquired_capture.h" // independent, opt-in capture.
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -28,6 +29,10 @@ public:
     // InitWindow precedes capture; the GS's Initialize precedes restore.
     void captureHostContext();
     void restoreHostContext();
+    // Vita hardware GS zero-copy path: called from the GS worker while it owns
+    // the shared vitaGL context. texture==0 returns presentation to the normal
+    // host/RAM path.
+    void presentDirectTexture(uint32_t texture, uint32_t width, uint32_t height);
     View renderFrame(GS &gs, uint64_t vsyncTick, const std::function<void()> &overlay = {});
     // join the game thread first; keeps the host alive while destroying the GS.
     void shutdown(GS &gs);
@@ -57,4 +62,5 @@ private:
     bool uploadedBlank = false;
     bool modeKnown = false;
     bool sharedMode = false;
+    std::atomic<bool> workerDirectActive{false};
 };

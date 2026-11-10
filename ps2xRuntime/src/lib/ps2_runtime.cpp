@@ -854,9 +854,16 @@ bool PS2Runtime::initialize(const char *title)
         // Celosia's hardware GS uses the one global vitaGL/GXM context. The
         // backend itself serializes GS/host access with ps2xVitaGlMutex(); the
         // provider only records that the context is ready before GS creation.
-        if (const char *hardwareGs = std::getenv("PS2X_GS_HW");
-            hardwareGs && *hardwareGs && *hardwareGs != '0')
+        const char *hardwareGs = std::getenv("PS2X_GS_HW");
+        const bool useHardwareGs = hardwareGs && *hardwareGs && *hardwareGs != '0';
+        if (useHardwareGs)
+        {
             GSHwBackend::setContextProvider([] {});
+            const char *direct = std::getenv("PS2X_GS_HW_DIRECT");
+            if (direct && *direct && *direct != '0')
+                GSHwBackend::setPresentHook([this](uint32_t texture, uint32_t width, uint32_t height)
+                                            { m_hostPresentation->presentDirectTexture(texture, width, height); });
+        }
 #endif
         // the GPU backend can only share if the host already exists.
         m_hostPresentation->captureHostContext();
@@ -902,6 +909,9 @@ void PS2Runtime::shutdownHostGraphics()
     if (!m_hostWindowOwned)
         return;
     m_hostPresentation->shutdown(m_gs);
+#if defined(PLATFORM_VITA)
+    GSHwBackend::setPresentHook(nullptr);
+#endif
     if (IsWindowReady())
         CloseWindow();
     m_hostWindowOwned = false;
