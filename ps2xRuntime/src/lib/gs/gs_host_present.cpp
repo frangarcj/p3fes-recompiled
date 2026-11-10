@@ -59,6 +59,8 @@ void GSHostPresentation::presentDirectTexture(uint32_t texture, uint32_t width, 
 #if defined(PLATFORM_VITA)
     if (texture == 0u || width == 0u || height == 0u)
     {
+        workerDirectWidth.store(0u, std::memory_order_relaxed);
+        workerDirectHeight.store(0u, std::memory_order_relaxed);
         workerDirectActive.store(false, std::memory_order_release);
         return;
     }
@@ -84,6 +86,8 @@ void GSHostPresentation::presentDirectTexture(uint32_t texture, uint32_t width, 
                              1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8},
                    source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     EndDrawing();
+    workerDirectWidth.store(width, std::memory_order_relaxed);
+    workerDirectHeight.store(height, std::memory_order_relaxed);
     workerDirectActive.store(true, std::memory_order_release);
 #else
     (void)texture;
@@ -180,6 +184,20 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
         lastTick = vsyncTick;
         hasLatched = true;
     }
+#if defined(PLATFORM_VITA)
+    if (workerDirectActive.load(std::memory_order_acquire))
+    {
+        // The worker has already presented the GPU texture. Do not interpret
+        // GSDirectFrame's tiny transport record as RGBA pixels or touch the
+        // fallback texture; renderFrame() will only poll input for this tick.
+        current = {};
+        current.width = workerDirectWidth.load(std::memory_order_relaxed);
+        current.height = workerDirectHeight.load(std::memory_order_relaxed);
+        current.borrowed = true;
+        current.blank = false;
+        return current;
+    }
+#endif
     current.shared = shared;
     if (shared)
     {
@@ -347,6 +365,8 @@ void GSHostPresentation::shutdown(GS &gs)
     fallback = {};
     if (captureRequested)
         GSSharedPresent::ShutdownHost();
+    workerDirectWidth.store(0u, std::memory_order_relaxed);
+    workerDirectHeight.store(0u, std::memory_order_relaxed);
     workerDirectActive.store(false, std::memory_order_release);
     started = captureRequested = hasLatched = uploaded = uploadedBlank = modeKnown = sharedMode = false;
     lastTick = lastSharedSequence = 0u;

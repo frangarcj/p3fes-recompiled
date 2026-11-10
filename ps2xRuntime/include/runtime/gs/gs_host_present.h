@@ -63,4 +63,6 @@ private:
     bool modeKnown = false;
     bool sharedMode = false;
     std::atomic<bool> workerDirectActive{false};
+    std::atomic<uint32_t> workerDirectWidth{0u};
+    std::atomic<uint32_t> workerDirectHeight{0u};
 };
