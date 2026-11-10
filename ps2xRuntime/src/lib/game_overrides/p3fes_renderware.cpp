@@ -7,8 +7,8 @@
 // The hook is opt-in and still calls the original until the native path can
 // submit the corresponding geometry itself.
 #include "game_overrides.h"
+#include "p3fes_native_present.h"
 #include "ps2_runtime.h"
-#include "runtime/gs/gs_host_present.h"
 #include "runtime/ps2_memory.h"
 #if !defined(__ANDROID__)
 #include "native_renderer/renderer.h"
@@ -20,8 +20,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
-#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -50,6 +48,15 @@ namespace
     constexpr uint32_t kCameraFrameOffset = 0x04u;
     constexpr uint32_t kCameraViewWindowYOffset = 0x6Cu;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
+    constexpr uint32_t kSkyIm2DRenderLine = 0x004ECA60u;
+    constexpr uint32_t kSkyIm2DRenderTriangle = 0x004ECCE0u;
+    constexpr uint32_t kSkyIm2DRenderPrimitive = 0x004EDBA0u;
+    constexpr uint32_t kSkyIm2DRenderIndexedPrimitive = 0x004EEB50u;
+    constexpr uint32_t kRwGp = 0x007D2CF0u;
+    constexpr uint32_t kRwRenderFlags = kRwGp - 20272u;
+    constexpr uint64_t kGsPrimTextureEnable = 0x10u;
+    constexpr float kRwScreenWidth = 640.0f;
+    constexpr float kRwScreenHeight = 448.0f;
     constexpr uint32_t kMaxVertices = 1u << 20;
     constexpr uint32_t kMaxTriangles = 1u << 20;
 
@@ -58,6 +65,7 @@ namespace
     std::atomic<bool> g_nativeEnabled{false};
     std::atomic<bool> g_diagEnabled{false};
     std::atomic<bool> g_diagPrinted{false};
+    std::atomic<bool> g_im2dDiagPrinted{false};
 
     template <typename T>
     bool readGuest(const uint8_t *rdram, uint32_t address, T &value)
@@ -155,12 +163,11 @@ namespace
     using p3fes::native_renderer::Matrix4;
     using p3fes::native_renderer::MeshData;
     using p3fes::native_renderer::MeshId;
-    using p3fes::native_renderer::Renderer;
+    using p3fes::native_renderer::ScreenVertex;
     using p3fes::native_renderer::Submesh;
     using p3fes::native_renderer::Vertex;
 
-    std::unique_ptr<Renderer> g_nativeRenderer;
-    std::unordered_set<MeshId> g_uploadedMeshes;
+    std::unordered_set<MeshId> g_definedMeshes;
     bool g_nativeFrameActive = false;
     uint32_t g_nativeErrors = 0u;
 
@@ -269,72 +276,241 @@ namespace
         return true;
     }
 
-    bool ensureNativeRenderer()
+    bool ensureNativeFrame(uint8_t *rdram)
     {
-        if (!g_nativeRenderer)
-            g_nativeRenderer = p3fes::native_renderer::createPlatformRenderer();
-        if (!g_nativeRenderer)
+        if (g_nativeFrameActive)
+            return true;
+        Camera camera;
+        if (!readCurrentCamera(rdram, camera))
             return false;
-        std::string error;
-        if (!g_nativeRenderer->open(960, 544, "Persona 3 FES native", error))
-        {
-            if (g_nativeErrors++ < 4u)
-                std::fprintf(stderr, "[p3fes-native] renderer open failed: %s\n", error.c_str());
-            return false;
-        }
+        p3fes_native_present::beginFrame(camera, ClearColor{});
+        g_nativeFrameActive = true;
         return true;
     }
 
     bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic)
     {
         AtomicSummary summary;
-        if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u || !ensureNativeRenderer())
+        if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u)
             return false;
 
-        if (!g_nativeFrameActive)
-        {
-            Camera camera;
-            if (!readCurrentCamera(rdram, camera))
-                return false;
-            g_nativeRenderer->beginFrame(camera, ClearColor{});
-            g_nativeFrameActive = true;
-        }
+        if (!ensureNativeFrame(rdram))
+            return false;
 
         MeshId meshId = 0u;
         const int16_t morph = [&] { int16_t value = 0; readGuest(rdram, atomic + kAtomicCurrentMorphOffset, value); return value; }();
         const uint32_t morphIndex = morph >= 0 && static_cast<uint32_t>(morph) < summary.morphTargets ? static_cast<uint32_t>(morph) : 0u;
         meshId = (static_cast<MeshId>(summary.geometry) << 16u) | morphIndex;
-        if (g_uploadedMeshes.find(meshId) == g_uploadedMeshes.end())
+        if (g_definedMeshes.find(meshId) == g_definedMeshes.end())
         {
             MeshData mesh;
             MeshId decodedId = 0u;
-            std::string error;
-            if (!decodeNativeMesh(rdram, summary, mesh, decodedId) || decodedId != meshId ||
-                !g_nativeRenderer->uploadMesh(meshId, mesh, error))
+            if (!decodeNativeMesh(rdram, summary, mesh, decodedId) || decodedId != meshId)
             {
                 if (g_nativeErrors++ < 8u)
-                    std::fprintf(stderr, "[p3fes-native] mesh 0x%08X decode/upload failed%s%s\n",
-                                 summary.geometry, error.empty() ? "" : ": ", error.c_str());
+                    std::fprintf(stderr, "[p3fes-native] mesh 0x%08X decode failed\n", summary.geometry);
                 return false;
             }
-            g_uploadedMeshes.insert(meshId);
+            p3fes_native_present::defineMesh(meshId, mesh);
+            g_definedMeshes.insert(meshId);
         }
 
         Matrix4 model{};
         if (!readFrameMatrix(rdram, summary.frame, model))
             return false;
-        g_nativeRenderer->drawMesh(meshId, model);
+        p3fes_native_present::drawMesh(meshId, model);
         return true;
+    }
+
+    struct RwIm2DVertex
+    {
+        float x, y, z, cameraZ;
+        float u, v, recipZ, pad;
+        float r, g, b, a;
+        float extra[4];
+    };
+    static_assert(sizeof(RwIm2DVertex) == 64u);
+
+    uint32_t reg32(const R5900Context *ctx, uint32_t reg)
+    {
+        return static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[reg]));
+    }
+
+    uint8_t colorByte(float v)
+    {
+        if (!std::isfinite(v))
+            return 0u;
+        return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v)), 0, 255));
+    }
+
+    bool readIm2DVertex(const uint8_t *rdram, uint32_t base, uint32_t index, ScreenVertex &out)
+    {
+        const uint64_t address = static_cast<uint64_t>(base) + static_cast<uint64_t>(index) * sizeof(RwIm2DVertex);
+        if (address + sizeof(RwIm2DVertex) > 0x02000000ull)
+            return false;
+        RwIm2DVertex in{};
+        std::memcpy(&in, rdram + static_cast<uint32_t>(address), sizeof(in));
+        if (!std::isfinite(in.x) || !std::isfinite(in.y) || !std::isfinite(in.z))
+            return false;
+        out.x = in.x;
+        out.y = in.y;
+        out.z = in.z;
+        out.u = std::isfinite(in.u) ? in.u : 0.0f;
+        out.v = std::isfinite(in.v) ? in.v : 0.0f;
+        out.color = {colorByte(in.r), colorByte(in.g), colorByte(in.b), colorByte(in.a)};
+        return true;
+    }
+
+    bool nativeIm2DTextured(const uint8_t *rdram)
+    {
+        uint64_t flags = 0u;
+        return readGuest(rdram, kRwRenderFlags, flags) && (flags & kGsPrimTextureEnable) != 0u;
+    }
+
+    bool drawNativeIm2DTriangles(uint8_t *rdram, uint32_t vertices, uint32_t vertexCount,
+                                 const std::vector<uint16_t> &triangles)
+    {
+        if (vertexCount == 0u || vertexCount > 65535u || triangles.empty() || nativeIm2DTextured(rdram))
+            return false;
+        std::vector<ScreenVertex> out;
+        out.reserve(triangles.size());
+        for (uint16_t index : triangles)
+        {
+            if (index >= vertexCount)
+                return false;
+            ScreenVertex v;
+            if (!readIm2DVertex(rdram, vertices, index, v))
+                return false;
+            out.push_back(v);
+        }
+        if (!ensureNativeFrame(rdram))
+            return false;
+        p3fes_native_present::drawScreenTriangles(std::move(out), kRwScreenWidth, kRwScreenHeight);
+        return true;
+    }
+
+    std::vector<uint16_t> im2dTriangleList(uint32_t primitive, uint32_t count,
+                                          const uint16_t *indices = nullptr)
+    {
+        std::vector<uint16_t> out;
+        auto at = [&](uint32_t i) -> uint16_t { return indices ? indices[i] : static_cast<uint16_t>(i); };
+        if (count > 65535u)
+            return out;
+        switch (primitive)
+        {
+        case 3u: // rwPRIMTYPETRILIST
+            out.reserve((count / 3u) * 3u);
+            for (uint32_t i = 0u; i + 2u < count; i += 3u)
+            {
+                out.push_back(at(i));
+                out.push_back(at(i + 1u));
+                out.push_back(at(i + 2u));
+            }
+            break;
+        case 4u: // rwPRIMTYPETRISTRIP
+            out.reserve(count > 2u ? (count - 2u) * 3u : 0u);
+            for (uint32_t i = 0u; i + 2u < count; ++i)
+            {
+                if (i & 1u)
+                {
+                    out.push_back(at(i + 1u));
+                    out.push_back(at(i));
+                }
+                else
+                {
+                    out.push_back(at(i));
+                    out.push_back(at(i + 1u));
+                }
+                out.push_back(at(i + 2u));
+            }
+            break;
+        case 5u: // rwPRIMTYPETRIFAN
+            out.reserve(count > 2u ? (count - 2u) * 3u : 0u);
+            for (uint32_t i = 1u; i + 1u < count; ++i)
+            {
+                out.push_back(at(0u));
+                out.push_back(at(i));
+                out.push_back(at(i + 1u));
+            }
+            break;
+        default:
+            break; // line list/polyline are added when native line drawing is useful.
+        }
+        return out;
+    }
+
+    void nativeIm2DResult(R5900Context *ctx)
+    {
+        ctx->r[2] = _mm_cvtsi32_si128(1); // every SkyIm2DRender* entry returns 1
+    }
+
+    void p3fesSkyIm2DRenderLine(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[p3fes-native] first Im2D call: line textured=%u\n", nativeIm2DTextured(rdram) ? 1u : 0u);
+        nativeIm2DResult(ctx); // strict native mode: line support is intentionally pending.
+    }
+
+    void p3fesSkyIm2DRenderTriangle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t verts = reg32(ctx, 4u), count = reg32(ctx, 5u);
+        const uint32_t i0 = reg32(ctx, 6u), i1 = reg32(ctx, 7u), i2 = reg32(ctx, 8u);
+        if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[p3fes-native] first Im2D call: triangle vertices=%u textured=%u\n",
+                         count, nativeIm2DTextured(rdram) ? 1u : 0u);
+        if (i0 <= 65535u && i1 <= 65535u && i2 <= 65535u)
+            drawNativeIm2DTriangles(rdram, verts, count,
+                                    {static_cast<uint16_t>(i0), static_cast<uint16_t>(i1), static_cast<uint16_t>(i2)});
+        nativeIm2DResult(ctx);
+    }
+
+    void p3fesSkyIm2DRenderPrimitive(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t primitive = reg32(ctx, 4u), verts = reg32(ctx, 5u), count = reg32(ctx, 6u);
+        if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[p3fes-native] first Im2D call: primitive=%u vertices=%u textured=%u\n",
+                         primitive, count, nativeIm2DTextured(rdram) ? 1u : 0u);
+        drawNativeIm2DTriangles(rdram, verts, count, im2dTriangleList(primitive, count));
+        nativeIm2DResult(ctx);
+    }
+
+    void p3fesSkyIm2DRenderIndexedPrimitive(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t primitive = reg32(ctx, 4u), verts = reg32(ctx, 5u), vertexCount = reg32(ctx, 6u);
+        const uint32_t indicesAddress = reg32(ctx, 7u), indexCount = reg32(ctx, 8u);
+        if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[p3fes-native] first Im2D call: indexed primitive=%u vertices=%u indices=%u textured=%u\n",
+                         primitive, vertexCount, indexCount, nativeIm2DTextured(rdram) ? 1u : 0u);
+        if (indexCount <= 65535u && guestPointer(indicesAddress, indexCount * sizeof(uint16_t)))
+        {
+            std::vector<uint16_t> indices(indexCount);
+            std::memcpy(indices.data(), rdram + indicesAddress, indexCount * sizeof(uint16_t));
+            drawNativeIm2DTriangles(rdram, verts, vertexCount, im2dTriangleList(primitive, indexCount, indices.data()));
+        }
+        nativeIm2DResult(ctx);
+    }
+
+    bool installNativeOnlyHook(PS2Runtime &runtime, uint32_t address, PS2Runtime::RecompiledFunction hook)
+    {
+        PS2Runtime::RecompiledFunction original = runtime.lookupFunction(address);
+        return original && original != hook && runtime.replaceFunction(address, hook);
     }
 
     void finishNativeFrame(PS2Runtime *runtime)
     {
-        if (!g_nativeFrameActive || !g_nativeRenderer)
+        if (!g_nativeFrameActive)
             return;
-        g_nativeRenderer->endFrame();
+        p3fes_native_present::endFrame();
         g_nativeFrameActive = false;
         (void)runtime;
-        ps2xSetExternalPresentationActive(true);
     }
 #endif
 
@@ -360,6 +536,10 @@ namespace
                 // unsupported atomic is missing rather than silently falling
                 // back to the interlaced GS path.
                 drawNativeAtomic(rdram, atomic);
+                // AtomicDefaultRenderCallBack returns the atomic on success.
+                // Native submission itself is the success path here, and
+                // callers do use $v0 as the RenderWare callback result.
+                ctx->r[2] = ctx->r[4];
                 return;
             }
 #endif
@@ -397,6 +577,7 @@ namespace
         g_diagEnabled.store(diagEnabled, std::memory_order_relaxed);
         g_nativeEnabled.store(nativeEnabled, std::memory_order_relaxed);
         g_diagPrinted.store(false, std::memory_order_relaxed);
+        g_im2dDiagPrinted.store(false, std::memory_order_relaxed);
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
         if (diagEnabled)
@@ -412,11 +593,16 @@ namespace
                 g_originalShowRaster.store(show, std::memory_order_release);
                 runtime.replaceFunction(kRwCameraShowRaster, &p3fesRwCameraShowRaster);
             }
+            const bool im2dLine = installNativeOnlyHook(runtime, kSkyIm2DRenderLine, &p3fesSkyIm2DRenderLine);
+            const bool im2dTri = installNativeOnlyHook(runtime, kSkyIm2DRenderTriangle, &p3fesSkyIm2DRenderTriangle);
+            const bool im2dPrim = installNativeOnlyHook(runtime, kSkyIm2DRenderPrimitive, &p3fesSkyIm2DRenderPrimitive);
+            const bool im2dIndexed = installNativeOnlyHook(runtime, kSkyIm2DRenderIndexedPrimitive, &p3fesSkyIm2DRenderIndexedPrimitive);
             // Strict native mode: never let the host GS consumer paint an
             // interlaced fallback over the HLE framebuffer, even before the
             // first supported 3-D atomic appears.
-            ps2xSetExternalPresentationActive(true);
-            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled\n");
+            p3fes_native_present::setActive(true);
+            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; Im2D hooks %u%u%u%u\n",
+                         im2dLine ? 1u : 0u, im2dTri ? 1u : 0u, im2dPrim ? 1u : 0u, im2dIndexed ? 1u : 0u);
         }
 #else
         (void)nativeEnabled;

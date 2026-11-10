@@ -1,0 +1,36 @@
+#pragma once
+
+#if defined(__ANDROID__)
+
+namespace p3fes_native_present
+{
+inline bool active() { return false; }
+inline bool renderHostFrame() { return false; }
+inline void shutdownHost() {}
+}
+
+#else
+
+#include "native_renderer/renderer.h"
+
+#include <vector>
+
+namespace p3fes_native_present
+{
+namespace nr = p3fes::native_renderer;
+
+// Producer side (guest GameThread): CPU-only command recording.
+void setActive(bool active);
+bool active();
+void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
+void defineMesh(nr::MeshId id, const nr::MeshData &mesh);
+void drawMesh(nr::MeshId id, const nr::Matrix4 &model);
+void drawScreenTriangles(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight);
+void endFrame();
+
+// Consumer side (host presentation thread): owns every graphics API call.
+bool renderHostFrame();
+void shutdownHost();
+}
+
+#endif

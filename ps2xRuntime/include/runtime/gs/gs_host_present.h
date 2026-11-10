@@ -12,11 +12,6 @@
 
 class GS;
 
-// Opt-in game HLE renderers can own the host framebuffer for a progressive
-// frame without exposing this control through ps2_runtime.h (which is part of
-// the giant recompiled-code PCH/ABI surface).
-void ps2xSetExternalPresentationActive(bool active);
-
 class GSHostPresentation
 {
 public:

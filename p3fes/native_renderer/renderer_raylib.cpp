@@ -2,6 +2,7 @@
 
 #include <raylib.h>
 #include <raymath.h>
+#include <rlgl.h>
 
 #include <algorithm>
 #include <array>
@@ -274,10 +275,16 @@ public:
         BeginDrawing();
         ClearBackground({clear.r, clear.g, clear.b, clear.a});
         BeginMode3D(m_camera);
+        m_in3D = true;
     }
 
     void drawMesh(MeshId id, const Matrix4 &model) override
     {
+        if (!m_in3D)
+        {
+            BeginMode3D(m_camera);
+            m_in3D = true;
+        }
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
             return;
@@ -308,15 +315,42 @@ public:
         }
     }
 
+    void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
+                             float sourceWidth, float sourceHeight) override
+    {
+        if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
+            return;
+        if (m_in3D)
+        {
+            EndMode3D();
+            m_in3D = false;
+        }
+        const float sx = static_cast<float>(std::max(GetScreenWidth(), 1)) / sourceWidth;
+        const float sy = static_cast<float>(std::max(GetScreenHeight(), 1)) / sourceHeight;
+        rlSetTexture(0);
+        rlDisableBackfaceCulling();
+        rlBegin(RL_TRIANGLES);
+        for (const ScreenVertex &v : vertices)
+        {
+            rlColor4ub(v.color[0], v.color[1], v.color[2], v.color[3]);
+            rlTexCoord2f(v.u, v.v);
+            rlVertex3f(v.x * sx, v.y * sy, v.z);
+        }
+        rlEnd();
+    }
+
     void endFrame() override
     {
-        EndMode3D();
+        if (m_in3D)
+            EndMode3D();
+        m_in3D = false;
         EndDrawing();
     }
 
 private:
     bool m_open = false;
     bool m_ownsWindow = false;
+    bool m_in3D = false;
     ::Material m_material{};
     Camera3D m_camera{};
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;

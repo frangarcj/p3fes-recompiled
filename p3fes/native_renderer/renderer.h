@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace p3fes::native_renderer
 {
@@ -39,6 +40,17 @@ struct ClearColor
     std::uint8_t a = 255;
 };
 
+// Host-side RenderWare Im2D vertex. Coordinates stay in the game's logical
+// 640x448-ish screen space; the backend scales them to the progressive host
+// framebuffer. Texture binding is intentionally separate so untextured fades
+// and colour-only UI can move off the GS before live RwRaster upload support.
+struct ScreenVertex
+{
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float u = 0.0f, v = 0.0f;
+    std::array<std::uint8_t, 4> color{255u, 255u, 255u, 255u};
+};
+
 class Renderer
 {
 public:
@@ -57,6 +69,8 @@ public:
     virtual void beginFrame(const Camera &camera, ClearColor clear) = 0;
     virtual void drawMesh(MeshId id, const Matrix4 &model) = 0;
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix); }
+    virtual void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
+                                     float sourceWidth, float sourceHeight) = 0;
     virtual void endFrame() = 0;
 };
 

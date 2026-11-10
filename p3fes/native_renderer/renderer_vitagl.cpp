@@ -37,6 +37,12 @@ struct GpuVertex
     std::uint8_t color[4];
 };
 
+struct ScreenGpuVertex
+{
+    float x, y, z;
+    std::uint8_t r, g, b, a;
+};
+
 struct DrawPart
 {
     GLuint vertexBuffer = 0;
@@ -352,6 +358,7 @@ public:
 
     void beginFrame(const Camera &camera, ClearColor clear) override
     {
+        m_camera = camera;
         BeginDrawing(); // holds ps2xVitaGlMutex until EndDrawing
         glClearColor(clear.r / 255.0f, clear.g / 255.0f, clear.b / 255.0f, clear.a / 255.0f);
         glClearDepthf(1.0f);
@@ -363,23 +370,13 @@ public:
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-        const float aspect = static_cast<float>(std::max(GetScreenWidth(), 1)) /
-                             static_cast<float>(std::max(GetScreenHeight(), 1));
-        constexpr float nearPlane = 0.1f;
-        constexpr float farPlane = 10000.0f;
-        const float radians = camera.fovy * 0.008726646259971648f;
-        const float top = nearPlane * std::tan(std::max(radians, 0.01f));
-        const float right = top * aspect;
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glFrustumf(-right, right, -top, top, nearPlane, farPlane);
-        const std::array<float, 16> view = lookAt(camera);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadMatrixf(view.data());
+        apply3D();
     }
 
     void drawMesh(MeshId id, const Matrix4 &model) override
     {
+        if (!m_in3D)
+            apply3D();
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
             return;
@@ -420,10 +417,42 @@ public:
         glPopMatrix();
     }
 
+    void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
+                             float sourceWidth, float sourceHeight) override
+    {
+        if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
+            return;
+        std::vector<ScreenGpuVertex> gpu;
+        gpu.reserve(vertices.size());
+        for (const ScreenVertex &v : vertices)
+            gpu.push_back({v.x, v.y, v.z, v.color[0], v.color[1], v.color[2], v.color[3]});
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_TEXTURE_2D);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrthof(0.0f, sourceWidth, sourceHeight, 0.0f, -1.0f, 1.0f);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glVertexPointer(3, GL_FLOAT, sizeof(ScreenGpuVertex), &gpu[0].x);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenGpuVertex), &gpu[0].r);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(gpu.size()));
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+        m_in3D = false;
+    }
+
     void endFrame() override
     {
         glDisable(GL_DEPTH_TEST);
         EndDrawing();
+        m_in3D = false;
     }
 
 private:
@@ -448,8 +477,31 @@ private:
 
     bool m_open = false;
     bool m_ownsWindow = false;
+    bool m_in3D = false;
+    Camera m_camera{};
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
     std::unordered_map<std::string, GLuint> m_textures;
+
+    void apply3D()
+    {
+        const float aspect = static_cast<float>(std::max(GetScreenWidth(), 1)) /
+                             static_cast<float>(std::max(GetScreenHeight(), 1));
+        constexpr float nearPlane = 0.1f;
+        constexpr float farPlane = 10000.0f;
+        const float radians = m_camera.fovy * 0.008726646259971648f;
+        const float top = nearPlane * std::tan(std::max(radians, 0.01f));
+        const float right = top * aspect;
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glFrustumf(-right, right, -top, top, nearPlane, farPlane);
+        const std::array<float, 16> view = lookAt(m_camera);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadMatrixf(view.data());
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        m_in3D = true;
+    }
 };
 } // namespace
 

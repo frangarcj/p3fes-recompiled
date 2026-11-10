@@ -1,5 +1,6 @@
 // host context, frame selection and raylib drawing used by the port.
 #include "runtime/gs/gs_host_present.h"
+#include "../game_overrides/p3fes_native_present.h"
 #include "runtime/gs/gs_direct_frame.h"
 #include "runtime/gs/gs_host_present_diag.h" // window without extra GPU reads.
 #include "runtime/gs/gs_frontend.h"
@@ -30,7 +31,6 @@ namespace
         uint32_t width = 0u, height = 0u;
         uint64_t serial = 0u;
     } s_pcsx2;
-    std::atomic<bool> s_externalPresentationActive{false};
 
     void releasePcsx2View()
     {
@@ -58,11 +58,6 @@ namespace
         (void)fence;
 #endif
     }
-}
-
-void ps2xSetExternalPresentationActive(bool active)
-{
-    s_externalPresentationActive.store(active, std::memory_order_release);
 }
 
 void GSHostPresentation::captureHostContext()
@@ -375,12 +370,14 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
 
 GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncTick, const std::function<void()> &overlay)
 {
-    if (s_externalPresentationActive.load(std::memory_order_acquire))
+    if (p3fes_native_present::active())
     {
-        // The HLE/native renderer already swapped a progressive host frame.
-        // Keep input/window events moving, but never paint an interlaced GS
-        // fallback over that native picture.
-        PollInputEvents();
+        // Game-thread hooks only record CPU-side draw commands. Execute every
+        // graphics API call here, on the host thread that owns the raylib/GL
+        // context, and never paint an interlaced GS fallback over the native
+        // progressive frame.
+        if (!p3fes_native_present::renderHostFrame())
+            PollInputEvents();
         return current;
     }
     View selected;
@@ -442,7 +439,7 @@ void GSHostPresentation::shutdown(GS &gs)
     workerDirectHeight.store(0u, std::memory_order_relaxed);
     workerDirectLastNs.store(0u, std::memory_order_relaxed);
     workerDirectActive.store(false, std::memory_order_release);
-    s_externalPresentationActive.store(false, std::memory_order_release);
+    p3fes_native_present::shutdownHost();
     started = captureRequested = hasLatched = uploaded = uploadedBlank = modeKnown = sharedMode = false;
     lastTick = lastSharedSequence = 0u;
     current = {};

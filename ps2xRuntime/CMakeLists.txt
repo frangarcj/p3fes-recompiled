@@ -451,6 +451,7 @@ endif()
 add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
     src/lib/game_overrides.cpp
     src/lib/game_overrides/p3fes_renderware.cpp
+    src/lib/game_overrides/p3fes_native_present.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
