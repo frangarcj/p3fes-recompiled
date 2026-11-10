@@ -317,7 +317,8 @@ public:
 
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                              float sourceWidth, float sourceHeight,
-                             std::string_view textureName) override
+                             std::string_view textureName,
+                             const ScreenDrawState &state) override
     {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
@@ -333,7 +334,35 @@ public:
         {
             const auto texture = m_textures.find(textureKey(textureName));
             if (texture != m_textures.end())
+            {
                 textureId = texture->second.id;
+                rlTextureParameters(textureId, RL_TEXTURE_WRAP_S,
+                                    state.clampU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+                rlTextureParameters(textureId, RL_TEXTURE_WRAP_T,
+                                    state.clampV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+                const int filter = state.linearFilter ? RL_TEXTURE_FILTER_LINEAR : RL_TEXTURE_FILTER_NEAREST;
+                rlTextureParameters(textureId, RL_TEXTURE_MIN_FILTER, filter);
+                rlTextureParameters(textureId, RL_TEXTURE_MAG_FILTER, filter);
+            }
+        }
+        switch (state.blend)
+        {
+        case ScreenBlend::Opaque:
+            rlDisableColorBlend();
+            break;
+        case ScreenBlend::Additive:
+            rlEnableColorBlend();
+            rlSetBlendMode(RL_BLEND_ADDITIVE);
+            break;
+        case ScreenBlend::Subtractive:
+            rlEnableColorBlend();
+            rlSetBlendFactors(RL_SRC_ALPHA, RL_ONE, RL_FUNC_REVERSE_SUBTRACT);
+            rlSetBlendMode(RL_BLEND_CUSTOM);
+            break;
+        default:
+            rlEnableColorBlend();
+            rlSetBlendMode(RL_BLEND_ALPHA);
+            break;
         }
         rlSetTexture(textureId);
         rlDisableBackfaceCulling();
@@ -346,6 +375,8 @@ public:
         }
         rlEnd();
         rlSetTexture(0);
+        rlEnableColorBlend();
+        rlSetBlendMode(RL_BLEND_ALPHA);
     }
 
     void endFrame() override

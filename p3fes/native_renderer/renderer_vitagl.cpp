@@ -420,7 +420,8 @@ public:
 
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                              float sourceWidth, float sourceHeight,
-                             std::string_view textureName) override
+                             std::string_view textureName,
+                             const ScreenDrawState &state) override
     {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
@@ -442,9 +443,34 @@ public:
         {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
         }
         else
             glDisable(GL_TEXTURE_2D);
+        switch (state.blend)
+        {
+        case ScreenBlend::Opaque:
+            glDisable(GL_BLEND);
+            break;
+        case ScreenBlend::Additive:
+            glEnable(GL_BLEND);
+            glBlendEquation(GL_FUNC_ADD);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            break;
+        case ScreenBlend::Subtractive:
+            glEnable(GL_BLEND);
+            glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            break;
+        default:
+            glEnable(GL_BLEND);
+            glBlendEquation(GL_FUNC_ADD);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+        }
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         glOrthof(0.0f, sourceWidth, sourceHeight, 0.0f, -1.0f, 1.0f);
@@ -469,6 +495,9 @@ public:
         glDisableClientState(GL_VERTEX_ARRAY);
         glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         m_in3D = false;
     }
 

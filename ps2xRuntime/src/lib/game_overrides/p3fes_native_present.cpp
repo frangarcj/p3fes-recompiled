@@ -30,6 +30,7 @@ struct ScreenDraw
     float sourceWidth = 640.0f;
     float sourceHeight = 448.0f;
     std::string textureName;
+    ScreenDrawState state{};
 };
 
 struct TextureDefinition
@@ -201,13 +202,14 @@ void drawMesh(MeshId id, const Matrix4 &model)
 }
 
 void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, float sourceHeight,
-                         std::string textureName)
+                         std::string textureName, ScreenDrawState state)
 {
     if (!active() || vertices.empty())
         return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_buildingOpen)
-        g_building.draws.emplace_back(ScreenDraw{std::move(vertices), sourceWidth, sourceHeight, std::move(textureName)});
+        g_building.draws.emplace_back(ScreenDraw{std::move(vertices), sourceWidth, sourceHeight,
+                                                std::move(textureName), state});
 }
 
 void endFrame()
@@ -252,7 +254,7 @@ bool renderHostFrame()
         {
             if (ensureTexture(screen->textureName))
                 g_renderer->drawScreenTriangles(screen->vertices, screen->sourceWidth, screen->sourceHeight,
-                                                screen->textureName);
+                                                screen->textureName, screen->state);
         }
     }
     g_renderer->endFrame();

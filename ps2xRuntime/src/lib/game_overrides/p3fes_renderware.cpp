@@ -56,8 +56,12 @@ namespace
     constexpr uint32_t kSkyIm2DRenderIndexedPrimitive = 0x004EEB50u;
     constexpr uint32_t kRwGp = 0x007D2CF0u;
     constexpr uint32_t kRwRenderFlags = kRwGp - 20272u;
+    constexpr uint32_t kRwClamp1 = kRwGp - 17048u;
+    constexpr uint32_t kRwTex1 = kRwGp - 17040u;
+    constexpr uint32_t kRwAlpha1 = kRwGp - 17032u;
     constexpr uint32_t kRwCurrentRaster = kRwGp - 16948u;
     constexpr uint64_t kGsPrimTextureEnable = 0x10u;
+    constexpr uint64_t kGsPrimAlphaBlendEnable = 0x40u;
     constexpr float kRwScreenWidth = 640.0f;
     constexpr float kRwScreenHeight = 448.0f;
     constexpr uint32_t kMaxVertices = 1u << 20;
@@ -168,6 +172,8 @@ namespace
     using p3fes::native_renderer::MeshData;
     using p3fes::native_renderer::MeshId;
     using p3fes::native_renderer::ScreenVertex;
+    using p3fes::native_renderer::ScreenBlend;
+    using p3fes::native_renderer::ScreenDrawState;
     using p3fes::native_renderer::Submesh;
     using p3fes::native_renderer::TextureData;
     using p3fes::native_renderer::Vertex;
@@ -371,6 +377,34 @@ namespace
     {
         uint64_t flags = 0u;
         return readGuest(rdram, kRwRenderFlags, flags) && (flags & kGsPrimTextureEnable) != 0u;
+    }
+
+    ScreenDrawState nativeIm2DState(const uint8_t *rdram)
+    {
+        ScreenDrawState state;
+        uint64_t flags = 0u, alpha = 0u, clamp = 0u, tex1 = 0u;
+        readGuest(rdram, kRwRenderFlags, flags);
+        readGuest(rdram, kRwAlpha1, alpha);
+        readGuest(rdram, kRwClamp1, clamp);
+        readGuest(rdram, kRwTex1, tex1);
+
+        if ((flags & kGsPrimAlphaBlendEnable) == 0u)
+            state.blend = ScreenBlend::Opaque;
+        else
+        {
+            switch (alpha & 0xFFu)
+            {
+            case 0x48u: state.blend = ScreenBlend::Additive; break;   // Cs * As + Cd
+            case 0x42u: state.blend = ScreenBlend::Subtractive; break; // Cd - Cs * As
+            default: state.blend = ScreenBlend::Alpha; break;
+            }
+        }
+        const uint32_t wms = static_cast<uint32_t>(clamp & 0x3u);
+        const uint32_t wmt = static_cast<uint32_t>((clamp >> 2u) & 0x3u);
+        state.clampU = wms == 1u || wms == 2u;
+        state.clampV = wmt == 1u || wmt == 2u;
+        state.linearFilter = (tex1 & (1ull << 5u)) != 0u; // GS TEX1.MMAG
+        return state;
     }
 
     struct RasterSummary
@@ -586,7 +620,7 @@ namespace
         if (!ensureNativeFrame(rdram))
             return false;
         p3fes_native_present::drawScreenTriangles(std::move(out), kRwScreenWidth, kRwScreenHeight,
-                                                  std::move(textureName));
+                                                  std::move(textureName), nativeIm2DState(rdram));
         return true;
     }
 

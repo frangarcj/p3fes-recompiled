@@ -51,6 +51,22 @@ struct ScreenVertex
     std::array<std::uint8_t, 4> color{255u, 255u, 255u, 255u};
 };
 
+enum class ScreenBlend : std::uint8_t
+{
+    Alpha,
+    Additive,
+    Subtractive,
+    Opaque,
+};
+
+struct ScreenDrawState
+{
+    ScreenBlend blend = ScreenBlend::Alpha;
+    bool clampU = false;
+    bool clampV = false;
+    bool linearFilter = true;
+};
+
 class Renderer
 {
 public:
@@ -71,7 +87,8 @@ public:
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix); }
     virtual void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                                      float sourceWidth, float sourceHeight,
-                                     std::string_view textureName = {}) = 0;
+                                     std::string_view textureName = {},
+                                     const ScreenDrawState &state = {}) = 0;
     virtual void endFrame() = 0;
 };
 
