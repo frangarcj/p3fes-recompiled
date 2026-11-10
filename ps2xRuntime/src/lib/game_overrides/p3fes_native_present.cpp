@@ -31,6 +31,7 @@ struct ScreenDraw
     float sourceHeight = 448.0f;
     std::string textureName;
     ScreenDrawState state{};
+    bool lines = false;
 };
 
 struct TextureDefinition
@@ -209,7 +210,18 @@ void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, 
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_buildingOpen)
         g_building.draws.emplace_back(ScreenDraw{std::move(vertices), sourceWidth, sourceHeight,
-                                                std::move(textureName), state});
+                                                std::move(textureName), state, false});
+}
+
+void drawScreenLines(std::vector<ScreenVertex> vertices, float sourceWidth, float sourceHeight,
+                     std::string textureName, ScreenDrawState state)
+{
+    if (!active() || vertices.empty())
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_buildingOpen)
+        g_building.draws.emplace_back(ScreenDraw{std::move(vertices), sourceWidth, sourceHeight,
+                                                std::move(textureName), state, true});
 }
 
 void endFrame()
@@ -253,8 +265,14 @@ bool renderHostFrame()
         else if (const auto *screen = std::get_if<ScreenDraw>(&draw))
         {
             if (ensureTexture(screen->textureName))
-                g_renderer->drawScreenTriangles(screen->vertices, screen->sourceWidth, screen->sourceHeight,
+            {
+                if (screen->lines)
+                    g_renderer->drawScreenLines(screen->vertices, screen->sourceWidth, screen->sourceHeight,
                                                 screen->textureName, screen->state);
+                else
+                    g_renderer->drawScreenTriangles(screen->vertices, screen->sourceWidth, screen->sourceHeight,
+                                                    screen->textureName, screen->state);
+            }
         }
     }
     g_renderer->endFrame();

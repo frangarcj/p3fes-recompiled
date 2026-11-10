@@ -29,6 +29,8 @@ void defineTexture(const nr::TextureData &texture, uint64_t revision);
 void drawMesh(nr::MeshId id, const nr::Matrix4 &model);
 void drawScreenTriangles(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight,
                          std::string textureName = {}, nr::ScreenDrawState state = {});
+void drawScreenLines(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight,
+                     std::string textureName = {}, nr::ScreenDrawState state = {});
 void endFrame();
 
 // Consumer side (host presentation thread): owns every graphics API call.

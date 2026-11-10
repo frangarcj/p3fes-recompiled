@@ -89,6 +89,10 @@ public:
                                      float sourceWidth, float sourceHeight,
                                      std::string_view textureName = {},
                                      const ScreenDrawState &state = {}) = 0;
+    virtual void drawScreenLines(const std::vector<ScreenVertex> &vertices,
+                                 float sourceWidth, float sourceHeight,
+                                 std::string_view textureName = {},
+                                 const ScreenDrawState &state = {}) = 0;
     virtual void endFrame() = 0;
 };
 

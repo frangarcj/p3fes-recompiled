@@ -624,6 +624,60 @@ namespace
         return true;
     }
 
+    bool drawNativeIm2DLines(uint8_t *rdram, uint32_t vertices, uint32_t vertexCount,
+                             const std::vector<uint16_t> &lines)
+    {
+        if (vertexCount == 0u || vertexCount > 65535u || lines.empty())
+            return false;
+        std::string textureName;
+        if (nativeIm2DTextured(rdram) && !prepareNativeIm2DTexture(rdram, textureName))
+            return false;
+        std::vector<ScreenVertex> out;
+        out.reserve(lines.size());
+        for (uint16_t index : lines)
+        {
+            if (index >= vertexCount)
+                return false;
+            ScreenVertex v;
+            if (!readIm2DVertex(rdram, vertices, index, v))
+                return false;
+            out.push_back(v);
+        }
+        if (!ensureNativeFrame(rdram))
+            return false;
+        p3fes_native_present::drawScreenLines(std::move(out), kRwScreenWidth, kRwScreenHeight,
+                                             std::move(textureName), nativeIm2DState(rdram));
+        return true;
+    }
+
+    std::vector<uint16_t> im2dLineList(uint32_t primitive, uint32_t count,
+                                      const uint16_t *indices = nullptr)
+    {
+        std::vector<uint16_t> out;
+        auto at = [&](uint32_t i) -> uint16_t { return indices ? indices[i] : static_cast<uint16_t>(i); };
+        if (count > 65535u)
+            return out;
+        if (primitive == 1u) // rwPRIMTYPELINELIST
+        {
+            out.reserve((count / 2u) * 2u);
+            for (uint32_t i = 0u; i + 1u < count; i += 2u)
+            {
+                out.push_back(at(i));
+                out.push_back(at(i + 1u));
+            }
+        }
+        else if (primitive == 2u) // rwPRIMTYPEPOLYLINE
+        {
+            out.reserve(count > 1u ? (count - 1u) * 2u : 0u);
+            for (uint32_t i = 0u; i + 1u < count; ++i)
+            {
+                out.push_back(at(i));
+                out.push_back(at(i + 1u));
+            }
+        }
+        return out;
+    }
+
     std::vector<uint16_t> im2dTriangleList(uint32_t primitive, uint32_t count,
                                           const uint16_t *indices = nullptr)
     {
@@ -669,7 +723,7 @@ namespace
             }
             break;
         default:
-            break; // line list/polyline are added when native line drawing is useful.
+            break;
         }
         return out;
     }
@@ -683,9 +737,14 @@ namespace
     {
         if (!ctx)
             return;
+        const uint32_t verts = reg32(ctx, 4u), count = reg32(ctx, 5u);
+        const uint32_t i0 = reg32(ctx, 6u), i1 = reg32(ctx, 7u);
         if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "[p3fes-native] first Im2D call: line textured=%u\n", nativeIm2DTextured(rdram) ? 1u : 0u);
-        nativeIm2DResult(ctx); // strict native mode: line support is intentionally pending.
+        if (i0 <= 65535u && i1 <= 65535u)
+            drawNativeIm2DLines(rdram, verts, count,
+                                {static_cast<uint16_t>(i0), static_cast<uint16_t>(i1)});
+        nativeIm2DResult(ctx);
     }
 
     void p3fesSkyIm2DRenderTriangle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
@@ -711,7 +770,10 @@ namespace
         if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "[p3fes-native] first Im2D call: primitive=%u vertices=%u textured=%u\n",
                          primitive, count, nativeIm2DTextured(rdram) ? 1u : 0u);
-        drawNativeIm2DTriangles(rdram, verts, count, im2dTriangleList(primitive, count));
+        if (primitive == 1u || primitive == 2u)
+            drawNativeIm2DLines(rdram, verts, count, im2dLineList(primitive, count));
+        else
+            drawNativeIm2DTriangles(rdram, verts, count, im2dTriangleList(primitive, count));
         nativeIm2DResult(ctx);
     }
 
@@ -728,7 +790,10 @@ namespace
         {
             std::vector<uint16_t> indices(indexCount);
             std::memcpy(indices.data(), rdram + indicesAddress, indexCount * sizeof(uint16_t));
-            drawNativeIm2DTriangles(rdram, verts, vertexCount, im2dTriangleList(primitive, indexCount, indices.data()));
+            if (primitive == 1u || primitive == 2u)
+                drawNativeIm2DLines(rdram, verts, vertexCount, im2dLineList(primitive, indexCount, indices.data()));
+            else
+                drawNativeIm2DTriangles(rdram, verts, vertexCount, im2dTriangleList(primitive, indexCount, indices.data()));
         }
         nativeIm2DResult(ctx);
     }

@@ -423,6 +423,30 @@ public:
                              std::string_view textureName,
                              const ScreenDrawState &state) override
     {
+        drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_TRIANGLES);
+    }
+
+    void drawScreenLines(const std::vector<ScreenVertex> &vertices,
+                         float sourceWidth, float sourceHeight,
+                         std::string_view textureName,
+                         const ScreenDrawState &state) override
+    {
+        drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_LINES);
+    }
+
+    void endFrame() override
+    {
+        glDisable(GL_DEPTH_TEST);
+        EndDrawing();
+        m_in3D = false;
+    }
+
+private:
+    void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
+                             float sourceWidth, float sourceHeight,
+                             std::string_view textureName,
+                             const ScreenDrawState &state, GLenum primitive)
+    {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
         std::vector<ScreenGpuVertex> gpu;
@@ -489,7 +513,7 @@ public:
             glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glVertexPointer(3, GL_FLOAT, sizeof(ScreenGpuVertex), &gpu[0].x);
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenGpuVertex), &gpu[0].r);
-        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(gpu.size()));
+        glDrawArrays(primitive, 0, static_cast<GLsizei>(gpu.size()));
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);
         glDisableClientState(GL_VERTEX_ARRAY);
@@ -500,15 +524,6 @@ public:
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         m_in3D = false;
     }
-
-    void endFrame() override
-    {
-        glDisable(GL_DEPTH_TEST);
-        EndDrawing();
-        m_in3D = false;
-    }
-
-private:
     void removeTextureLocked(std::string_view name)
     {
         auto found = m_textures.find(textureKey(name));

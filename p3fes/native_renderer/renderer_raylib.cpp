@@ -320,6 +320,31 @@ public:
                              std::string_view textureName,
                              const ScreenDrawState &state) override
     {
+        drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, RL_TRIANGLES);
+    }
+
+    void drawScreenLines(const std::vector<ScreenVertex> &vertices,
+                         float sourceWidth, float sourceHeight,
+                         std::string_view textureName,
+                         const ScreenDrawState &state) override
+    {
+        drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, RL_LINES);
+    }
+
+    void endFrame() override
+    {
+        if (m_in3D)
+            EndMode3D();
+        m_in3D = false;
+        EndDrawing();
+    }
+
+private:
+    void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
+                             float sourceWidth, float sourceHeight,
+                             std::string_view textureName,
+                             const ScreenDrawState &state, int primitive)
+    {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
         if (m_in3D)
@@ -366,7 +391,7 @@ public:
         }
         rlSetTexture(textureId);
         rlDisableBackfaceCulling();
-        rlBegin(RL_TRIANGLES);
+        rlBegin(primitive);
         for (const ScreenVertex &v : vertices)
         {
             rlColor4ub(v.color[0], v.color[1], v.color[2], v.color[3]);
@@ -378,16 +403,6 @@ public:
         rlEnableColorBlend();
         rlSetBlendMode(RL_BLEND_ALPHA);
     }
-
-    void endFrame() override
-    {
-        if (m_in3D)
-            EndMode3D();
-        m_in3D = false;
-        EndDrawing();
-    }
-
-private:
     bool m_open = false;
     bool m_ownsWindow = false;
     bool m_in3D = false;
