@@ -1,6 +1,7 @@
 #include "ps2_runtime.h"
 #include "runtime/gs/gs_pcsx2.h"
 #include "runtime/gs/gs_host_present.h" // the host's private consumer.
+#include "runtime/gs/gs_hw_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_perf.h"
 #include "ps2_stubs.h"
@@ -849,6 +850,14 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to create the runtime host window" << std::endl;
             return false;
         }
+#if defined(PLATFORM_VITA)
+        // Celosia's hardware GS uses the one global vitaGL/GXM context. The
+        // backend itself serializes GS/host access with ps2xVitaGlMutex(); the
+        // provider only records that the context is ready before GS creation.
+        if (const char *hardwareGs = std::getenv("PS2X_GS_HW");
+            hardwareGs && *hardwareGs && *hardwareGs != '0')
+            GSHwBackend::setContextProvider([] {});
+#endif
         // the GPU backend can only share if the host already exists.
         m_hostPresentation->captureHostContext();
         if (!syncCoreSubsystems())

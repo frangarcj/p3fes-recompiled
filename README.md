@@ -170,6 +170,7 @@ being brought up separately through the portable `.p3n` asset/renderer interface
 | `PS2X_FRAME_CAP_FIELDS=1` | Let the game logic run at 60 updates per second (default 2: 30, like the console) |
 | `PS2X_AUDIO_STRETCH=0` | Play the sound unstretched when the game runs below full speed (it runs dry instead) |
 | `PS2X_GS_GPU=1` | Built-in OpenGL GS backend instead of the CPU rasterizer |
+| `PS2X_GS_HW=1` | Experimental Celosia hardware GS (vitaGL on Vita); CPU GS remains the default fallback |
 | `PS2X_GS_THREAD=1` | Run the GS backend on its own thread |
 | `PS2X_GS_RASTER_THREADS=1..4` | Experimental: split large independent P3 PSMT4 triangle rows across CPU workers (off by default) |
 | `PS2X_MEMCARD1=<path>` / `none` | Memory card for slot 1 (default `memcards/Mcd001.ps2`) |

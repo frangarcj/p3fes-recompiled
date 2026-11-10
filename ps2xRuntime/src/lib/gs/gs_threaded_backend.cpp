@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_hw_backend.h"
 #include "runtime/gs/gs_host_fenv.h"
 #include "runtime/gs/gs_shared_present.h"
 #include "ThreadPriority.h"
@@ -91,6 +92,14 @@ GSThreadedBackend::~GSThreadedBackend()
 
 std::unique_ptr<GSRasterBackend> GSThreadedBackend::MakeDefault()
 {
+    const char *hardware = std::getenv("PS2X_GS_HW");
+    const bool useHardware = hardware && *hardware && *hardware != '0';
+    if (useHardware)
+    {
+        if (GSHwBackend::available())
+            return std::make_unique<GSThreadedBackend>(std::make_unique<GSHwBackend>());
+        std::fprintf(stderr, "[gs:hw] requested but no compatible host GL/vitaGL context is available; using CPU GS\n");
+    }
     const char *value = std::getenv("PS2X_GS_THREAD");
     const bool enabled = (value && *value) ? *value != '0' : s_enabledByDefault.load();
     const char *gpu = std::getenv("PS2X_GS_GPU");
