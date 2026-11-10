@@ -158,7 +158,6 @@ namespace
 
 
 GS::GS()
-    : m_backend(GSThreadedBackend::MakeDefault())
 {
     reset();
 }
@@ -168,6 +167,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
+    // Backend selection must happen after the host graphics context exists.
+    // The macOS hardware GS installs its shared-context provider during
+    // PS2Runtime::initialize(), immediately before this init call.
     if (!m_backend)
         m_backend = GSThreadedBackend::MakeDefault();
     m_backend->Initialize(vram, vramSize);
