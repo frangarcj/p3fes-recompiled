@@ -86,6 +86,9 @@ struct MeshDrawState
     bool depthWrite = true;
     CullMode cullMode = CullMode::Back;
     bool blendEnabled = true;
+    bool clampU = false;
+    bool clampV = false;
+    bool linearFilter = true;
 
     // Optional per-draw RenderWare material colours. Persona 3 mutates these
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,

@@ -323,7 +323,7 @@ namespace
 
     void readNativeGlobalMeshState(const uint8_t *rdram, MeshDrawState &state)
     {
-        uint64_t zbuf = 0u, test = 0u;
+        uint64_t zbuf = 0u, test = 0u, clamp = 0u, tex1 = 0u;
         uint64_t renderFlags = 0u;
         uint32_t cull = 2u, srcBlend = 5u, dstBlend = 6u;
         if (readGuest(rdram, kRwZbuf1, zbuf))
@@ -340,6 +340,15 @@ namespace
             default: state.cullMode = MeshDrawState::CullMode::Back; break;
             }
         }
+        if (readGuest(rdram, kRwClamp1, clamp))
+        {
+            const uint32_t wms = static_cast<uint32_t>(clamp & 0x3u);
+            const uint32_t wmt = static_cast<uint32_t>((clamp >> 2u) & 0x3u);
+            state.clampU = wms == 1u || wms == 2u;
+            state.clampV = wmt == 1u || wmt == 2u;
+        }
+        if (readGuest(rdram, kRwTex1, tex1))
+            state.linearFilter = (tex1 & (1ull << 5u)) != 0u; // GS TEX1.MMAG
         if (readGuest(rdram, kRwRenderFlags, renderFlags))
             state.blendEnabled = (renderFlags & kGsPrimAlphaBlendEnable) != 0u;
         if (state.blendEnabled && readGuest(rdram, kRwSrcBlend, srcBlend) && readGuest(rdram, kRwDstBlend, dstBlend) &&

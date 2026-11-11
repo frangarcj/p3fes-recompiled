@@ -30,6 +30,19 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
+void applyMeshSampler(unsigned int textureId, const MeshDrawState &state)
+{
+    if (!textureId)
+        return;
+    rlTextureParameters(textureId, RL_TEXTURE_WRAP_S,
+                        state.clampU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+    rlTextureParameters(textureId, RL_TEXTURE_WRAP_T,
+                        state.clampV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+    const int filter = state.linearFilter ? RL_TEXTURE_FILTER_LINEAR : RL_TEXTURE_FILTER_NEAREST;
+    rlTextureParameters(textureId, RL_TEXTURE_MIN_FILTER, filter);
+    rlTextureParameters(textureId, RL_TEXTURE_MAG_FILTER, filter);
+}
+
 int rwBlendFactor(std::uint8_t factor)
 {
     switch (factor)
@@ -440,7 +453,10 @@ public:
             {
                 auto texture = m_textures.find(textureKey(part.textureName));
                 if (texture != m_textures.end())
+                {
+                    applyMeshSampler(texture->second.id, state);
                     diffuse.texture = texture->second;
+                }
             }
             // Matrix4 uses the normal OpenGL column-major order. raylib's
             // Matrix struct names are laid out by rows, so spell the mapping
@@ -456,6 +472,7 @@ public:
                 const auto dualTexture = m_textures.find(textureKey(dual->textureName));
                 if (dualTexture != m_textures.end())
                 {
+                    applyMeshSampler(dualTexture->second.id, state);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
                         const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
@@ -480,6 +497,7 @@ public:
                 const auto envTexture = m_textures.find(textureKey(env->textureName));
                 if (envTexture != m_textures.end())
                 {
+                    applyMeshSampler(envTexture->second.id, state);
                     const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
@@ -557,7 +575,10 @@ public:
         {
             const auto found = m_textures.find(textureKey(textureName));
             if (found != m_textures.end())
+            {
                 textureId = found->second.id;
+                applyMeshSampler(textureId, state);
+            }
         }
         rlSetTexture(textureId);
         rlPushMatrix();

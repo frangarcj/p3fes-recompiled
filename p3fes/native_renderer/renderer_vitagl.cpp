@@ -74,6 +74,17 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
+void applyMeshSampler(GLuint texture, const MeshDrawState &state)
+{
+    if (!texture)
+        return;
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
+}
+
 GLenum rwBlendFactor(std::uint8_t factor)
 {
     switch (factor)
@@ -497,6 +508,7 @@ public:
             {
                 glEnable(GL_TEXTURE_2D);
                 glBindTexture(GL_TEXTURE_2D, texture->second);
+                applyMeshSampler(texture->second, state);
                 glEnableClientState(GL_TEXTURE_COORD_ARRAY);
                 glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
             }
@@ -515,6 +527,7 @@ public:
                 const auto dualTexture = m_textures.find(textureKey(dual->textureName));
                 if (dualTexture != m_textures.end())
                 {
+                    applyMeshSampler(dualTexture->second, state);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
                         const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
@@ -544,6 +557,7 @@ public:
                 const auto envTexture = m_textures.find(textureKey(env->textureName));
                 if (envTexture != m_textures.end())
                 {
+                    applyMeshSampler(envTexture->second, state);
                     const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
@@ -632,7 +646,10 @@ public:
         {
             const auto found = m_textures.find(textureKey(textureName));
             if (found != m_textures.end())
+            {
                 texture = found->second;
+                applyMeshSampler(texture, state);
+            }
         }
         if (texture)
         {
