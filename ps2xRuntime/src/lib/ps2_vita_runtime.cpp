@@ -5,8 +5,15 @@
 
 // Heap sizes must live in a native object as well(bc of LTO).
 // the newlib malloc/new arena (PS2 guest RAM 32MB + GS + buffers live here).
-extern "C" unsigned int _newlib_heap_size_user = 96u * 1024u * 1024u;
+// Reused from Celosia's Vita memory setup: its recompiled PS2 runtime needed
+// substantially more than 96 MB once guest RAM, GS state and renderer buffers
+// were live together. Keep enough headroom for the same workload here.
+extern "C" unsigned int _newlib_heap_size_user = 176u * 1024u * 1024u;
 extern "C" unsigned int sceLibcHeapSize = 8u * 1024u * 1024u;
+// Recompiled guest code can nest native C++ calls deeply. VitaSDK's default
+// main-thread stack is too small for that pattern; Celosia uses 8 MB.
+extern "C" unsigned int sceUserMainThreadStackSize = 8u * 1024u * 1024u;
+extern "C" unsigned int _pthread_stack_default_user = 32u * 1024u;
 
 // Celosia's host shim calls this optional runtime hook once every few seconds.
 // Persona 3 does not yet have Celosia's emergency-heap controller, so keep the
