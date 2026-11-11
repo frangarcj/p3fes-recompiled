@@ -284,6 +284,7 @@ namespace
 
     std::unordered_set<MeshId> g_definedMeshes;
     std::unordered_map<uint32_t, uint64_t> g_rasterRevisions;
+    std::unordered_map<uint32_t, std::string> g_frameRasterTextures;
     bool g_nativeFrameActive = false;
     uint32_t g_nativeErrors = 0u;
 
@@ -949,17 +950,10 @@ namespace
             if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
                 !readGuest(rdram, texture + kTextureRasterOffset, raster) || !raster)
                 continue;
-            TextureData nativeTexture;
-            uint64_t revision = 0u;
-            if (!decodeNativeRaster(rdram, raster, nativeTexture, revision))
+            std::string textureName;
+            if (!prepareNativeRasterTexture(rdram, raster, textureName))
                 continue;
-            mesh.materials[materialIndex].textureName = nativeTexture.name;
-            const auto known = g_rasterRevisions.find(raster);
-            if (known == g_rasterRevisions.end() || known->second != revision)
-            {
-                p3fes_native_present::defineTexture(nativeTexture, revision);
-                g_rasterRevisions[raster] = revision;
-            }
+            mesh.materials[materialIndex].textureName = std::move(textureName);
         }
         return true;
     }
@@ -1075,17 +1069,10 @@ namespace
             if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
                 !readGuest(rdram, texture + kTextureRasterOffset, raster) || !raster)
                 continue;
-            TextureData nativeTexture;
-            uint64_t revision = 0u;
-            if (!decodeNativeRaster(rdram, raster, nativeTexture, revision))
+            std::string textureName;
+            if (!prepareNativeRasterTexture(rdram, raster, textureName))
                 continue;
-            mesh.materials[localMaterial].textureName = nativeTexture.name;
-            const auto known = g_rasterRevisions.find(raster);
-            if (known == g_rasterRevisions.end() || known->second != revision)
-            {
-                p3fes_native_present::defineTexture(nativeTexture, revision);
-                g_rasterRevisions[raster] = revision;
-            }
+            mesh.materials[localMaterial].textureName = std::move(textureName);
         }
         meshId = (1ull << 63u) | sector;
         return !mesh.indices.empty();
@@ -1518,6 +1505,18 @@ namespace
     {
         if (!raster)
             return false;
+        // RenderWare commonly submits the same raster many times in one frame
+        // (fonts, movie quads, layered UI). Decoding and hashing the CPU raster
+        // for every primitive dominated the game thread during the intro. A
+        // raster can be considered stable across one CameraShowRaster frame;
+        // dynamic rasters are rechecked on the next frame, preserving the
+        // existing content-revision upload path without repeated per-draw work.
+        const auto frameCached = g_frameRasterTextures.find(raster);
+        if (frameCached != g_frameRasterTextures.end())
+        {
+            textureName = frameCached->second;
+            return true;
+        }
         TextureData texture;
         uint64_t revision = 0u;
         if (!decodeNativeRaster(rdram, raster, texture, revision))
@@ -1529,6 +1528,7 @@ namespace
             p3fes_native_present::defineTexture(texture, revision);
             g_rasterRevisions[raster] = revision;
         }
+        g_frameRasterTextures.emplace(raster, textureName);
         return true;
     }
 
@@ -1981,6 +1981,7 @@ namespace
             return;
         p3fes_native_present::endFrame();
         g_nativeFrameActive = false;
+        g_frameRasterTextures.clear();
         (void)runtime;
     }
 #endif
