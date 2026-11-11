@@ -592,6 +592,87 @@ public:
         glDisable(GL_CULL_FACE);
     }
 
+    void drawWorldLines(const std::vector<Vertex> &vertices, const Matrix4 &model,
+                        std::string_view textureName, const MeshDrawState &state) override
+    {
+        if (vertices.size() < 2u)
+            return;
+        if (!m_in3D)
+            apply3D();
+
+        std::vector<GpuVertex> gpu(vertices.size());
+        for (std::size_t i = 0; i < vertices.size(); ++i)
+        {
+            const Vertex &in = vertices[i];
+            GpuVertex &out = gpu[i];
+            std::copy(in.position.begin(), in.position.end(), out.position);
+            std::copy(in.normal.begin(), in.normal.end(), out.normal);
+            std::copy(in.texCoord.begin(), in.texCoord.end(), out.uv);
+            std::copy(in.color.begin(), in.color.end(), out.color);
+        }
+
+        if (state.depthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+        glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
+        glBlendEquation(GL_FUNC_ADD);
+        if (!state.blendEnabled)
+            glDisable(GL_BLEND);
+        else if (!state.materialBlends.empty() && state.materialBlends[0].enabled)
+        {
+            glEnable(GL_BLEND);
+            glBlendFunc(rwBlendFactor(state.materialBlends[0].src), rwBlendFactor(state.materialBlends[0].dst));
+        }
+        else
+        {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+
+        GLuint texture = 0u;
+        if (!textureName.empty())
+        {
+            const auto found = m_textures.find(textureKey(textureName));
+            if (found != m_textures.end())
+                texture = found->second;
+        }
+        if (texture)
+        {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, texture);
+        }
+        else
+            glDisable(GL_TEXTURE_2D);
+
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glMultMatrixf(model.data());
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), &gpu[0].position[0]);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), &gpu[0].color[0]);
+        if (texture)
+        {
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), &gpu[0].uv[0]);
+        }
+        else
+            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gpu.size()));
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+        glPopMatrix();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_TEXTURE_2D);
+
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+    }
+
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                              float sourceWidth, float sourceHeight,
                              std::string_view textureName,

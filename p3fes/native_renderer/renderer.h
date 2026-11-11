@@ -190,6 +190,11 @@ public:
     virtual void beginFrame(const Camera &camera, ClearColor clear) = 0;
     virtual void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state = {}) = 0;
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix, {}); }
+    // Transient world-space lines (RenderWare Im3D/debug/effect paths). The
+    // vertex vector is already expanded as pairs, so no persistent GPU mesh is
+    // required and callers can submit short-lived line batches cheaply.
+    virtual void drawWorldLines(const std::vector<Vertex> &vertices, const Matrix4 &model,
+                                std::string_view textureName = {}, const MeshDrawState &state = {}) = 0;
     virtual void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                                      float sourceWidth, float sourceHeight,
                                      std::string_view textureName = {},

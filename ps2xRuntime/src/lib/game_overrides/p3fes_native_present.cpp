@@ -25,6 +25,21 @@ struct MeshDraw
     MeshDrawState state{};
 };
 
+struct TransientMeshDraw
+{
+    MeshData mesh;
+    Matrix4 model = kIdentityMatrix;
+    MeshDrawState state{};
+};
+
+struct WorldLineDraw
+{
+    std::vector<Vertex> vertices;
+    Matrix4 model = kIdentityMatrix;
+    std::string textureName;
+    MeshDrawState state{};
+};
+
 struct ScreenDraw
 {
     std::vector<ScreenVertex> vertices;
@@ -41,7 +56,7 @@ struct TextureDefinition
     uint64_t revision = 0;
 };
 
-using Draw = std::variant<MeshDraw, ScreenDraw>;
+using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw>;
 
 struct Frame
 {
@@ -203,6 +218,25 @@ void drawMesh(MeshId id, const Matrix4 &model, MeshDrawState state)
         g_building.draws.emplace_back(MeshDraw{id, model, std::move(state)});
 }
 
+void drawTransientMesh(MeshData mesh, const Matrix4 &model, MeshDrawState state)
+{
+    if (!active() || mesh.vertices.empty())
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_buildingOpen)
+        g_building.draws.emplace_back(TransientMeshDraw{std::move(mesh), model, std::move(state)});
+}
+
+void drawWorldLines(std::vector<Vertex> vertices, const Matrix4 &model,
+                    std::string textureName, MeshDrawState state)
+{
+    if (!active() || vertices.size() < 2u)
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_buildingOpen)
+        g_building.draws.emplace_back(WorldLineDraw{std::move(vertices), model, std::move(textureName), std::move(state)});
+}
+
 void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, float sourceHeight,
                          std::string textureName, ScreenDrawState state)
 {
@@ -256,12 +290,41 @@ bool renderHostFrame()
 
     const Frame &frame = *g_hostFrame;
     g_renderer->beginFrame(frame.camera, frame.clear);
+    uint64_t transientIndex = 0u;
     for (const Draw &draw : frame.draws)
     {
         if (const auto *mesh = std::get_if<MeshDraw>(&draw))
         {
             if (ensureMesh(mesh->id))
                 g_renderer->drawMesh(mesh->id, mesh->model, mesh->state);
+        }
+        else if (const auto *transient = std::get_if<TransientMeshDraw>(&draw))
+        {
+            bool texturesReady = true;
+            for (const Material &material : transient->mesh.materials)
+                if (!ensureTexture(material.textureName))
+                    texturesReady = false;
+            if (!texturesReady)
+                continue;
+
+            // Bit 62 is outside the persistent atomic/sector ID spaces used by
+            // this port. The mesh is removed immediately after the draw.
+            const MeshId id = (1ull << 62u) | ((frame.sequence & 0x3FFFFFFFull) << 20u) |
+                              (transientIndex++ & 0xFFFFFull);
+            std::string error;
+            if (!g_renderer->uploadMesh(id, transient->mesh, error))
+            {
+                if (g_errors++ < 8u)
+                    std::fprintf(stderr, "[p3fes-native] transient mesh upload failed: %s\n", error.c_str());
+                continue;
+            }
+            g_renderer->drawMesh(id, transient->model, transient->state);
+            g_renderer->removeMesh(id);
+        }
+        else if (const auto *lines = std::get_if<WorldLineDraw>(&draw))
+        {
+            if (ensureTexture(lines->textureName))
+                g_renderer->drawWorldLines(lines->vertices, lines->model, lines->textureName, lines->state);
         }
         else if (const auto *screen = std::get_if<ScreenDraw>(&draw))
         {

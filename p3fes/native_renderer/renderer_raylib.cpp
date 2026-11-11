@@ -518,6 +518,69 @@ public:
         rlSetCullFace(RL_CULL_FACE_BACK);
     }
 
+    void drawWorldLines(const std::vector<Vertex> &vertices, const Matrix4 &model,
+                        std::string_view textureName, const MeshDrawState &state) override
+    {
+        if (vertices.size() < 2u)
+            return;
+        if (!m_in3D)
+        {
+            if (m_exactCamera)
+            {
+                rlSetMatrixProjection(m_exactProjection);
+                rlSetMatrixModelview(m_exactView);
+            }
+            else
+                BeginMode3D(m_camera);
+            m_in3D = true;
+        }
+
+        if (state.depthTest) rlEnableDepthTest(); else rlDisableDepthTest();
+        if (state.depthWrite) rlEnableDepthMask(); else rlDisableDepthMask();
+        if (!state.blendEnabled)
+            rlDisableColorBlend();
+        else if (!state.materialBlends.empty() && state.materialBlends[0].enabled)
+        {
+            rlEnableColorBlend();
+            rlSetBlendFactors(rwBlendFactor(state.materialBlends[0].src),
+                              rwBlendFactor(state.materialBlends[0].dst), RL_FUNC_ADD);
+            rlSetBlendMode(RL_BLEND_CUSTOM);
+        }
+        else
+        {
+            rlEnableColorBlend();
+            rlSetBlendMode(RL_BLEND_ALPHA);
+        }
+
+        unsigned int textureId = 0u;
+        if (!textureName.empty())
+        {
+            const auto found = m_textures.find(textureKey(textureName));
+            if (found != m_textures.end())
+                textureId = found->second.id;
+        }
+        rlSetTexture(textureId);
+        rlPushMatrix();
+        rlMultMatrixf(model.data());
+        rlBegin(RL_LINES);
+        for (const Vertex &v : vertices)
+        {
+            rlColor4ub(v.color[0], v.color[1], v.color[2], v.color[3]);
+            rlTexCoord2f(v.texCoord[0], v.texCoord[1]);
+            rlVertex3f(v.position[0], v.position[1], v.position[2]);
+        }
+        rlEnd();
+        rlPopMatrix();
+        rlSetTexture(0);
+
+        rlEnableDepthTest();
+        rlEnableDepthMask();
+        rlEnableColorBlend();
+        rlSetBlendMode(RL_BLEND_ALPHA);
+        rlEnableBackfaceCulling();
+        rlSetCullFace(RL_CULL_FACE_BACK);
+    }
+
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                              float sourceWidth, float sourceHeight,
                              std::string_view textureName,

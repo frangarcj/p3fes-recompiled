@@ -112,6 +112,11 @@ namespace
     constexpr uint32_t kCameraFarPlaneOffset = 0x84u;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
     constexpr uint32_t kPtankAtomicRender = 0x00474160u;
+    constexpr uint32_t kRwIm3DTransform = 0x004F1ED0u;
+    constexpr uint32_t kRwIm3DEnd = 0x004F1F80u;
+    constexpr uint32_t kRwIm3DRenderIndexedPrimitive = 0x004F1FD0u;
+    constexpr uint32_t kRwIm3DRenderPrimitive = 0x004F2150u;
+    constexpr uint32_t kRwIm3DRenderLine = 0x004F22B0u;
     constexpr uint32_t kSkyIm2DRenderLine = 0x004ECA60u;
     constexpr uint32_t kSkyIm2DRenderTriangle = 0x004ECCE0u;
     constexpr uint32_t kSkyIm2DRenderPrimitive = 0x004EDBA0u;
@@ -136,6 +141,9 @@ namespace
     constexpr float kRwScreenHeight = 448.0f;
     constexpr uint32_t kMaxVertices = 1u << 20;
     constexpr uint32_t kMaxTriangles = 1u << 20;
+    constexpr uint32_t kIm3DVertexSize = 36u;
+    constexpr uint32_t kIm3DFlagUv = 0x01u;
+    constexpr uint32_t kIm3DEffectiveFields = 0x18u; // Transform ORs XYZ + RGBA into the PS2 instance flags.
     constexpr uint32_t kMatFxEffectOffset = 128u;
     constexpr uint32_t kMatFxSlotSize = 64u;
     constexpr uint32_t kMatFxSlotTypeOffset = 32u;
@@ -158,6 +166,17 @@ namespace
     std::atomic<bool> g_im2dTextureDiagPrinted{false};
     std::atomic<bool> g_sectorDiagPrinted{false};
     std::atomic<bool> g_ptankDiagPrinted{false};
+    std::atomic<bool> g_im3dDiagPrinted{false};
+
+    struct NativeIm3DState
+    {
+        uint32_t vertices = 0u;
+        uint32_t count = 0u;
+        uint32_t matrix = 0u;
+        uint32_t flags = 0u;
+        bool open = false;
+    };
+    NativeIm3DState g_nativeIm3D;
 
     template <typename T>
     bool readGuest(const uint8_t *rdram, uint32_t address, T &value)
@@ -342,11 +361,10 @@ namespace
                readGuest(rdram, address + 8u, out[2]);
     }
 
-    bool readFrameMatrix(const uint8_t *rdram, uint32_t frame, Matrix4 &out)
+    bool readRwMatrix(const uint8_t *rdram, uint32_t m, Matrix4 &out)
     {
-        if (!guestPointer(frame, kFrameLtmOffset + 64u))
+        if (!guestPointer(m, 64u))
             return false;
-        const uint32_t m = frame + kFrameLtmOffset;
         std::array<float, 3> right{}, up{}, at{}, pos{};
         if (!readVec3(rdram, m + 0u, right) || !readVec3(rdram, m + 16u, up) ||
             !readVec3(rdram, m + 32u, at) || !readVec3(rdram, m + 48u, pos))
@@ -356,6 +374,13 @@ namespace
                at[0], at[1], at[2], 0.0f,
                pos[0], pos[1], pos[2], 1.0f};
         return true;
+    }
+
+    bool readFrameMatrix(const uint8_t *rdram, uint32_t frame, Matrix4 &out)
+    {
+        if (!guestPointer(frame, kFrameLtmOffset + 64u))
+            return false;
+        return readRwMatrix(rdram, frame + kFrameLtmOffset, out);
     }
 
     void readMaterialSurface(const uint8_t *rdram, uint32_t material,
@@ -1636,6 +1661,235 @@ namespace
         return out;
     }
 
+    bool readIm3DVertex(const uint8_t *rdram, uint32_t base, uint32_t index, uint32_t flags, Vertex &out)
+    {
+        const uint64_t address = static_cast<uint64_t>(base) + static_cast<uint64_t>(index) * kIm3DVertexSize;
+        if (address + kIm3DVertexSize > PS2_RAM_SIZE)
+            return false;
+        const uint32_t v = static_cast<uint32_t>(address);
+        if (!readVec3(rdram, v, out.position) ||
+            !std::all_of(out.position.begin(), out.position.end(), [](float x) { return std::isfinite(x); }))
+            return false;
+        std::memcpy(out.color.data(), rdram + v + 12u, 4u);
+        if ((flags & kIm3DFlagUv) != 0u)
+        {
+            if (!readGuest(rdram, v + 28u, out.texCoord[0]) || !readGuest(rdram, v + 32u, out.texCoord[1]) ||
+                !std::isfinite(out.texCoord[0]) || !std::isfinite(out.texCoord[1]))
+                return false;
+        }
+        return true;
+    }
+
+    bool nativeIm3DModel(const uint8_t *rdram, Matrix4 &model)
+    {
+        model = p3fes::native_renderer::kIdentityMatrix;
+        return g_nativeIm3D.matrix == 0u || readRwMatrix(rdram, g_nativeIm3D.matrix, model);
+    }
+
+    bool nativeIm3DSourceIndices(const uint8_t *rdram, bool indexed, uint32_t indicesAddress,
+                                 uint32_t count, std::vector<uint16_t> &indices)
+    {
+        if (!indexed)
+            return count <= g_nativeIm3D.count;
+        if (count > (1u << 20u) || !guestPointer(indicesAddress, count * sizeof(uint16_t)))
+            return false;
+        indices.resize(count);
+        if (count)
+            std::memcpy(indices.data(), rdram + indicesAddress, count * sizeof(uint16_t));
+        return true;
+    }
+
+    bool submitNativeIm3D(uint8_t *rdram, uint32_t primitive, bool indexed,
+                          uint32_t indicesAddress, uint32_t indexCount)
+    {
+        if (!g_nativeIm3D.open || g_nativeIm3D.count == 0u || g_nativeIm3D.count > 65536u)
+            return false;
+
+        std::vector<Vertex> vertices(g_nativeIm3D.count);
+        for (uint32_t i = 0u; i < g_nativeIm3D.count; ++i)
+            if (!readIm3DVertex(rdram, g_nativeIm3D.vertices, i, g_nativeIm3D.flags, vertices[i]))
+                return false;
+
+        std::vector<uint16_t> sourceIndices;
+        const uint32_t sourceCount = indexed ? indexCount : g_nativeIm3D.count;
+        if (!nativeIm3DSourceIndices(rdram, indexed, indicesAddress, sourceCount, sourceIndices))
+            return false;
+        auto at = [&](uint32_t i) -> uint32_t {
+            return indexed ? static_cast<uint32_t>(sourceIndices[i]) : i;
+        };
+        auto valid = [&](uint32_t i) { return i < g_nativeIm3D.count; };
+
+        std::string textureName;
+        if (nativeIm2DTextured(rdram) && !prepareNativeIm2DTexture(rdram, textureName))
+            return false;
+        MeshDrawState drawState;
+        readNativeGlobalMeshState(rdram, drawState);
+        Matrix4 model{};
+        if (!nativeIm3DModel(rdram, model) || !ensureNativeFrame(rdram))
+            return false;
+
+        bool queued = false;
+        if (primitive == 1u || primitive == 2u)
+        {
+            std::vector<Vertex> lines;
+            const uint32_t pairs = primitive == 1u ? sourceCount / 2u : (sourceCount > 1u ? sourceCount - 1u : 0u);
+            lines.reserve(static_cast<size_t>(pairs) * 2u);
+            if (primitive == 1u)
+            {
+                for (uint32_t i = 0u; i + 1u < sourceCount; i += 2u)
+                {
+                    const uint32_t a = at(i), b = at(i + 1u);
+                    if (!valid(a) || !valid(b)) return false;
+                    lines.push_back(vertices[a]); lines.push_back(vertices[b]);
+                }
+            }
+            else
+            {
+                for (uint32_t i = 0u; i + 1u < sourceCount; ++i)
+                {
+                    const uint32_t a = at(i), b = at(i + 1u);
+                    if (!valid(a) || !valid(b)) return false;
+                    lines.push_back(vertices[a]); lines.push_back(vertices[b]);
+                }
+            }
+            if (!lines.empty())
+            {
+                p3fes_native_present::drawWorldLines(std::move(lines), model, std::move(textureName), std::move(drawState));
+                queued = true;
+            }
+        }
+        else if (primitive == 3u || primitive == 4u || primitive == 5u)
+        {
+            MeshData mesh;
+            mesh.vertices = std::move(vertices);
+            mesh.hasPrelight = true;
+            mesh.materials.resize(1u);
+            mesh.materials[0].textureName = std::move(textureName);
+            if (primitive == 3u)
+            {
+                mesh.indices.reserve((sourceCount / 3u) * 3u);
+                for (uint32_t i = 0u; i + 2u < sourceCount; i += 3u)
+                {
+                    const uint32_t a = at(i), b = at(i + 1u), c = at(i + 2u);
+                    if (!valid(a) || !valid(b) || !valid(c)) return false;
+                    mesh.indices.push_back(a); mesh.indices.push_back(b); mesh.indices.push_back(c);
+                }
+            }
+            else if (primitive == 4u)
+            {
+                mesh.indices.reserve(sourceCount > 2u ? (sourceCount - 2u) * 3u : 0u);
+                for (uint32_t i = 0u; i + 2u < sourceCount; ++i)
+                {
+                    uint32_t a = at(i), b = at(i + 1u), c = at(i + 2u);
+                    if (!valid(a) || !valid(b) || !valid(c)) return false;
+                    if (a == b || b == c || a == c) continue;
+                    if (i & 1u) std::swap(a, b);
+                    mesh.indices.push_back(a); mesh.indices.push_back(b); mesh.indices.push_back(c);
+                }
+            }
+            else
+            {
+                mesh.indices.reserve(sourceCount > 2u ? (sourceCount - 2u) * 3u : 0u);
+                for (uint32_t i = 1u; i + 1u < sourceCount; ++i)
+                {
+                    const uint32_t a = at(0u), b = at(i), c = at(i + 1u);
+                    if (!valid(a) || !valid(b) || !valid(c)) return false;
+                    mesh.indices.push_back(a); mesh.indices.push_back(b); mesh.indices.push_back(c);
+                }
+            }
+            if (!mesh.indices.empty())
+            {
+                mesh.submeshes.push_back(Submesh{0u, static_cast<uint32_t>(mesh.indices.size()), 0u});
+                p3fes_native_present::drawTransientMesh(std::move(mesh), model, std::move(drawState));
+                queued = true;
+            }
+        }
+
+        if (!g_im3dDiagPrinted.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[p3fes-native] first Im3D: primitive=%u vertices=%u indices=%u indexed=%u textured=%u native=%u\n",
+                         primitive, g_nativeIm3D.count, sourceCount, indexed ? 1u : 0u,
+                         nativeIm2DTextured(rdram) ? 1u : 0u, queued ? 1u : 0u);
+        return queued;
+    }
+
+    void p3fesRwIm3DTransform(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t vertices = reg32(ctx, 4u), count = reg32(ctx, 5u), matrix = reg32(ctx, 6u), flags = reg32(ctx, 7u);
+        const uint64_t bytes = static_cast<uint64_t>(count) * kIm3DVertexSize;
+        const bool valid = count <= 65536u && bytes <= PS2_RAM_SIZE &&
+                           guestPointer(vertices, static_cast<uint32_t>(bytes)) &&
+                           (matrix == 0u || guestPointer(matrix, 64u));
+        if (valid)
+            g_nativeIm3D = NativeIm3DState{vertices, count, matrix, flags | kIm3DEffectiveFields, true};
+        else
+            g_nativeIm3D = {};
+        ctx->r[2] = _mm_cvtsi32_si128(valid ? static_cast<int32_t>(vertices) : 0);
+    }
+
+    void p3fesRwIm3DRenderPrimitive(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t primitive = reg32(ctx, 4u);
+        const bool valid = g_nativeIm3D.open && primitive >= 1u && primitive <= 5u;
+        if (valid)
+            submitNativeIm3D(rdram, primitive, false, 0u, g_nativeIm3D.count);
+        ctx->r[2] = _mm_cvtsi32_si128(valid ? 1 : 0);
+    }
+
+    void p3fesRwIm3DRenderIndexedPrimitive(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t primitive = reg32(ctx, 4u), indices = reg32(ctx, 5u), count = reg32(ctx, 6u);
+        const uint64_t bytes = static_cast<uint64_t>(count) * sizeof(uint16_t);
+        const bool valid = g_nativeIm3D.open && primitive >= 1u && primitive <= 5u &&
+                           count <= (1u << 20u) && bytes <= PS2_RAM_SIZE &&
+                           guestPointer(indices, static_cast<uint32_t>(bytes));
+        if (valid)
+            submitNativeIm3D(rdram, primitive, true, indices, count);
+        ctx->r[2] = _mm_cvtsi32_si128(valid ? 1 : 0);
+    }
+
+    void p3fesRwIm3DRenderLine(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const uint32_t a = reg32(ctx, 4u), b = reg32(ctx, 5u);
+        const bool valid = g_nativeIm3D.open && a < g_nativeIm3D.count && b < g_nativeIm3D.count;
+        if (valid)
+        {
+            // RenderLine is just an indexed two-vertex line-list in the stock
+            // implementation; use a tiny guest-independent index buffer here.
+            std::vector<Vertex> vertices(2u);
+            if (readIm3DVertex(rdram, g_nativeIm3D.vertices, a, g_nativeIm3D.flags, vertices[0]) &&
+                readIm3DVertex(rdram, g_nativeIm3D.vertices, b, g_nativeIm3D.flags, vertices[1]))
+            {
+                Matrix4 model{};
+                MeshDrawState state;
+                std::string textureName;
+                if (nativeIm3DModel(rdram, model) && ensureNativeFrame(rdram))
+                {
+                    readNativeGlobalMeshState(rdram, state);
+                    if (!nativeIm2DTextured(rdram) || prepareNativeIm2DTexture(rdram, textureName))
+                        p3fes_native_present::drawWorldLines(std::move(vertices), model, std::move(textureName), std::move(state));
+                }
+            }
+        }
+        ctx->r[2] = _mm_cvtsi32_si128(valid ? 1 : 0);
+    }
+
+    void p3fesRwIm3DEnd(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!ctx)
+            return;
+        const bool wasOpen = g_nativeIm3D.open;
+        g_nativeIm3D = {};
+        ctx->r[2] = _mm_cvtsi32_si128(wasOpen ? 1 : 0);
+    }
+
     void nativeIm2DResult(R5900Context *ctx)
     {
         ctx->r[2] = _mm_cvtsi32_si128(1); // every SkyIm2DRender* entry returns 1
@@ -1893,6 +2147,8 @@ namespace
         g_im2dTextureDiagPrinted.store(false, std::memory_order_relaxed);
         g_sectorDiagPrinted.store(false, std::memory_order_relaxed);
         g_ptankDiagPrinted.store(false, std::memory_order_relaxed);
+        g_im3dDiagPrinted.store(false, std::memory_order_relaxed);
+        g_nativeIm3D = {};
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
         if (diagEnabled)
@@ -1908,6 +2164,11 @@ namespace
             if (sectorHook)
                 g_originalSectorRender.store(sector, std::memory_order_release);
             const bool ptankHook = installNativeOnlyHook(runtime, kPtankAtomicRender, &p3fesPtankAtomicRender);
+            const bool im3dTransform = installNativeOnlyHook(runtime, kRwIm3DTransform, &p3fesRwIm3DTransform);
+            const bool im3dEnd = installNativeOnlyHook(runtime, kRwIm3DEnd, &p3fesRwIm3DEnd);
+            const bool im3dIndexed = installNativeOnlyHook(runtime, kRwIm3DRenderIndexedPrimitive, &p3fesRwIm3DRenderIndexedPrimitive);
+            const bool im3dPrim = installNativeOnlyHook(runtime, kRwIm3DRenderPrimitive, &p3fesRwIm3DRenderPrimitive);
+            const bool im3dLine = installNativeOnlyHook(runtime, kRwIm3DRenderLine, &p3fesRwIm3DRenderLine);
             PS2Runtime::RecompiledFunction show = runtime.lookupFunction(kRwCameraShowRaster);
             if (show && show != &p3fesRwCameraShowRaster)
             {
@@ -1922,8 +2183,11 @@ namespace
             // interlaced fallback over the HLE framebuffer, even before the
             // first supported 3-D atomic appears.
             p3fes_native_present::setActive(true);
-            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u ptank=%u Im2D=%u%u%u%u\n",
-                         sectorHook ? 1u : 0u, ptankHook ? 1u : 0u, im2dLine ? 1u : 0u, im2dTri ? 1u : 0u,
+            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u ptank=%u Im3D=%u%u%u%u%u Im2D=%u%u%u%u\n",
+                         sectorHook ? 1u : 0u, ptankHook ? 1u : 0u,
+                         im3dTransform ? 1u : 0u, im3dEnd ? 1u : 0u, im3dIndexed ? 1u : 0u,
+                         im3dPrim ? 1u : 0u, im3dLine ? 1u : 0u,
+                         im2dLine ? 1u : 0u, im2dTri ? 1u : 0u,
                          im2dPrim ? 1u : 0u, im2dIndexed ? 1u : 0u);
         }
 #else
