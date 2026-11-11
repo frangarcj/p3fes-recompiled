@@ -151,8 +151,10 @@ if(PS2X_IS_VITA AND PS2X_VITA_SDL2_SHIM)
     set(PS2X_VITA_VITAGL_DIR "" CACHE PATH
         "vitaGL source tree with libvitaGL.a built (empty: use the VitaSDK copy)")
     set(PS2X_VITA_VITAGL vitaGL)
+    set(PS2X_VITA_VITAGL_ARCHIVE "${PS2X_VITA_PREFIX}/lib/libvitaGL.a")
     if(PS2X_VITA_VITAGL_DIR)
         set(PS2X_VITA_VITAGL "${PS2X_VITA_VITAGL_DIR}/libvitaGL.a")
+        set(PS2X_VITA_VITAGL_ARCHIVE "${PS2X_VITA_VITAGL_DIR}/libvitaGL.a")
     endif()
 
     add_library(ps2x_vita_raylib STATIC
@@ -825,6 +827,15 @@ endif()
 # Vita: Work around for GCC 10's LTO plugin
 if(PS2X_IS_VITA)
     target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+    if(PS2X_VITA_SDL2_SHIM)
+        # Vita3K currently loses GXM/vitaGL entry points when they are placed at
+        # the far end of this very large recompiled executable. Pull the whole
+        # vitaGL archive into the first link segment; the transitive -lvitaGL
+        # later in the link then satisfies no additional objects. This keeps the
+        # renderer code in the same low address range as normal Vita homebrew.
+        target_link_options(ps2EntryRunner PRIVATE
+            "LINKER:--whole-archive,${PS2X_VITA_VITAGL_ARCHIVE},--no-whole-archive")
+    endif()
     target_sources(ps2EntryRunner PRIVATE src/lib/ps2_vita_runtime.cpp)
     set_source_files_properties(src/lib/ps2_vita_runtime.cpp PROPERTIES
         SKIP_UNITY_BUILD_INCLUSION TRUE
