@@ -12,6 +12,8 @@
 #include "runtime/ps2_memory.h"
 #if !defined(__ANDROID__)
 #include "native_renderer/renderer.h"
+#include "runtime/gs/ps2_gs_psmt4.h"
+#include "runtime/gs/ps2_gs_psmt8.h"
 #endif
 
 #include <atomic>
@@ -541,15 +543,18 @@ namespace
         if (type != 4u && type != 5u) // texture / camera-texture only
             return false;
 
-        // RMD native textures can keep their CPU copy in PS2 swizzled PSMT8/
-        // PSMT4 order. The simple host decoder below is intentionally only
-        // for ordinary linear rasters (TMX/font/UI and equivalent material
-        // textures); leave swizzled native rasters for the dedicated decoder.
         uint32_t pluginOffset = 0u;
         uint8_t cacheFlags = 0u;
+        uint32_t tex0 = 0u;
         if (readGuest(rdram, kRwRasterPluginOffset, pluginOffset) && pluginOffset &&
-            guestPointer(raster + pluginOffset, 55u) && readGuest(rdram, raster + pluginOffset + 54u, cacheFlags) &&
-            (cacheFlags & 0x06u) != 0u)
+            guestPointer(raster + pluginOffset, 55u))
+        {
+            readGuest(rdram, raster + pluginOffset + 54u, cacheFlags);
+            readGuest(rdram, raster + pluginOffset + 8u, tex0);
+        }
+        const bool swizzled8 = (cacheFlags & 0x02u) != 0u;
+        const bool swizzled4 = (cacheFlags & 0x04u) != 0u;
+        if ((swizzled8 && info.depth != 8) || (swizzled4 && info.depth != 4) || (swizzled8 && swizzled4))
             return false;
 
         size_t rowBytes = 0u;
@@ -562,12 +567,17 @@ namespace
         case 32: rowBytes = static_cast<size_t>(info.width) * 4u; break;
         default: return false;
         }
-        if (static_cast<size_t>(info.stride) < rowBytes)
+        if (!guestPointer(info.pixels, 1u))
             return false;
-        const uint64_t pixelEnd = static_cast<uint64_t>(info.pixels) +
-                                  static_cast<uint64_t>(info.stride) * static_cast<uint64_t>(info.height - 1) + rowBytes;
-        if (!guestPointer(info.pixels, 1u) || pixelEnd > PS2_RAM_SIZE)
-            return false;
+        if (!swizzled8 && !swizzled4)
+        {
+            if (static_cast<size_t>(info.stride) < rowBytes)
+                return false;
+            const uint64_t pixelEnd = static_cast<uint64_t>(info.pixels) +
+                                      static_cast<uint64_t>(info.stride) * static_cast<uint64_t>(info.height - 1) + rowBytes;
+            if (pixelEnd > PS2_RAM_SIZE)
+                return false;
+        }
 
         const uint32_t paletteEntries = info.depth == 4 ? 16u : (info.depth == 8 ? 256u : 0u);
         const uint32_t paletteEntryBytes = (info.format & 0x0Fu) == 1u ? 2u : 4u;
@@ -579,21 +589,42 @@ namespace
         texture.height = static_cast<uint32_t>(info.height);
         texture.rgba.resize(static_cast<size_t>(info.width) * static_cast<size_t>(info.height) * 4u);
 
-        constexpr uint64_t kFnvOffset = 1469598103934665603ull;
-        uint64_t hash = kFnvOffset;
+        const uint32_t tex0Tbw = (tex0 >> 14u) & 0x3Fu;
+        const uint32_t tbw = tex0Tbw != 0u ? tex0Tbw : std::max(1u, (static_cast<uint32_t>(info.width) + 63u) / 64u);
         for (int32_t y = 0; y < info.height; ++y)
         {
             const uint64_t rowOffset = static_cast<uint64_t>(static_cast<uint32_t>(y)) *
                                        static_cast<uint32_t>(info.stride);
-            const uint8_t *src = rdram + info.pixels + static_cast<uint32_t>(rowOffset);
-            hash = hashBytes(hash, src, rowBytes);
+            const uint8_t *src = (!swizzled8 && !swizzled4)
+                ? rdram + info.pixels + static_cast<uint32_t>(rowOffset)
+                : nullptr;
             for (int32_t x = 0; x < info.width; ++x)
             {
                 std::array<uint8_t, 4> color{};
                 if (info.depth == 4 || info.depth == 8)
                 {
-                    uint32_t index = info.depth == 8 ? src[x]
-                        : ((x & 1) ? (src[x >> 1] >> 4u) : (src[x >> 1] & 0x0Fu));
+                    uint32_t index = 0u;
+                    if (swizzled8)
+                    {
+                        const uint32_t byteOffset = GSPSMT8::addrPSMT8(0u, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                        const uint64_t address = static_cast<uint64_t>(info.pixels) + byteOffset;
+                        if (address >= PS2_RAM_SIZE)
+                            return false;
+                        index = rdram[static_cast<uint32_t>(address)];
+                    }
+                    else if (swizzled4)
+                    {
+                        const uint32_t nibbleOffset = GSPSMT4::addrPSMT4(0u, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                        const uint32_t byteOffset = nibbleOffset >> 1u;
+                        const uint64_t address = static_cast<uint64_t>(info.pixels) + byteOffset;
+                        if (address >= PS2_RAM_SIZE)
+                            return false;
+                        const uint8_t packed = rdram[static_cast<uint32_t>(address)];
+                        index = (nibbleOffset & 1u) ? (packed >> 4u) : (packed & 0x0Fu);
+                    }
+                    else
+                        index = info.depth == 8 ? src[x]
+                            : ((x & 1) ? (src[x >> 1] >> 4u) : (src[x >> 1] & 0x0Fu));
                     // The sky driver keeps 256-entry CLUTs in GS CSM1 order
                     // (middle index bits swapped); 16-entry CLUTs stay linear.
                     if (info.depth == 8)
@@ -630,15 +661,17 @@ namespace
                             color.data(), 4u);
             }
         }
-        if (paletteEntries)
-            hash = hashBytes(hash, rdram + info.palette, paletteEntries * paletteEntryBytes);
+        constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+        uint64_t hash = hashBytes(kFnvOffset, texture.rgba.data(), texture.rgba.size());
         hash ^= (static_cast<uint64_t>(static_cast<uint32_t>(info.width)) << 32u) |
                 static_cast<uint32_t>(info.height);
         revision = hash ? hash : 1u;
 
         if (!g_im2dTextureDiagPrinted.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr, "[p3fes-native] first native texture: raster=0x%08X type=%u fmt=0x%02X %dx%d depth=%d\n",
-                         raster, type, info.format, info.width, info.height, info.depth);
+            std::fprintf(stderr,
+                         "[p3fes-native] first native texture: raster=0x%08X type=%u fmt=0x%02X %dx%d depth=%d swizzle=%u\n",
+                         raster, type, info.format, info.width, info.height, info.depth,
+                         swizzled8 ? 8u : (swizzled4 ? 4u : 0u));
         return true;
     }
 
