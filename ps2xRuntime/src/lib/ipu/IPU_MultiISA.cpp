@@ -1407,8 +1407,15 @@ __fi static bool mpeg2_slice()
 #elif defined(ARCH_ARM32)
 					for (uint i = 0; i < (256 + 64 + 64) / 32; ++i)
 					{
-						for (uint j = 0; j < 32; ++j)
-							d[j] = s[j];
+						// Cortex-A9 has NEON even though it lacks AArch64's zip/high
+						// convenience intrinsics. Widen the 32 input bytes to u16 in
+						// four vector stores instead of the old 32-iteration scalar loop.
+						const uint8x16_t woot1 = vld1q_u8(reinterpret_cast<const uint8_t*>(s));
+						const uint8x16_t woot2 = vld1q_u8(reinterpret_cast<const uint8_t*>(s) + 16);
+						vst1q_u16(d + 0, vmovl_u8(vget_low_u8(woot1)));
+						vst1q_u16(d + 8, vmovl_u8(vget_high_u8(woot1)));
+						vst1q_u16(d + 16, vmovl_u8(vget_low_u8(woot2)));
+						vst1q_u16(d + 24, vmovl_u8(vget_high_u8(woot2)));
 						s += 32;
 						d += 32;
 					}

@@ -136,7 +136,7 @@ __ri void yuv2rgb_sse2()
 	}
 }
 
-#elif defined(ARCH_ARM64)
+#elif defined(ARCH_ARM64) || defined(ARCH_ARM32)
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <arm64_neon.h>
@@ -175,8 +175,11 @@ __ri void yuv2rgb_neon()
 		// (Cb - 128) << 8, (Cr - 128) << 8
 		cb = veorq_s8(cb, c_bias);
 		cr = veorq_s8(cr, c_bias);
-		cb = vzip1q_s8(vdupq_n_s8(0), cb);
-		cr = vzip1q_s8(vdupq_n_s8(0), cr);
+		const int8x16_t zero8 = vdupq_n_s8(0);
+		const int8x16x2_t cb_zip = vzipq_s8(zero8, cb);
+		const int8x16x2_t cr_zip = vzipq_s8(zero8, cr);
+		cb = cb_zip.val[0];
+		cr = cr_zip.val[0];
 
 		int16x8_t rc = MULHI16(vreinterpretq_s16_s8(cr), rcr_coefficient);
 		int16x8_t gc = vqaddq_s16(MULHI16(vreinterpretq_s16_s8(cr), gcr_coefficient), MULHI16(vreinterpretq_s16_s8(cb), gcb_coefficient));
@@ -196,15 +199,17 @@ __ri void yuv2rgb_neon()
 
 			uint16x4_t a3210 = vget_low_u16(vreinterpretq_u16_s16(y_even));
 			uint16x4_t b3210 = vget_low_u16(vreinterpretq_u16_s16(y_coefficient));
-			uint32x4_t ab3210 = vmull_u16(a3210, b3210);
-			uint32x4_t ab7654 = vmull_high_u16(vreinterpretq_u16_s16(y_even), vreinterpretq_u16_s16(y_coefficient));
-			y_even = vreinterpretq_s16_u16(vuzp2q_u16(vreinterpretq_u16_u32(ab3210), vreinterpretq_u16_u32(ab7654)));
+				uint32x4_t ab3210 = vmull_u16(a3210, b3210);
+				uint32x4_t ab7654 = vmull_u16(vget_high_u16(vreinterpretq_u16_s16(y_even)),
+				                                  vget_high_u16(vreinterpretq_u16_s16(y_coefficient)));
+				y_even = vreinterpretq_s16_u16(vcombine_u16(vshrn_n_u32(ab3210, 16), vshrn_n_u32(ab7654, 16)));
 
 			a3210 = vget_low_u16(vreinterpretq_u16_s16(y_odd));
 			b3210 = vget_low_u16(vreinterpretq_u16_s16(y_coefficient));
-			ab3210 = vmull_u16(a3210, b3210);
-			ab7654 = vmull_high_u16(vreinterpretq_u16_s16(y_odd), vreinterpretq_u16_s16(y_coefficient));
-			y_odd = vreinterpretq_s16_u16(vuzp2q_u16(vreinterpretq_u16_u32(ab3210), vreinterpretq_u16_u32(ab7654)));
+				ab3210 = vmull_u16(a3210, b3210);
+				ab7654 = vmull_u16(vget_high_u16(vreinterpretq_u16_s16(y_odd)),
+				                    vget_high_u16(vreinterpretq_u16_s16(y_coefficient)));
+				y_odd = vreinterpretq_s16_u16(vcombine_u16(vshrn_n_u32(ab3210, 16), vshrn_n_u32(ab7654, 16)));
 
 			int16x8_t r_even = vqaddq_s16(rc, y_even);
 			int16x8_t r_odd = vqaddq_s16(rc, y_odd);
@@ -222,31 +227,24 @@ __ri void yuv2rgb_neon()
 			b_odd = vshrq_n_s16(vaddq_s16(b_odd, round_1bit), 1);
 
 			// combine even and odd bytes in original order
-			uint8x16_t r = vcombine_u8(vqmovun_s16(r_even), vqmovun_s16(r_odd));
-			uint8x16_t g = vcombine_u8(vqmovun_s16(g_even), vqmovun_s16(g_odd));
-			uint8x16_t b = vcombine_u8(vqmovun_s16(b_even), vqmovun_s16(b_odd));
+				const uint8x8x2_t r_zip = vzip_u8(vqmovun_s16(r_even), vqmovun_s16(r_odd));
+				const uint8x8x2_t g_zip = vzip_u8(vqmovun_s16(g_even), vqmovun_s16(g_odd));
+				const uint8x8x2_t b_zip = vzip_u8(vqmovun_s16(b_even), vqmovun_s16(b_odd));
+				const uint8x16_t r = vcombine_u8(r_zip.val[0], r_zip.val[1]);
+				const uint8x16_t g = vcombine_u8(g_zip.val[0], g_zip.val[1]);
+				const uint8x16_t b = vcombine_u8(b_zip.val[0], b_zip.val[1]);
 
-			r = vzip1q_u8(r, vreinterpretq_u8_u64(vdupq_laneq_u64(vreinterpretq_u64_u8(r), 1)));
-			g = vzip1q_u8(g, vreinterpretq_u8_u64(vdupq_laneq_u64(vreinterpretq_u64_u8(g), 1)));
-			b = vzip1q_u8(b, vreinterpretq_u8_u64(vdupq_laneq_u64(vreinterpretq_u64_u8(b), 1)));
-
-			// Create RGBA (we could generate A here, but we don't) quads
-			uint8x16_t rg_l = vzip1q_u8(r, g);
-			uint8x16_t ba_l = vzip1q_u8(b, alpha);
-			uint16x8_t rgba_ll = vzip1q_u16(vreinterpretq_u16_u8(rg_l), vreinterpretq_u16_u8(ba_l));
-			uint16x8_t rgba_lh = vzip2q_u16(vreinterpretq_u16_u8(rg_l), vreinterpretq_u16_u8(ba_l));
-
-			uint8x16_t rg_h = vzip2q_u8(r, g);
-			uint8x16_t ba_h = vzip2q_u8(b, alpha);
-			uint16x8_t rgba_hl = vzip1q_u16(vreinterpretq_u16_u8(rg_h), vreinterpretq_u16_u8(ba_h));
-			uint16x8_t rgba_hh = vzip2q_u16(vreinterpretq_u16_u8(rg_h), vreinterpretq_u16_u8(ba_h));
-
-			vst1q_u8(reinterpret_cast<u8*>(&decoder.rgb32.c[n * 2 + m][0]), vreinterpretq_u8_u16(rgba_ll));
-			vst1q_u8(reinterpret_cast<u8*>(&decoder.rgb32.c[n * 2 + m][4]), vreinterpretq_u8_u16(rgba_lh));
-			vst1q_u8(reinterpret_cast<u8*>(&decoder.rgb32.c[n * 2 + m][8]), vreinterpretq_u8_u16(rgba_hl));
-			vst1q_u8(reinterpret_cast<u8*>(&decoder.rgb32.c[n * 2 + m][12]), vreinterpretq_u8_u16(rgba_hh));
+				// Store 16 pixels as interleaved RGBA. vst4q is available on ARMv7
+				// NEON as well as AArch64, avoiding the AArch64-only zip/high-lane
+				// intrinsics the old implementation depended on.
+				uint8x16x4_t rgba{};
+				rgba.val[0] = r;
+				rgba.val[1] = g;
+				rgba.val[2] = b;
+				rgba.val[3] = alpha;
+				vst4q_u8(reinterpret_cast<u8*>(&decoder.rgb32.c[n * 2 + m][0]), rgba);
+			}
 		}
-	}
 }
 
 #undef MULHI16
