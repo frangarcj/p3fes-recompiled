@@ -34,6 +34,7 @@
 namespace
 {
     constexpr uint32_t kAtomicDefaultRenderCallBack = 0x00490860u;
+    constexpr uint32_t kSectorDefaultRenderCallBack = 0x00499B90u;
     constexpr uint32_t kAtomicFlagsOffset = 0x02u;
     constexpr uint32_t kAtomicFrameOffset = 0x04u;
     constexpr uint32_t kAtomicGeometryOffset = 0x18u;
@@ -57,8 +58,18 @@ namespace
     constexpr uint32_t kMaterialTextureOffset = 0x00u;
     constexpr uint32_t kMaterialColorOffset = 0x04u;
     constexpr uint32_t kTextureRasterOffset = 0x00u;
+    constexpr uint32_t kSectorTrianglesOffset = 0x04u;
+    constexpr uint32_t kSectorVerticesOffset = 0x08u;
+    constexpr uint32_t kSectorNormalsOffset = 0x0Cu;
+    constexpr uint32_t kSectorUv0Offset = 0x10u;
+    constexpr uint32_t kSectorPrelitOffset = 0x30u;
+    constexpr uint32_t kSectorMaterialBaseOffset = 0x80u;
+    constexpr uint32_t kSectorNumTrianglesOffset = 0x84u;
+    constexpr uint32_t kWorldMaterialsOffset = 0x10u;
+    constexpr uint32_t kWorldNumMaterialsOffset = 0x14u;
     constexpr uint32_t kFrameLtmOffset = 0x50u;
     constexpr uint32_t kRwCurrentCamera = 0x00960070u;
+    constexpr uint32_t kRwCurrentWorld = 0x00960074u;
     constexpr uint32_t kCameraFrameOffset = 0x04u;
     constexpr uint32_t kCameraProjectionOffset = 0x14u;
     constexpr uint32_t kCameraViewWindowXOffset = 0x68u;
@@ -87,12 +98,14 @@ namespace
     constexpr uint32_t kMaxTriangles = 1u << 20;
 
     std::atomic<PS2Runtime::RecompiledFunction> g_originalAtomicRender{nullptr};
+    std::atomic<PS2Runtime::RecompiledFunction> g_originalSectorRender{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalShowRaster{nullptr};
     std::atomic<bool> g_nativeEnabled{false};
     std::atomic<bool> g_diagEnabled{false};
     std::atomic<bool> g_diagPrinted{false};
     std::atomic<bool> g_im2dDiagPrinted{false};
     std::atomic<bool> g_im2dTextureDiagPrinted{false};
+    std::atomic<bool> g_sectorDiagPrinted{false};
 
     template <typename T>
     bool readGuest(const uint8_t *rdram, uint32_t address, T &value)
@@ -431,6 +444,124 @@ namespace
         return true;
     }
 
+    bool decodeNativeSector(const uint8_t *rdram, uint32_t sector, MeshData &mesh, MeshId &meshId,
+                            MeshDrawState &drawState)
+    {
+        uint16_t triangleCount = 0u, materialBase = 0u;
+        uint32_t triangles = 0u, positions = 0u, normals = 0u, uv0 = 0u, prelit = 0u;
+        uint32_t world = 0u, materialArray = 0u;
+        int32_t worldMaterialCountSigned = 0;
+        if (!guestPointer(sector, kSectorNumTrianglesOffset + sizeof(uint16_t)) ||
+            !readGuest(rdram, sector + kSectorNumTrianglesOffset, triangleCount) || triangleCount == 0u ||
+            !readGuest(rdram, sector + kSectorMaterialBaseOffset, materialBase) ||
+            !readGuest(rdram, sector + kSectorTrianglesOffset, triangles) ||
+            !readGuest(rdram, sector + kSectorVerticesOffset, positions) ||
+            !readGuest(rdram, sector + kSectorNormalsOffset, normals) ||
+            !readGuest(rdram, sector + kSectorUv0Offset, uv0) ||
+            !readGuest(rdram, sector + kSectorPrelitOffset, prelit) ||
+            !readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldNumMaterialsOffset + 4u) ||
+            !readGuest(rdram, world + kWorldMaterialsOffset, materialArray) ||
+            !readGuest(rdram, world + kWorldNumMaterialsOffset, worldMaterialCountSigned) ||
+            worldMaterialCountSigned <= 0 || worldMaterialCountSigned > 65535 ||
+            materialBase >= static_cast<uint32_t>(worldMaterialCountSigned) ||
+            !guestPointer(materialArray, static_cast<uint32_t>(worldMaterialCountSigned) * sizeof(uint32_t)) ||
+            !guestPointer(triangles, static_cast<uint32_t>(triangleCount) * 8u))
+            return false;
+
+        uint32_t vertexCount = 0u, maxLocalMaterial = 0u;
+        std::vector<std::array<uint16_t, 4>> sourceTriangles(triangleCount);
+        for (uint32_t i = 0u; i < triangleCount; ++i)
+        {
+            auto &tri = sourceTriangles[i];
+            const uint32_t address = triangles + i * 8u;
+            if (!readGuest(rdram, address + 0u, tri[0]) || !readGuest(rdram, address + 2u, tri[1]) ||
+                !readGuest(rdram, address + 4u, tri[2]) || !readGuest(rdram, address + 6u, tri[3]))
+                return false;
+            vertexCount = std::max(vertexCount, static_cast<uint32_t>(std::max({tri[0], tri[1], tri[2]})) + 1u);
+            maxLocalMaterial = std::max(maxLocalMaterial, static_cast<uint32_t>(tri[3]));
+        }
+        if (vertexCount == 0u || vertexCount > kMaxVertices || !guestPointer(positions, vertexCount * 12u))
+            return false;
+
+        const bool hasNormals = guestPointer(normals, vertexCount * 4u);
+        const bool hasUv = guestPointer(uv0, vertexCount * 8u);
+        const bool hasPrelight = guestPointer(prelit, vertexCount * 4u);
+        mesh.vertices.resize(vertexCount);
+        mesh.hasNormals = hasNormals;
+        mesh.hasPrelight = hasPrelight;
+        for (uint32_t i = 0u; i < vertexCount; ++i)
+        {
+            Vertex &v = mesh.vertices[i];
+            if (!readVec3(rdram, positions + i * 12u, v.position))
+                return false;
+            if (hasNormals)
+            {
+                int8_t packed[4]{};
+                std::memcpy(packed, rdram + normals + i * 4u, sizeof(packed));
+                v.normal = {packed[0] / 127.0f, packed[1] / 127.0f, packed[2] / 127.0f};
+            }
+            if (hasUv)
+            {
+                readGuest(rdram, uv0 + i * 8u + 0u, v.texCoord[0]);
+                readGuest(rdram, uv0 + i * 8u + 4u, v.texCoord[1]);
+            }
+            if (hasPrelight)
+                std::memcpy(v.color.data(), rdram + prelit + i * 4u, 4u);
+        }
+
+        const uint32_t availableMaterials = static_cast<uint32_t>(worldMaterialCountSigned) - materialBase;
+        if (maxLocalMaterial >= availableMaterials)
+            return false;
+        const uint32_t localMaterialCount = maxLocalMaterial + 1u;
+        std::vector<std::vector<uint32_t>> materialIndices(localMaterialCount);
+        for (const auto &tri : sourceTriangles)
+        {
+            const uint32_t localMaterial = tri[3] < localMaterialCount ? tri[3] : 0u;
+            auto &indices = materialIndices[localMaterial];
+            indices.push_back(tri[0]);
+            indices.push_back(tri[1]);
+            indices.push_back(tri[2]);
+        }
+
+        mesh.materials.resize(localMaterialCount);
+        drawState.materialColors.assign(localMaterialCount, {255u, 255u, 255u, 255u});
+        for (uint32_t localMaterial = 0u; localMaterial < localMaterialCount; ++localMaterial)
+        {
+            const auto &indices = materialIndices[localMaterial];
+            if (!indices.empty())
+            {
+                const uint32_t firstIndex = static_cast<uint32_t>(mesh.indices.size());
+                mesh.indices.insert(mesh.indices.end(), indices.begin(), indices.end());
+                mesh.submeshes.push_back(Submesh{firstIndex, static_cast<uint32_t>(indices.size()), localMaterial});
+            }
+
+            uint32_t material = 0u;
+            const uint32_t worldMaterial = materialBase + localMaterial;
+            if (!readGuest(rdram, materialArray + worldMaterial * 4u, material) || !material || !guestPointer(material, 28u))
+                continue;
+            std::memcpy(mesh.materials[localMaterial].color.data(), rdram + material + kMaterialColorOffset, 4u);
+            drawState.materialColors[localMaterial] = mesh.materials[localMaterial].color;
+
+            uint32_t texture = 0u, raster = 0u;
+            if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
+                !readGuest(rdram, texture + kTextureRasterOffset, raster) || !raster)
+                continue;
+            TextureData nativeTexture;
+            uint64_t revision = 0u;
+            if (!decodeNativeRaster(rdram, raster, nativeTexture, revision))
+                continue;
+            mesh.materials[localMaterial].textureName = nativeTexture.name;
+            const auto known = g_rasterRevisions.find(raster);
+            if (known == g_rasterRevisions.end() || known->second != revision)
+            {
+                p3fes_native_present::defineTexture(nativeTexture, revision);
+                g_rasterRevisions[raster] = revision;
+            }
+        }
+        meshId = (1ull << 63u) | sector;
+        return !mesh.indices.empty();
+    }
+
     bool ensureNativeFrame(uint8_t *rdram)
     {
         if (g_nativeFrameActive)
@@ -476,6 +607,68 @@ namespace
         MeshDrawState drawState;
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
         p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
+        return true;
+    }
+
+    bool drawNativeSector(uint8_t *rdram, uint32_t sector)
+    {
+        if (!ensureNativeFrame(rdram))
+            return false;
+        const MeshId meshId = (1ull << 63u) | sector;
+        MeshDrawState drawState;
+        if (g_definedMeshes.find(meshId) == g_definedMeshes.end())
+        {
+            MeshData mesh;
+            MeshId decodedId = 0u;
+            if (!decodeNativeSector(rdram, sector, mesh, decodedId, drawState) || decodedId != meshId)
+            {
+                if (g_nativeErrors++ < 8u)
+                    std::fprintf(stderr, "[p3fes-native] sector 0x%08X decode failed\n", sector);
+                return false;
+            }
+            p3fes_native_present::defineMesh(meshId, mesh);
+            g_definedMeshes.insert(meshId);
+            if (!g_sectorDiagPrinted.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[p3fes-native] first world sector: 0x%08X vertices=%zu triangles=%zu materials=%zu\n",
+                             sector, mesh.vertices.size(), mesh.indices.size() / 3u, mesh.materials.size());
+        }
+        else
+        {
+            // Sector material colours can still be animated; rebuild only the
+            // small live draw-state array, not the immutable geometry.
+            uint32_t world = 0u, materialArray = 0u;
+            int32_t worldMaterialCount = 0;
+            uint16_t materialBase = 0u, triangleCount = 0u;
+            uint32_t triangles = 0u;
+            if (readGuest(rdram, kRwCurrentWorld, world) && guestPointer(world, kWorldNumMaterialsOffset + 4u) &&
+                readGuest(rdram, world + kWorldMaterialsOffset, materialArray) &&
+                readGuest(rdram, world + kWorldNumMaterialsOffset, worldMaterialCount) && worldMaterialCount > 0 &&
+                readGuest(rdram, sector + kSectorMaterialBaseOffset, materialBase) && materialBase < worldMaterialCount &&
+                readGuest(rdram, sector + kSectorNumTrianglesOffset, triangleCount) &&
+                readGuest(rdram, sector + kSectorTrianglesOffset, triangles) &&
+                guestPointer(triangles, static_cast<uint32_t>(triangleCount) * 8u))
+            {
+                uint32_t maxLocalMaterial = 0u;
+                for (uint32_t i = 0u; i < triangleCount; ++i)
+                {
+                    uint16_t localMaterial = 0u;
+                    readGuest(rdram, triangles + i * 8u + kTriangleMaterialOffset, localMaterial);
+                    maxLocalMaterial = std::max(maxLocalMaterial, static_cast<uint32_t>(localMaterial));
+                }
+                const uint32_t available = static_cast<uint32_t>(worldMaterialCount) - materialBase;
+                const uint32_t materialCount = std::min(maxLocalMaterial + 1u, available);
+                drawState.materialColors.assign(materialCount, {255u, 255u, 255u, 255u});
+                for (uint32_t localMaterial = 0u; localMaterial < materialCount; ++localMaterial)
+                {
+                    uint32_t material = 0u;
+                    const uint32_t worldMaterial = materialBase + localMaterial;
+                    if (readGuest(rdram, materialArray + worldMaterial * 4u, material) && material && guestPointer(material, 8u))
+                        std::memcpy(drawState.materialColors[localMaterial].data(),
+                                    rdram + material + kMaterialColorOffset, 4u);
+                }
+            }
+        }
+        p3fes_native_present::drawMesh(meshId, p3fes::native_renderer::kIdentityMatrix, std::move(drawState));
         return true;
     }
 
@@ -1036,6 +1229,26 @@ namespace
             original(rdram, ctx, runtime);
     }
 
+    void p3fesSectorDefaultRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx && ctx->pc == kSectorDefaultRenderCallBack)
+        {
+            const uint32_t sector = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+#if !defined(__ANDROID__)
+            if (g_nativeEnabled.load(std::memory_order_relaxed))
+            {
+                // World sectors are the field environment path. In strict
+                // native mode consume them here, before PS2All/VIF/VU1/GS.
+                drawNativeSector(rdram, sector);
+                ctx->r[2] = ctx->r[4];
+                return;
+            }
+#endif
+        }
+        if (PS2Runtime::RecompiledFunction original = g_originalSectorRender.load(std::memory_order_acquire))
+            original(rdram, ctx, runtime);
+    }
+
     void p3fesRwCameraShowRaster(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
 #if !defined(__ANDROID__)
@@ -1066,6 +1279,7 @@ namespace
         g_diagPrinted.store(false, std::memory_order_relaxed);
         g_im2dDiagPrinted.store(false, std::memory_order_relaxed);
         g_im2dTextureDiagPrinted.store(false, std::memory_order_relaxed);
+        g_sectorDiagPrinted.store(false, std::memory_order_relaxed);
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
         if (diagEnabled)
@@ -1075,6 +1289,11 @@ namespace
 #if !defined(__ANDROID__)
         if (nativeEnabled)
         {
+            PS2Runtime::RecompiledFunction sector = runtime.lookupFunction(kSectorDefaultRenderCallBack);
+            const bool sectorHook = sector && sector != &p3fesSectorDefaultRender &&
+                                    runtime.replaceFunction(kSectorDefaultRenderCallBack, &p3fesSectorDefaultRender);
+            if (sectorHook)
+                g_originalSectorRender.store(sector, std::memory_order_release);
             PS2Runtime::RecompiledFunction show = runtime.lookupFunction(kRwCameraShowRaster);
             if (show && show != &p3fesRwCameraShowRaster)
             {
@@ -1089,8 +1308,9 @@ namespace
             // interlaced fallback over the HLE framebuffer, even before the
             // first supported 3-D atomic appears.
             p3fes_native_present::setActive(true);
-            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; Im2D hooks %u%u%u%u\n",
-                         im2dLine ? 1u : 0u, im2dTri ? 1u : 0u, im2dPrim ? 1u : 0u, im2dIndexed ? 1u : 0u);
+            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u Im2D=%u%u%u%u\n",
+                         sectorHook ? 1u : 0u, im2dLine ? 1u : 0u, im2dTri ? 1u : 0u,
+                         im2dPrim ? 1u : 0u, im2dIndexed ? 1u : 0u);
         }
 #else
         (void)nativeEnabled;
