@@ -213,6 +213,66 @@ __fi static void BUTTERFLY(int& t0, int& t1, int w0, int w1, int d0, int d1)
 	t1 = tmp - (w1 + w0) * d0;
 }
 
+#if defined(ARCH_ARM64) || defined(ARCH_ARM32)
+__ri static void IDCT_Columns_NEON(s16* block)
+{
+	for (int column = 0; column < 8; column += 4)
+	{
+		auto load_row = [&](int row) {
+			return vmovl_s16(vld1_s16(block + 8 * row + column));
+		};
+		auto mul = [](int32x4_t value, int coefficient) {
+			return vmulq_n_s32(value, coefficient);
+		};
+		auto butterfly = [&](int32x4_t& t0, int32x4_t& t1, int w0, int w1,
+		                     int32x4_t d0, int32x4_t d1) {
+			const int32x4_t tmp = mul(vaddq_s32(d0, d1), w0);
+			t0 = vaddq_s32(tmp, mul(d1, w1 - w0));
+			t1 = vsubq_s32(tmp, mul(d0, w1 + w0));
+		};
+
+		const int32x4_t d0 = vaddq_s32(vshlq_n_s32(load_row(0), 11), vdupq_n_s32(65536));
+		const int32x4_t d1 = load_row(1);
+		const int32x4_t d2 = vshlq_n_s32(load_row(2), 11);
+		const int32x4_t d3 = load_row(3);
+		const int32x4_t t0 = vaddq_s32(d0, d2);
+		const int32x4_t t1 = vsubq_s32(d0, d2);
+		int32x4_t t2, t3;
+		butterfly(t2, t3, W6, W2, d3, d1);
+		const int32x4_t a0 = vaddq_s32(t0, t2);
+		const int32x4_t a1 = vaddq_s32(t1, t3);
+		const int32x4_t a2 = vsubq_s32(t1, t3);
+		const int32x4_t a3 = vsubq_s32(t0, t2);
+
+		const int32x4_t e0 = load_row(4);
+		const int32x4_t e1 = load_row(5);
+		const int32x4_t e2 = load_row(6);
+		const int32x4_t e3 = load_row(7);
+		int32x4_t u0, u1, u2, u3;
+		butterfly(u0, u1, W7, W1, e3, e0);
+		butterfly(u2, u3, W3, W5, e1, e2);
+		const int32x4_t b0 = vaddq_s32(u0, u2);
+		const int32x4_t b3 = vaddq_s32(u1, u3);
+		u0 = vshrq_n_s32(vsubq_s32(u0, u2), 8);
+		u1 = vshrq_n_s32(vsubq_s32(u1, u3), 8);
+		const int32x4_t b1 = mul(vaddq_s32(u0, u1), 181);
+		const int32x4_t b2 = mul(vsubq_s32(u0, u1), 181);
+
+		auto store_row = [&](int row, int32x4_t value) {
+			vst1_s16(block + 8 * row + column, vmovn_s32(vshrq_n_s32(value, 17)));
+		};
+		store_row(0, vaddq_s32(a0, b0));
+		store_row(1, vaddq_s32(a1, b1));
+		store_row(2, vaddq_s32(a2, b2));
+		store_row(3, vaddq_s32(a3, b3));
+		store_row(4, vsubq_s32(a3, b3));
+		store_row(5, vsubq_s32(a2, b2));
+		store_row(6, vsubq_s32(a1, b1));
+		store_row(7, vsubq_s32(a0, b0));
+	}
+}
+#endif
+
 __ri static void IDCT_Block(s16* block)
 {
 	for (int i = 0; i < 8; i++)
@@ -273,6 +333,9 @@ __ri static void IDCT_Block(s16* block)
 		rblock[7] = (a0 - b0) >> 8;
 	}
 
+#if defined(ARCH_ARM64) || defined(ARCH_ARM32)
+	IDCT_Columns_NEON(block);
+#else
 	for (int i = 0; i < 8; i++)
 	{
 		s16* const cblock = block + i;
@@ -320,6 +383,7 @@ __ri static void IDCT_Block(s16* block)
 		cblock[8 * 6] = (a1 - b1) >> 17;
 		cblock[8 * 7] = (a0 - b0) >> 17;
 	}
+#endif
 }
 
 __ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
@@ -328,6 +392,14 @@ __ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
 
 	for (int i = 0; i < 8; i++)
 	{
+#if defined(ARCH_ARM64) || defined(ARCH_ARM32)
+		// The clip LUT is exactly signed-s16 saturation to [0, 255]. NEON's
+		// narrowing saturate performs all eight pixels at once and lets us clear
+		// the transformed row with one vector store as well.
+		const int16x8_t row = vld1q_s16(block);
+		vst1_u8(dest, vqmovun_s16(row));
+		vst1q_s16(block, vdupq_n_s16(0));
+#else
 		dest[0] = (g_idct_clip_lut.data() + 384)[block[0]];
 		dest[1] = (g_idct_clip_lut.data() + 384)[block[1]];
 		dest[2] = (g_idct_clip_lut.data() + 384)[block[2]];
@@ -338,6 +410,7 @@ __ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
 		dest[7] = (g_idct_clip_lut.data() + 384)[block[7]];
 
 		std::memset(block, 0, 16);
+#endif
 
 		dest += stride;
 		block += 8;
@@ -1816,8 +1889,16 @@ __ri static bool ipuCSC(tIPU_CMD_CSC csc)
 			if (!getBits64((u8*)&decoder.mb8 + 8 * ipu_cmd.pos[0], 1)) return false;
 		}
 
-		ipu_csc(decoder.mb8, decoder.rgb32, 0);
-		if (csc.OFM) ipu_dither(decoder.rgb32, decoder.rgb16, csc.DTE);
+		// The output FIFO can fill before a macroblock has been completely
+		// transferred. Preserve the converted macroblock across those retries
+		// instead of re-running CSC/dither every time IPUWorker is re-entered.
+		// pos[2] is otherwise unused by CSC/PACK and acts as the conversion stage.
+		if (ipu_cmd.pos[2] == 0)
+		{
+			ipu_csc(decoder.mb8, decoder.rgb32, 0);
+			if (csc.OFM) ipu_dither(decoder.rgb32, decoder.rgb16, csc.DTE);
+			ipu_cmd.pos[2] = 1;
+		}
 
 		if (csc.OFM)
 		{
@@ -1840,6 +1921,7 @@ __ri static bool ipuCSC(tIPU_CMD_CSC csc)
 
 		ipu_cmd.pos[0] = 0;
 		ipu_cmd.pos[1] = 0;
+		ipu_cmd.pos[2] = 0;
 	}
 
 	return true;
@@ -1856,9 +1938,13 @@ __ri static bool ipuPACK(tIPU_CMD_CSC csc)
 			if (!getBits64((u8*)&decoder.rgb32 + 8 * ipu_cmd.pos[0], 1)) return false;
 		}
 
-		ipu_dither(decoder.rgb32, decoder.rgb16, csc.DTE);
+		if (ipu_cmd.pos[2] == 0)
+		{
+			ipu_dither(decoder.rgb32, decoder.rgb16, csc.DTE);
 
-		if (!csc.OFM) ipu_vq(decoder.rgb16, g_ipu_indx4);
+			if (!csc.OFM) ipu_vq(decoder.rgb16, g_ipu_indx4);
+			ipu_cmd.pos[2] = 1;
+		}
 
 		if (csc.OFM)
 		{
@@ -1881,6 +1967,7 @@ __ri static bool ipuPACK(tIPU_CMD_CSC csc)
 
 		ipu_cmd.pos[0] = 0;
 		ipu_cmd.pos[1] = 0;
+		ipu_cmd.pos[2] = 0;
 	}
 
 	return true;
