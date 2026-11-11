@@ -82,6 +82,7 @@ std::unordered_map<std::string, uint64_t> g_uploadedTextures;
 std::optional<Frame> g_hostFrame;
 uint32_t g_errors = 0;
 bool g_textureUploadLogged = false;
+bool g_textureUpdateLogged = false;
 
 bool ensureRenderer()
 {
@@ -129,6 +130,7 @@ bool ensureTexture(const std::string &name)
         return true;
 
     TextureDefinition definition;
+    bool updating = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         const auto found = g_textureDefinitions.find(name);
@@ -137,6 +139,7 @@ bool ensureTexture(const std::string &name)
         const auto uploaded = g_uploadedTextures.find(name);
         if (uploaded != g_uploadedTextures.end() && uploaded->second == found->second.revision)
             return true;
+        updating = uploaded != g_uploadedTextures.end();
         definition = found->second;
     }
 
@@ -152,6 +155,12 @@ bool ensureTexture(const std::string &name)
     {
         g_textureUploadLogged = true;
         std::fprintf(stderr, "[p3fes-native] host texture upload active: %s %ux%u\n",
+                     name.c_str(), definition.texture.width, definition.texture.height);
+    }
+    if (updating && !g_textureUpdateLogged)
+    {
+        g_textureUpdateLogged = true;
+        std::fprintf(stderr, "[p3fes-native] host texture in-place update active: %s %ux%u\n",
                      name.c_str(), definition.texture.width, definition.texture.height);
     }
     return true;
@@ -351,6 +360,7 @@ void shutdownHost()
     g_uploaded.clear();
     g_uploadedTextures.clear();
     g_textureUploadLogged = false;
+    g_textureUpdateLogged = false;
     g_hostFrame.reset();
     {
         std::lock_guard<std::mutex> lock(g_mutex);

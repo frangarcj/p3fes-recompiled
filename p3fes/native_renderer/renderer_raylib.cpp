@@ -196,6 +196,18 @@ public:
             return false;
         }
 
+        const std::string key = textureKey(source.name);
+        auto existing = m_textures.find(key);
+        if (existing != m_textures.end() && existing->second.width == static_cast<int>(source.width) &&
+            existing->second.height == static_cast<int>(source.height))
+        {
+            // Dynamic RenderWare rasters (notably Sofdec/movie frames) retain
+            // the same RwRaster identity while their pixels change. Updating
+            // the existing GL object avoids a texture delete/create every
+            // frame and keeps sampler state/cache references stable.
+            UpdateTexture(existing->second, source.rgba.data());
+            return true;
+        }
         removeTexture(source.name);
         Image image{};
         image.data = const_cast<std::uint8_t *>(source.rgba.data());
@@ -210,7 +222,7 @@ public:
             return false;
         }
         SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
-        m_textures.emplace(textureKey(source.name), texture);
+        m_textures.emplace(key, texture);
         return true;
     }
 

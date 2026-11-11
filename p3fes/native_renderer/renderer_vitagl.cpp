@@ -246,6 +246,7 @@ public:
                 if (texture)
                     glDeleteTextures(1, &texture);
             m_textures.clear();
+            m_textureSizes.clear();
         }
         if (m_ownsWindow)
             CloseWindow();
@@ -271,6 +272,17 @@ public:
         }
 
         std::lock_guard<std::recursive_mutex> lock(ps2xVitaGlMutex());
+        const std::string key = textureKey(source.name);
+        const auto existing = m_textures.find(key);
+        const auto size = m_textureSizes.find(key);
+        if (existing != m_textures.end() && size != m_textureSizes.end() &&
+            size->second[0] == source.width && size->second[1] == source.height)
+        {
+            glBindTexture(GL_TEXTURE_2D, existing->second);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(source.width),
+                            static_cast<GLsizei>(source.height), GL_RGBA, GL_UNSIGNED_BYTE, source.rgba.data());
+            return true;
+        }
         removeTextureLocked(source.name);
         GLuint texture = 0;
         glGenTextures(1, &texture);
@@ -286,7 +298,8 @@ public:
             error = "vitaGL failed to allocate texture";
             return false;
         }
-        m_textures.emplace(textureKey(source.name), texture);
+        m_textures.emplace(key, texture);
+        m_textureSizes.emplace(key, std::array<std::uint32_t, 2>{source.width, source.height});
         return true;
     }
 
@@ -798,12 +811,14 @@ private:
     }
     void removeTextureLocked(std::string_view name)
     {
-        auto found = m_textures.find(textureKey(name));
+        const std::string key = textureKey(name);
+        auto found = m_textures.find(key);
         if (found == m_textures.end())
             return;
         if (found->second)
             glDeleteTextures(1, &found->second);
         m_textures.erase(found);
+        m_textureSizes.erase(key);
     }
 
     void removeMeshLocked(MeshId id)
@@ -821,6 +836,7 @@ private:
     Camera m_camera{};
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
     std::unordered_map<std::string, GLuint> m_textures;
+    std::unordered_map<std::string, std::array<std::uint32_t, 2>> m_textureSizes;
 
     void apply3D()
     {
