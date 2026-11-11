@@ -111,6 +111,7 @@ namespace
     constexpr uint32_t kCameraNearPlaneOffset = 0x80u;
     constexpr uint32_t kCameraFarPlaneOffset = 0x84u;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
+    constexpr uint32_t kPtankAtomicRender = 0x00474160u;
     constexpr uint32_t kSkyIm2DRenderLine = 0x004ECA60u;
     constexpr uint32_t kSkyIm2DRenderTriangle = 0x004ECCE0u;
     constexpr uint32_t kSkyIm2DRenderPrimitive = 0x004EDBA0u;
@@ -123,6 +124,7 @@ namespace
     constexpr uint32_t kRwTex1 = kRwGp - 17040u;
     constexpr uint32_t kRwAlpha1 = kRwGp - 17032u;
     constexpr uint32_t kRwCurrentRaster = kRwGp - 16948u;
+    constexpr uint32_t kPtankAtomicExtensionOffset = kRwGp - 17792u;
     constexpr uint64_t kGsPrimTextureEnable = 0x10u;
     constexpr uint64_t kGsPrimAlphaBlendEnable = 0x40u;
     constexpr float kRwScreenWidth = 640.0f;
@@ -150,6 +152,7 @@ namespace
     std::atomic<bool> g_im2dDiagPrinted{false};
     std::atomic<bool> g_im2dTextureDiagPrinted{false};
     std::atomic<bool> g_sectorDiagPrinted{false};
+    std::atomic<bool> g_ptankDiagPrinted{false};
 
     template <typename T>
     bool readGuest(const uint8_t *rdram, uint32_t address, T &value)
@@ -1728,6 +1731,78 @@ namespace
             original(rdram, ctx, runtime);
     }
 
+    void p3fesPtankAtomicRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+#if !defined(__ANDROID__)
+        if (!ctx || !runtime)
+            return;
+        const uint32_t atomic = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
+        uint32_t pluginOffset = 0u, tank = 0u;
+        int32_t count = 0;
+        const auto atomicExtension = [&]() -> uint32_t {
+            const uint64_t address = static_cast<uint64_t>(atomic) + pluginOffset;
+            return address <= 0xFFFFFFFFull ? static_cast<uint32_t>(address) : 0xFFFFFFFFu;
+        };
+        if (readGuest(rdram, kPtankAtomicExtensionOffset, pluginOffset) && pluginOffset != 0u &&
+            guestPointer(atomicExtension(), sizeof(uint32_t)) &&
+            readGuest(rdram, atomicExtension(), tank) && tank && guestPointer(tank, 104u) &&
+            readGuest(rdram, tank + 4u, count) && count > 0)
+        {
+            uint32_t lockCallback = 0u, instanceCallback = 0u;
+            readGuest(rdram, tank + 28u, lockCallback);
+            readGuest(rdram, tank + 32u, instanceCallback);
+
+            if (lockCallback)
+            {
+                uint32_t lockArg = 0u;
+                readGuest(rdram, tank + 64u, lockArg);
+                // Original sub_474160 clears this in the jalr delay slot, even
+                // if the callback itself later fails. Preserve that state
+                // transition before dispatching the dynamic callback.
+                const uint32_t zero = 0u;
+                std::memcpy(rdram + tank + 64u, &zero, sizeof(zero));
+                if (PS2Runtime::RecompiledFunction lock = runtime->lookupFunction(lockCallback))
+                {
+                    ctx->r[4] = _mm_cvtsi32_si128(static_cast<int32_t>(atomic));
+                    ctx->r[5] = _mm_cvtsi32_si128(static_cast<int32_t>(tank + 80u));
+                    ctx->r[6] = _mm_cvtsi32_si128(count);
+                    ctx->r[7] = _mm_cvtsi32_si128(static_cast<int32_t>(lockArg));
+                    lock(rdram, ctx, runtime);
+                }
+            }
+
+            uint32_t instanceResult = 1u;
+            if (instanceCallback)
+            {
+                if (PS2Runtime::RecompiledFunction instance = runtime->lookupFunction(instanceCallback))
+                {
+                    ctx->r[4] = _mm_cvtsi32_si128(static_cast<int32_t>(atomic));
+                    ctx->r[5] = _mm_cvtsi32_si128(static_cast<int32_t>(tank + 80u));
+                    ctx->r[6] = _mm_cvtsi32_si128(count);
+                    instance(rdram, ctx, runtime);
+                    instanceResult = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[2]));
+                }
+                else
+                    instanceResult = 0u;
+            }
+
+            bool drawn = false;
+            if (instanceResult == 1u)
+                drawn = drawNativeAtomic(rdram, atomic, ctx, runtime);
+            if (!g_ptankDiagPrinted.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[p3fes-native] first PTank: atomic=0x%08X count=%d lock=0x%08X instance=0x%08X result=%u native=%u\n",
+                             atomic, count, lockCallback, instanceCallback, instanceResult, drawn ? 1u : 0u);
+        }
+        ctx->r[4] = _mm_cvtsi32_si128(static_cast<int32_t>(atomic));
+        ctx->r[2] = ctx->r[4];
+#else
+        (void)rdram;
+        (void)ctx;
+        (void)runtime;
+#endif
+    }
+
     void p3fesRwCameraShowRaster(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
 #if !defined(__ANDROID__)
@@ -1759,6 +1834,7 @@ namespace
         g_im2dDiagPrinted.store(false, std::memory_order_relaxed);
         g_im2dTextureDiagPrinted.store(false, std::memory_order_relaxed);
         g_sectorDiagPrinted.store(false, std::memory_order_relaxed);
+        g_ptankDiagPrinted.store(false, std::memory_order_relaxed);
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
         if (diagEnabled)
@@ -1773,6 +1849,7 @@ namespace
                                     runtime.replaceFunction(kSectorDefaultRenderCallBack, &p3fesSectorDefaultRender);
             if (sectorHook)
                 g_originalSectorRender.store(sector, std::memory_order_release);
+            const bool ptankHook = installNativeOnlyHook(runtime, kPtankAtomicRender, &p3fesPtankAtomicRender);
             PS2Runtime::RecompiledFunction show = runtime.lookupFunction(kRwCameraShowRaster);
             if (show && show != &p3fesRwCameraShowRaster)
             {
@@ -1787,8 +1864,8 @@ namespace
             // interlaced fallback over the HLE framebuffer, even before the
             // first supported 3-D atomic appears.
             p3fes_native_present::setActive(true);
-            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u Im2D=%u%u%u%u\n",
-                         sectorHook ? 1u : 0u, im2dLine ? 1u : 0u, im2dTri ? 1u : 0u,
+            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u ptank=%u Im2D=%u%u%u%u\n",
+                         sectorHook ? 1u : 0u, ptankHook ? 1u : 0u, im2dLine ? 1u : 0u, im2dTri ? 1u : 0u,
                          im2dPrim ? 1u : 0u, im2dIndexed ? 1u : 0u);
         }
 #else
