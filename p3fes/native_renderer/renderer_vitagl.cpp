@@ -1,6 +1,7 @@
 // Vita native renderer: the same GPU-neutral contract as the desktop proof,
 // drawn through the vitaGL/GXM context already owned by the Celosia host shim.
 #include "renderer.h"
+#include "lighting.h"
 
 #include <raylib.h>
 #include <vitaGL.h>
@@ -52,6 +53,11 @@ struct DrawPart
     std::array<std::uint8_t, 4> color{255, 255, 255, 255};
     std::string textureName;
     std::uint32_t materialIndex = 0;
+    Material material{};
+    std::vector<Vertex> sourceVertices;
+    std::vector<GpuVertex> gpuVertices;
+    bool lighting = false;
+    bool hasPrelight = false;
 };
 
 using Vec3 = std::array<float, 3>;
@@ -298,11 +304,17 @@ public:
 
             DrawPart part;
             part.materialIndex = submesh.materialIndex;
+            part.sourceVertices = source.vertices;
+            part.lighting = source.lighting && source.hasNormals;
+            part.hasPrelight = source.hasPrelight;
             if (!source.materials.empty())
             {
                 part.color = source.materials[submesh.materialIndex].color;
                 part.textureName = source.materials[submesh.materialIndex].textureName;
+                part.material = source.materials[submesh.materialIndex];
             }
+            else
+                part.material.color = part.color;
             std::vector<GpuVertex> vertices(source.vertices.size());
             for (std::size_t i = 0; i < source.vertices.size(); ++i)
             {
@@ -313,6 +325,7 @@ public:
                 std::copy(in.texCoord.begin(), in.texCoord.end(), out.uv);
                 std::copy(in.color.begin(), in.color.end(), out.color);
             }
+            part.gpuVertices = vertices;
 
             glGenBuffers(1, &part.vertexBuffer);
             glBindBuffer(GL_ARRAY_BUFFER, part.vertexBuffer);
@@ -382,28 +395,28 @@ public:
         glPushMatrix();
         glMultMatrixf(model.data());
         glEnableClientState(GL_VERTEX_ARRAY);
-        for (const DrawPart &part : found->second)
+        for (DrawPart &part : found->second)
         {
             glBindBuffer(GL_ARRAY_BUFFER, part.vertexBuffer);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, part.indexBuffer);
-            glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
             const auto &color = part.materialIndex < state.materialColors.size()
                 ? state.materialColors[part.materialIndex]
                 : part.color;
-            const bool whiteTint = color[0] == 255u && color[1] == 255u && color[2] == 255u && color[3] == 255u;
-            if (whiteTint)
+            if (part.gpuVertices.size() == part.sourceVertices.size())
             {
-                glEnableClientState(GL_COLOR_ARRAY);
-                glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
+                for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                {
+                    const auto shaded = shadeVertexColor(part.sourceVertices[i], part.material, color,
+                                                         part.lighting, part.hasPrelight, state, model);
+                    std::copy(shaded.begin(), shaded.end(), part.gpuVertices[i].color);
+                }
+                glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
+                                part.gpuVertices.data());
             }
-            else
-            {
-                // Fixed-function VitaGL has no extra material-colour uniform.
-                // Prefer the game's live material tint/fade on tinted draws;
-                // white draws keep the per-vertex prelight array above.
-                glDisableClientState(GL_COLOR_ARRAY);
-                glColor4ub(color[0], color[1], color[2], color[3]);
-            }
+            glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
+            glEnableClientState(GL_COLOR_ARRAY);
+            glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
 
             auto texture = part.textureName.empty() ? m_textures.end() : m_textures.find(textureKey(part.textureName));
             if (texture != m_textures.end())

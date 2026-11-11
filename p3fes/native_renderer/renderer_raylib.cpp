@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "lighting.h"
 
 #include <raylib.h>
 #include <raymath.h>
@@ -90,6 +91,11 @@ struct DrawPart
     std::array<std::uint8_t, 4> color{255, 255, 255, 255};
     std::string textureName;
     std::uint32_t materialIndex = 0;
+    Material material{};
+    std::vector<Vertex> sourceVertices;
+    std::vector<unsigned char> shadedColors;
+    bool lighting = false;
+    bool hasPrelight = false;
 };
 
 class RaylibRenderer final : public Renderer
@@ -227,11 +233,18 @@ public:
 
             DrawPart part;
             part.materialIndex = submesh.materialIndex;
+            part.sourceVertices = source.vertices;
+            part.shadedColors.resize(source.vertices.size() * 4u);
+            part.lighting = source.lighting && source.hasNormals;
+            part.hasPrelight = source.hasPrelight;
             if (!source.materials.empty())
             {
                 part.color = source.materials[submesh.materialIndex].color;
                 part.textureName = source.materials[submesh.materialIndex].textureName;
+                part.material = source.materials[submesh.materialIndex];
             }
+            else
+                part.material.color = part.color;
             Mesh &mesh = part.mesh;
             mesh.vertexCount = static_cast<int>(source.vertices.size());
             mesh.triangleCount = static_cast<int>(indices.size() / 3);
@@ -317,7 +330,7 @@ public:
         if (found == m_meshes.end())
             return;
 
-        for (const DrawPart &part : found->second)
+        for (DrawPart &part : found->second)
         {
             ::Material drawMaterial = m_material;
             std::array<MaterialMap, kMaterialMapCount> maps{};
@@ -327,7 +340,20 @@ public:
             const auto &color = part.materialIndex < state.materialColors.size()
                 ? state.materialColors[part.materialIndex]
                 : part.color;
-            diffuse.color = {color[0], color[1], color[2], color[3]};
+            if (part.mesh.colors && part.sourceVertices.size() == static_cast<std::size_t>(part.mesh.vertexCount))
+            {
+                for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                {
+                    const auto shaded = shadeVertexColor(part.sourceVertices[i], part.material, color,
+                                                         part.lighting, part.hasPrelight, state, model);
+                    std::memcpy(part.shadedColors.data() + i * 4u, shaded.data(), 4u);
+                }
+                UpdateMeshBuffer(part.mesh, 3, part.shadedColors.data(),
+                                 static_cast<int>(part.shadedColors.size()), 0);
+                diffuse.color = WHITE;
+            }
+            else
+                diffuse.color = {color[0], color[1], color[2], color[3]};
             if (!part.textureName.empty())
             {
                 auto texture = m_textures.find(textureKey(part.textureName));

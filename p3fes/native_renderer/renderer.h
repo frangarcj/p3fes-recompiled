@@ -79,6 +79,18 @@ struct MeshDrawState
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,
     // so they cannot be baked permanently into the cached GPU mesh.
     std::vector<std::array<std::uint8_t, 4>> materialColors;
+
+    // RenderWare world lighting, kept in the same form used by librw-vita's
+    // default shader: ambient plus directional lights. Local point/spot lights
+    // are intentionally left for a later pass.
+    struct DirectionalLight
+    {
+        std::array<float, 3> direction{};
+        std::array<float, 3> color{};
+    };
+    bool lightingEnabled = false;
+    std::array<float, 3> ambientLight{};
+    std::vector<DirectionalLight> directionalLights;
 };
 
 class Renderer

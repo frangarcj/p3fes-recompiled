@@ -57,6 +57,9 @@ namespace
     constexpr uint32_t kTriangleMaterialOffset = 0x06u;
     constexpr uint32_t kMaterialTextureOffset = 0x00u;
     constexpr uint32_t kMaterialColorOffset = 0x04u;
+    constexpr uint32_t kMaterialAmbientOffset = 0x0Cu;
+    constexpr uint32_t kMaterialSpecularOffset = 0x10u;
+    constexpr uint32_t kMaterialDiffuseOffset = 0x14u;
     constexpr uint32_t kTextureRasterOffset = 0x00u;
     constexpr uint32_t kSectorTrianglesOffset = 0x04u;
     constexpr uint32_t kSectorVerticesOffset = 0x08u;
@@ -65,8 +68,20 @@ namespace
     constexpr uint32_t kSectorPrelitOffset = 0x30u;
     constexpr uint32_t kSectorMaterialBaseOffset = 0x80u;
     constexpr uint32_t kSectorNumTrianglesOffset = 0x84u;
+    constexpr uint32_t kWorldFlagsOffset = 0x08u;
     constexpr uint32_t kWorldMaterialsOffset = 0x10u;
     constexpr uint32_t kWorldNumMaterialsOffset = 0x14u;
+    constexpr uint32_t kWorldGlobalLightsOffset = 0x3Cu;
+    constexpr uint32_t kLightTypeOffset = 0x01u;
+    constexpr uint32_t kLightFlagsOffset = 0x02u;
+    constexpr uint32_t kLightFrameOffset = 0x04u;
+    constexpr uint32_t kLightColorOffset = 0x18u;
+    constexpr uint32_t kLightWorldLinkOffset = 0x34u;
+    constexpr uint8_t kLightDirectional = 1u;
+    constexpr uint8_t kLightAmbient = 2u;
+    constexpr uint8_t kLightAffectsAtomics = 1u;
+    constexpr uint8_t kLightAffectsWorld = 2u;
+    constexpr uint32_t kGeometryLightingFlag = 0x20u;
     constexpr uint32_t kFrameLtmOffset = 0x50u;
     constexpr uint32_t kRwCurrentCamera = 0x00960070u;
     constexpr uint32_t kRwCurrentWorld = 0x00960074u;
@@ -262,6 +277,78 @@ namespace
         return true;
     }
 
+    void readMaterialSurface(const uint8_t *rdram, uint32_t material,
+                             p3fes::native_renderer::Material &out)
+    {
+        float ambient = 1.0f, specular = 1.0f, diffuse = 1.0f;
+        readGuest(rdram, material + kMaterialAmbientOffset, ambient);
+        readGuest(rdram, material + kMaterialSpecularOffset, specular);
+        readGuest(rdram, material + kMaterialDiffuseOffset, diffuse);
+        if (std::isfinite(ambient))
+            out.ambient = ambient;
+        if (std::isfinite(specular))
+            out.specular = specular;
+        if (std::isfinite(diffuse))
+            out.diffuse = diffuse;
+    }
+
+    bool readNativeLighting(const uint8_t *rdram, bool worldGeometry, MeshDrawState &state)
+    {
+        uint32_t world = 0u;
+        if (!readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldGlobalLightsOffset + 8u))
+            return false;
+
+        const uint32_t sentinel = world + kWorldGlobalLightsOffset;
+        uint32_t link = 0u;
+        if (!readGuest(rdram, sentinel, link))
+            return false;
+
+        state.lightingEnabled = true;
+        state.ambientLight = {0.0f, 0.0f, 0.0f};
+        state.directionalLights.clear();
+        const uint8_t targetFlag = worldGeometry ? kLightAffectsWorld : kLightAffectsAtomics;
+        for (uint32_t guard = 0u; link && link != sentinel && guard < 64u; ++guard)
+        {
+            if (link < kLightWorldLinkOffset || !guestPointer(link, 8u))
+                return false;
+            const uint32_t light = link - kLightWorldLinkOffset;
+            if (!guestPointer(light, kLightWorldLinkOffset + 8u))
+                return false;
+
+            uint8_t type = 0u, flags = 0u;
+            if (!readGuest(rdram, light + kLightTypeOffset, type) ||
+                !readGuest(rdram, light + kLightFlagsOffset, flags))
+                return false;
+            if ((flags & targetFlag) != 0u)
+            {
+                std::array<float, 4> color{};
+                std::memcpy(color.data(), rdram + light + kLightColorOffset, sizeof(color));
+                const bool finiteColor = std::all_of(color.begin(), color.begin() + 3,
+                                                     [](float v) { return std::isfinite(v); });
+                if (finiteColor && type == kLightAmbient)
+                {
+                    for (int c = 0; c < 3; ++c)
+                        state.ambientLight[c] += color[c];
+                }
+                else if (finiteColor && type == kLightDirectional && state.directionalLights.size() < 8u)
+                {
+                    uint32_t frame = 0u;
+                    Matrix4 ltm{};
+                    if (readGuest(rdram, light + kLightFrameOffset, frame) && readFrameMatrix(rdram, frame, ltm))
+                    {
+                        MeshDrawState::DirectionalLight nativeLight;
+                        nativeLight.direction = {ltm[8], ltm[9], ltm[10]};
+                        nativeLight.color = {color[0], color[1], color[2]};
+                        state.directionalLights.push_back(nativeLight);
+                    }
+                }
+            }
+            if (!readGuest(rdram, link, link))
+                return false;
+        }
+        return true;
+    }
+
     bool readCurrentCamera(const uint8_t *rdram, Camera &out)
     {
         uint32_t camera = 0u, frame = 0u;
@@ -368,6 +455,7 @@ namespace
         const bool hasUv = guestPointer(summary.uv0Data, summary.vertices * 8u);
         mesh.hasNormals = hasNormals;
         mesh.hasPrelight = hasPrelight;
+        mesh.lighting = (summary.geometryFlags & kGeometryLightingFlag) != 0u;
         for (uint32_t i = 0; i < summary.vertices; ++i)
         {
             Vertex &v = mesh.vertices[i];
@@ -424,6 +512,7 @@ namespace
             if (!readGuest(rdram, materialArray + materialIndex * 4u, material) || !material || !guestPointer(material, 28u))
                 continue;
             std::memcpy(mesh.materials[materialIndex].color.data(), rdram + material + kMaterialColorOffset, 4u);
+            readMaterialSurface(rdram, material, mesh.materials[materialIndex]);
 
             uint32_t texture = 0u, raster = 0u;
             if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
@@ -449,7 +538,7 @@ namespace
     {
         uint16_t triangleCount = 0u, materialBase = 0u;
         uint32_t triangles = 0u, positions = 0u, normals = 0u, uv0 = 0u, prelit = 0u;
-        uint32_t world = 0u, materialArray = 0u;
+        uint32_t world = 0u, worldFlags = 0u, materialArray = 0u;
         int32_t worldMaterialCountSigned = 0;
         if (!guestPointer(sector, kSectorNumTrianglesOffset + sizeof(uint16_t)) ||
             !readGuest(rdram, sector + kSectorNumTrianglesOffset, triangleCount) || triangleCount == 0u ||
@@ -460,6 +549,7 @@ namespace
             !readGuest(rdram, sector + kSectorUv0Offset, uv0) ||
             !readGuest(rdram, sector + kSectorPrelitOffset, prelit) ||
             !readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldNumMaterialsOffset + 4u) ||
+            !readGuest(rdram, world + kWorldFlagsOffset, worldFlags) ||
             !readGuest(rdram, world + kWorldMaterialsOffset, materialArray) ||
             !readGuest(rdram, world + kWorldNumMaterialsOffset, worldMaterialCountSigned) ||
             worldMaterialCountSigned <= 0 || worldMaterialCountSigned > 65535 ||
@@ -489,6 +579,7 @@ namespace
         mesh.vertices.resize(vertexCount);
         mesh.hasNormals = hasNormals;
         mesh.hasPrelight = hasPrelight;
+        mesh.lighting = (worldFlags & kGeometryLightingFlag) != 0u;
         for (uint32_t i = 0u; i < vertexCount; ++i)
         {
             Vertex &v = mesh.vertices[i];
@@ -540,6 +631,7 @@ namespace
             if (!readGuest(rdram, materialArray + worldMaterial * 4u, material) || !material || !guestPointer(material, 28u))
                 continue;
             std::memcpy(mesh.materials[localMaterial].color.data(), rdram + material + kMaterialColorOffset, 4u);
+            readMaterialSurface(rdram, material, mesh.materials[localMaterial]);
             drawState.materialColors[localMaterial] = mesh.materials[localMaterial].color;
 
             uint32_t texture = 0u, raster = 0u;
@@ -606,6 +698,8 @@ namespace
             return false;
         MeshDrawState drawState;
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
+        if ((summary.geometryFlags & kGeometryLightingFlag) != 0u)
+            readNativeLighting(rdram, false, drawState);
         p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
         return true;
     }
@@ -668,6 +762,7 @@ namespace
                 }
             }
         }
+        readNativeLighting(rdram, true, drawState);
         p3fes_native_present::drawMesh(meshId, p3fes::native_renderer::kIdentityMatrix, std::move(drawState));
         return true;
     }

@@ -24,6 +24,11 @@ struct Material
 {
     std::array<std::uint8_t, 4> color{255, 255, 255, 255};
     std::string textureName;
+    // RenderWare surface properties. The native runtime currently uses the
+    // ambient/diffuse terms; specular is retained for the next lighting step.
+    float ambient = 1.0f;
+    float specular = 1.0f;
+    float diffuse = 1.0f;
 };
 
 struct Submesh
@@ -42,6 +47,7 @@ struct MeshData
     bool triangleStrip = false;
     bool hasNormals = false;
     bool hasPrelight = false;
+    bool lighting = false;
     bool skinned = false;
     std::uint32_t boneCount = 0;
 };
