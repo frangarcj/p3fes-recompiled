@@ -117,6 +117,7 @@ namespace
     constexpr uint32_t kSkyIm2DRenderIndexedPrimitive = 0x004EEB50u;
     constexpr uint32_t kRwGp = 0x007D2CF0u;
     constexpr uint32_t kRwRenderFlags = kRwGp - 20272u;
+    constexpr uint32_t kRwMatFxPluginOffset = kRwGp - 17848u;
     constexpr uint32_t kRwRasterPluginOffset = kRwGp - 16968u;
     constexpr uint32_t kRwClamp1 = kRwGp - 17048u;
     constexpr uint32_t kRwTex1 = kRwGp - 17040u;
@@ -128,6 +129,9 @@ namespace
     constexpr float kRwScreenHeight = 448.0f;
     constexpr uint32_t kMaxVertices = 1u << 20;
     constexpr uint32_t kMaxTriangles = 1u << 20;
+    constexpr uint32_t kMatFxEffectOffset = 128u;
+    constexpr uint32_t kMatFxUvTransform = 5u;
+    constexpr uint32_t kMatFxDualUvTransform = 6u;
 
     std::atomic<PS2Runtime::RecompiledFunction> g_originalAtomicRender{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalSectorRender{nullptr};
@@ -249,6 +253,8 @@ namespace
     uint32_t g_nativeErrors = 0u;
 
     bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture, uint64_t &revision);
+    bool readMaterialUvTransform(const uint8_t *rdram, uint32_t material,
+                                 MeshDrawState::UvTransform &out);
 
     void readNativeMeshDrawState(const uint8_t *rdram, uint32_t geometry, MeshDrawState &state)
     {
@@ -260,6 +266,7 @@ namespace
             !guestPointer(materialArray, static_cast<uint32_t>(materialCount) * sizeof(uint32_t)))
             return;
         state.materialColors.assign(static_cast<size_t>(materialCount), {255u, 255u, 255u, 255u});
+        state.materialUvTransforms.resize(static_cast<size_t>(materialCount));
         for (int32_t i = 0; i < materialCount; ++i)
         {
             uint32_t material = 0u;
@@ -268,6 +275,7 @@ namespace
                 continue;
             std::memcpy(state.materialColors[static_cast<size_t>(i)].data(),
                         rdram + material + kMaterialColorOffset, 4u);
+            readMaterialUvTransform(rdram, material, state.materialUvTransforms[static_cast<size_t>(i)]);
         }
     }
 
@@ -307,6 +315,48 @@ namespace
             out.specular = specular;
         if (std::isfinite(diffuse))
             out.diffuse = diffuse;
+    }
+
+    bool readMaterialUvTransform(const uint8_t *rdram, uint32_t material,
+                                 MeshDrawState::UvTransform &out)
+    {
+        uint32_t pluginOffset = 0u;
+        if (!readGuest(rdram, kRwMatFxPluginOffset, pluginOffset) || pluginOffset == 0u ||
+            !guestPointer(material + pluginOffset, sizeof(uint32_t)))
+            return false;
+
+        // RenderWare's material plugin slot stores a pointer to the 132-byte
+        // MatFX record (two 64-byte slots + effect kind). P3FES' bridge reads
+        // slot 0 for both UVTRANSFORM and DUALUVTRANSFORM.
+        uint32_t extension = 0u, effect = 0u;
+        if (!readGuest(rdram, material + pluginOffset, extension) || !extension ||
+            !guestPointer(extension, kMatFxEffectOffset + sizeof(uint32_t)) ||
+            !readGuest(rdram, extension + kMatFxEffectOffset, effect) ||
+            (effect != kMatFxUvTransform && effect != kMatFxDualUvTransform))
+            return false;
+
+        uint32_t matrix = 0u;
+        if (!readGuest(rdram, extension, matrix) || !matrix)
+            return false; // null means the identity matrix in the stock bridge.
+        if (!guestPointer(matrix, 56u))
+            return false;
+
+        float rightX = 1.0f, rightY = 0.0f, upX = 0.0f, upY = 1.0f, posX = 0.0f, posY = 0.0f;
+        if (!readGuest(rdram, matrix + 0u, rightX) || !readGuest(rdram, matrix + 4u, rightY) ||
+            !readGuest(rdram, matrix + 16u, upX) || !readGuest(rdram, matrix + 20u, upY) ||
+            !readGuest(rdram, matrix + 48u, posX) || !readGuest(rdram, matrix + 52u, posY) ||
+            !std::isfinite(rightX) || !std::isfinite(rightY) || !std::isfinite(upX) ||
+            !std::isfinite(upY) || !std::isfinite(posX) || !std::isfinite(posY))
+            return false;
+
+        out.enabled = true;
+        out.rightX = rightX;
+        out.rightY = rightY;
+        out.upX = upX;
+        out.upY = upY;
+        out.posX = posX;
+        out.posY = posY;
+        return true;
     }
 
     bool readNativeLighting(const uint8_t *rdram, bool worldGeometry, uint32_t object, MeshDrawState &state)
@@ -805,6 +855,7 @@ namespace
 
         mesh.materials.resize(localMaterialCount);
         drawState.materialColors.assign(localMaterialCount, {255u, 255u, 255u, 255u});
+        drawState.materialUvTransforms.resize(localMaterialCount);
         for (uint32_t localMaterial = 0u; localMaterial < localMaterialCount; ++localMaterial)
         {
             const auto &indices = materialIndices[localMaterial];
@@ -822,6 +873,7 @@ namespace
             std::memcpy(mesh.materials[localMaterial].color.data(), rdram + material + kMaterialColorOffset, 4u);
             readMaterialSurface(rdram, material, mesh.materials[localMaterial]);
             drawState.materialColors[localMaterial] = mesh.materials[localMaterial].color;
+            readMaterialUvTransform(rdram, material, drawState.materialUvTransforms[localMaterial]);
 
             uint32_t texture = 0u, raster = 0u;
             if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
@@ -947,13 +999,17 @@ namespace
                 const uint32_t available = static_cast<uint32_t>(worldMaterialCount) - materialBase;
                 const uint32_t materialCount = std::min(maxLocalMaterial + 1u, available);
                 drawState.materialColors.assign(materialCount, {255u, 255u, 255u, 255u});
+                drawState.materialUvTransforms.resize(materialCount);
                 for (uint32_t localMaterial = 0u; localMaterial < materialCount; ++localMaterial)
                 {
                     uint32_t material = 0u;
                     const uint32_t worldMaterial = materialBase + localMaterial;
                     if (readGuest(rdram, materialArray + worldMaterial * 4u, material) && material && guestPointer(material, 8u))
+                    {
                         std::memcpy(drawState.materialColors[localMaterial].data(),
                                     rdram + material + kMaterialColorOffset, 4u);
+                        readMaterialUvTransform(rdram, material, drawState.materialUvTransforms[localMaterial]);
+                    }
                 }
             }
         }

@@ -80,9 +80,19 @@ struct MeshDrawState
     // so they cannot be baked permanently into the cached GPU mesh.
     std::vector<std::array<std::uint8_t, 4>> materialColors;
 
+    struct UvTransform
+    {
+        bool enabled = false;
+        // RenderWare Matrix rows 0/1/3 reduced to the 2D transform sent by
+        // the PS2 MatFX UV bridge: uv' = uv.x * right + uv.y * up + pos.
+        float rightX = 1.0f, rightY = 0.0f;
+        float upX = 0.0f, upY = 1.0f;
+        float posX = 0.0f, posY = 0.0f;
+    };
+    std::vector<UvTransform> materialUvTransforms;
+
     // RenderWare world lighting, kept in the same form used by librw-vita's
-    // default shader: ambient plus directional lights. Local point/spot lights
-    // are intentionally left for a later pass.
+    // default shader: ambient, directional, point and spot lights.
     struct DirectionalLight
     {
         std::array<float, 3> direction{};

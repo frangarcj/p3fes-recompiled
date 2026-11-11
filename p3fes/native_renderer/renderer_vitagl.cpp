@@ -3,6 +3,7 @@
 #include "renderer.h"
 #include "lighting.h"
 #include "skinning.h"
+#include "uv_transform.h"
 
 #include <raylib.h>
 #include <vitaGL.h>
@@ -407,12 +408,27 @@ public:
                 : part.color;
             if (part.gpuVertices.size() == part.sourceVertices.size())
             {
+                const MeshDrawState::UvTransform *uvTransform =
+                    part.materialIndex < state.materialUvTransforms.size()
+                        ? &state.materialUvTransforms[part.materialIndex]
+                        : nullptr;
                 for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                 {
                     const Vertex posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette)
                                                       : part.sourceVertices[i];
                     std::copy(posed.position.begin(), posed.position.end(), part.gpuVertices[i].position);
                     std::copy(posed.normal.begin(), posed.normal.end(), part.gpuVertices[i].normal);
+                    if (uvTransform && uvTransform->enabled)
+                    {
+                        const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, *uvTransform);
+                        part.gpuVertices[i].uv[0] = uv[0];
+                        part.gpuVertices[i].uv[1] = uv[1];
+                    }
+                    else
+                    {
+                        part.gpuVertices[i].uv[0] = part.sourceVertices[i].texCoord[0];
+                        part.gpuVertices[i].uv[1] = part.sourceVertices[i].texCoord[1];
+                    }
                     const auto shaded = shadeVertexColor(posed, part.material, color,
                                                          part.lighting, part.hasPrelight, state, model);
                     std::copy(shaded.begin(), shaded.end(), part.gpuVertices[i].color);

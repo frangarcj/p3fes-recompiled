@@ -1,6 +1,7 @@
 #include "renderer.h"
 #include "lighting.h"
 #include "skinning.h"
+#include "uv_transform.h"
 
 #include <raylib.h>
 #include <raymath.h>
@@ -347,10 +348,17 @@ public:
                 : part.color;
             if (part.mesh.colors && part.sourceVertices.size() == static_cast<std::size_t>(part.mesh.vertexCount))
             {
+                const MeshDrawState::UvTransform *uvTransform =
+                    part.materialIndex < state.materialUvTransforms.size()
+                        ? &state.materialUvTransforms[part.materialIndex]
+                        : nullptr;
                 for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                 {
                     Vertex &posed = part.posedVertices[i];
                     posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette) : part.sourceVertices[i];
+                    if (uvTransform && uvTransform->enabled)
+                        posed.texCoord = transformTexCoord(part.sourceVertices[i].texCoord, *uvTransform);
+                    std::memcpy(part.mesh.texcoords + i * 2u, posed.texCoord.data(), sizeof(float) * 2u);
                     const auto shaded = shadeVertexColor(posed, part.material, color,
                                                          part.lighting, part.hasPrelight, state, model);
                     std::memcpy(part.shadedColors.data() + i * 4u, shaded.data(), 4u);
@@ -367,6 +375,8 @@ public:
                     UpdateMeshBuffer(part.mesh, 2, part.mesh.normals,
                                      part.mesh.vertexCount * static_cast<int>(sizeof(float) * 3u), 0);
                 }
+                UpdateMeshBuffer(part.mesh, 1, part.mesh.texcoords,
+                                 part.mesh.vertexCount * static_cast<int>(sizeof(float) * 2u), 0);
                 UpdateMeshBuffer(part.mesh, 3, part.shadedColors.data(),
                                  static_cast<int>(part.shadedColors.size()), 0);
                 diffuse.color = WHITE;
