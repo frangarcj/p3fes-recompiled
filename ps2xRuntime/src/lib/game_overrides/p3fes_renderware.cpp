@@ -39,6 +39,7 @@ namespace
     constexpr uint32_t kAtomicFrameOffset = 0x04u;
     constexpr uint32_t kAtomicGeometryOffset = 0x18u;
     constexpr uint32_t kAtomicCurrentMorphOffset = 0x50u;
+    constexpr uint32_t kAtomicSectorTiesOffset = 0x64u;
     constexpr uint8_t kAtomicRenderFlag = 0x04u;
 
     constexpr uint32_t kGeometryFlagsOffset = 0x08u;
@@ -66,6 +67,7 @@ namespace
     constexpr uint32_t kSectorNormalsOffset = 0x0Cu;
     constexpr uint32_t kSectorUv0Offset = 0x10u;
     constexpr uint32_t kSectorPrelitOffset = 0x30u;
+    constexpr uint32_t kSectorLightTiesOffset = 0x40u;
     constexpr uint32_t kSectorMaterialBaseOffset = 0x80u;
     constexpr uint32_t kSectorNumTrianglesOffset = 0x84u;
     constexpr uint32_t kWorldFlagsOffset = 0x08u;
@@ -75,12 +77,20 @@ namespace
     constexpr uint32_t kLightTypeOffset = 0x01u;
     constexpr uint32_t kLightFlagsOffset = 0x02u;
     constexpr uint32_t kLightFrameOffset = 0x04u;
+    constexpr uint32_t kLightRadiusOffset = 0x14u;
     constexpr uint32_t kLightColorOffset = 0x18u;
+    constexpr uint32_t kLightMinusCosAngleOffset = 0x28u;
     constexpr uint32_t kLightWorldLinkOffset = 0x34u;
     constexpr uint8_t kLightDirectional = 1u;
     constexpr uint8_t kLightAmbient = 2u;
+    constexpr uint8_t kLightPoint = 0x80u;
+    constexpr uint8_t kLightSpot = 0x81u;
+    constexpr uint8_t kLightSoftSpot = 0x82u;
     constexpr uint8_t kLightAffectsAtomics = 1u;
     constexpr uint8_t kLightAffectsWorld = 2u;
+    constexpr uint32_t kTieObjectOffset = 0x08u;
+    constexpr uint32_t kTieObjectLinkOffset = 0x0Cu;
+    constexpr uint32_t kTieSectorOffset = 0x14u;
     constexpr uint32_t kGeometryLightingFlag = 0x20u;
     constexpr uint32_t kFrameLtmOffset = 0x50u;
     constexpr uint32_t kRwCurrentCamera = 0x00960070u;
@@ -292,7 +302,7 @@ namespace
             out.diffuse = diffuse;
     }
 
-    bool readNativeLighting(const uint8_t *rdram, bool worldGeometry, MeshDrawState &state)
+    bool readNativeLighting(const uint8_t *rdram, bool worldGeometry, uint32_t object, MeshDrawState &state)
     {
         uint32_t world = 0u;
         if (!readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldGlobalLightsOffset + 8u))
@@ -306,6 +316,7 @@ namespace
         state.lightingEnabled = true;
         state.ambientLight = {0.0f, 0.0f, 0.0f};
         state.directionalLights.clear();
+        state.localLights.clear();
         const uint8_t targetFlag = worldGeometry ? kLightAffectsWorld : kLightAffectsAtomics;
         for (uint32_t guard = 0u; link && link != sentinel && guard < 64u; ++guard)
         {
@@ -345,6 +356,90 @@ namespace
             }
             if (!readGuest(rdram, link, link))
                 return false;
+        }
+
+        std::unordered_set<uint32_t> seenLocalLights;
+        const auto appendLocalLight = [&](uint32_t light) {
+            if (!light || !seenLocalLights.insert(light).second || state.localLights.size() >= 8u ||
+                !guestPointer(light, kLightWorldLinkOffset + 8u))
+                return;
+
+            uint8_t type = 0u, flags = 0u;
+            if (!readGuest(rdram, light + kLightTypeOffset, type) ||
+                !readGuest(rdram, light + kLightFlagsOffset, flags) || (flags & targetFlag) == 0u ||
+                (type != kLightPoint && type != kLightSpot && type != kLightSoftSpot))
+                return;
+
+            float radius = 0.0f, minusCos = -1.0f;
+            std::array<float, 4> color{};
+            uint32_t frame = 0u;
+            Matrix4 ltm{};
+            if (!readGuest(rdram, light + kLightRadiusOffset, radius) ||
+                !readGuest(rdram, light + kLightMinusCosAngleOffset, minusCos) ||
+                !readGuest(rdram, light + kLightFrameOffset, frame) || !readFrameMatrix(rdram, frame, ltm))
+                return;
+            std::memcpy(color.data(), rdram + light + kLightColorOffset, sizeof(color));
+            if (!(radius > 0.0f) || !std::isfinite(radius) || !std::isfinite(minusCos) ||
+                !std::all_of(color.begin(), color.begin() + 3, [](float v) { return std::isfinite(v); }))
+                return;
+
+            MeshDrawState::LocalLight nativeLight;
+            nativeLight.type = type == kLightPoint ? MeshDrawState::LocalLight::Type::Point
+                : (type == kLightSpot ? MeshDrawState::LocalLight::Type::Spot
+                                      : MeshDrawState::LocalLight::Type::SoftSpot);
+            nativeLight.position = {ltm[12], ltm[13], ltm[14]};
+            nativeLight.direction = {ltm[8], ltm[9], ltm[10]};
+            nativeLight.color = {color[0], color[1], color[2]};
+            nativeLight.radius = radius;
+            nativeLight.minusCosAngle = minusCos;
+            state.localLights.push_back(nativeLight);
+        };
+
+        const auto walkSectorLights = [&](uint32_t sector) {
+            if (!guestPointer(sector, kSectorLightTiesOffset + 8u))
+                return;
+            const uint32_t sectorSentinel = sector + kSectorLightTiesOffset;
+            uint32_t sectorLink = 0u;
+            if (!readGuest(rdram, sectorSentinel, sectorLink))
+                return;
+            for (uint32_t guard = 0u; sectorLink && sectorLink != sectorSentinel && guard < 64u; ++guard)
+            {
+                // Sector lists use the tie's sector link at +0; the light is
+                // the common tie object pointer at +8.
+                uint32_t light = 0u;
+                if (!guestPointer(sectorLink, kTieObjectOffset + 4u) ||
+                    !readGuest(rdram, sectorLink + kTieObjectOffset, light))
+                    return;
+                appendLocalLight(light);
+                if (!readGuest(rdram, sectorLink, sectorLink))
+                    return;
+            }
+        };
+
+        if (worldGeometry)
+        {
+            walkSectorLights(object);
+        }
+        else if (guestPointer(object, kAtomicSectorTiesOffset + 8u))
+        {
+            const uint32_t atomicSentinel = object + kAtomicSectorTiesOffset;
+            uint32_t atomicLink = 0u;
+            if (readGuest(rdram, atomicSentinel, atomicLink))
+            {
+                for (uint32_t guard = 0u; atomicLink && atomicLink != atomicSentinel && guard < 64u; ++guard)
+                {
+                    // The atomic's list points at tie +12 (object link).
+                    if (atomicLink < kTieObjectLinkOffset)
+                        break;
+                    const uint32_t tie = atomicLink - kTieObjectLinkOffset;
+                    uint32_t sector = 0u;
+                    if (guestPointer(tie, kTieSectorOffset + 4u) &&
+                        readGuest(rdram, tie + kTieSectorOffset, sector))
+                        walkSectorLights(sector);
+                    if (!readGuest(rdram, atomicLink, atomicLink))
+                        break;
+                }
+            }
         }
         return true;
     }
@@ -699,7 +794,7 @@ namespace
         MeshDrawState drawState;
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
         if ((summary.geometryFlags & kGeometryLightingFlag) != 0u)
-            readNativeLighting(rdram, false, drawState);
+            readNativeLighting(rdram, false, atomic, drawState);
         p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
         return true;
     }
@@ -762,7 +857,7 @@ namespace
                 }
             }
         }
-        readNativeLighting(rdram, true, drawState);
+        readNativeLighting(rdram, true, sector, drawState);
         p3fes_native_present::drawMesh(meshId, p3fes::native_renderer::kIdentityMatrix, std::move(drawState));
         return true;
     }

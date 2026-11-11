@@ -88,9 +88,25 @@ struct MeshDrawState
         std::array<float, 3> direction{};
         std::array<float, 3> color{};
     };
+    struct LocalLight
+    {
+        enum class Type : std::uint8_t
+        {
+            Point,
+            Spot,
+            SoftSpot,
+        };
+        Type type = Type::Point;
+        std::array<float, 3> position{};
+        std::array<float, 3> direction{};
+        std::array<float, 3> color{};
+        float radius = 1.0f;
+        float minusCosAngle = -1.0f;
+    };
     bool lightingEnabled = false;
     std::array<float, 3> ambientLight{};
     std::vector<DirectionalLight> directionalLights;
+    std::vector<LocalLight> localLights;
 };
 
 class Renderer
