@@ -60,6 +60,7 @@ struct DrawPart
     std::vector<GpuVertex> gpuVertices;
     bool lighting = false;
     bool hasPrelight = false;
+    bool hasNormals = false;
     bool skinned = false;
 };
 
@@ -329,6 +330,7 @@ public:
             part.sourceVertices = source.vertices;
             part.lighting = source.lighting && source.hasNormals;
             part.hasPrelight = source.hasPrelight;
+            part.hasNormals = source.hasNormals;
             part.skinned = source.skinned;
             if (!source.materials.empty())
             {
@@ -499,6 +501,46 @@ public:
                     glEnable(GL_BLEND);
                     glBlendEquation(GL_FUNC_ADD);
                     glBlendFunc(rwBlendFactor(dual->srcBlend), rwBlendFactor(dual->dstBlend));
+                    glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                }
+            }
+
+            const MeshDrawState::EnvPass *env = part.materialIndex < state.materialEnvPasses.size()
+                ? &state.materialEnvPasses[part.materialIndex]
+                : nullptr;
+            if (env && env->enabled && part.hasNormals && !env->textureName.empty())
+            {
+                const auto envTexture = m_textures.find(textureKey(env->textureName));
+                if (envTexture != m_textures.end())
+                {
+                    const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
+                    for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                    {
+                        const Vertex posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette)
+                                                          : part.sourceVertices[i];
+                        const auto uv = environmentTexCoord(posed, model, *env);
+                        part.gpuVertices[i].uv[0] = uv[0];
+                        part.gpuVertices[i].uv[1] = uv[1];
+                        const float alpha = env->frameBufferAlpha
+                            ? static_cast<float>(part.gpuVertices[i].color[3]) / 255.0f
+                            : 1.0f;
+                        const auto level = static_cast<std::uint8_t>(std::lround(255.0f * coefficient * alpha));
+                        part.gpuVertices[i].color[0] = level;
+                        part.gpuVertices[i].color[1] = level;
+                        part.gpuVertices[i].color[2] = level;
+                        part.gpuVertices[i].color[3] = 255u;
+                    }
+                    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                    static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
+                                    part.gpuVertices.data());
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, envTexture->second);
+                    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+                    glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
+                    glEnable(GL_BLEND);
+                    glBlendEquation(GL_FUNC_ADD);
+                    glBlendFunc(GL_ONE, GL_ONE);
                     glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 }

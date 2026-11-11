@@ -134,6 +134,9 @@ namespace
     constexpr uint32_t kMatFxSlotTypeOffset = 32u;
     constexpr uint32_t kMatFxSlotDual = 4u;
     constexpr uint32_t kMatFxSlotUv = 5u;
+    constexpr uint32_t kMatFxSlotEnv = 2u;
+    constexpr uint32_t kMatFxEnv = 2u;
+    constexpr uint32_t kMatFxBumpEnv = 3u;
     constexpr uint32_t kMatFxDual = 4u;
     constexpr uint32_t kMatFxUvTransform = 5u;
     constexpr uint32_t kMatFxDualUvTransform = 6u;
@@ -262,6 +265,7 @@ namespace
     bool readMaterialUvTransform(const uint8_t *rdram, uint32_t material,
                                  MeshDrawState::UvTransform &out);
     bool readMaterialDualPass(const uint8_t *rdram, uint32_t material, MeshDrawState::DualPass &out);
+    bool readMaterialEnvPass(const uint8_t *rdram, uint32_t material, MeshDrawState::EnvPass &out);
 
     void readNativeMeshDrawState(const uint8_t *rdram, uint32_t geometry, MeshDrawState &state)
     {
@@ -275,6 +279,7 @@ namespace
         state.materialColors.assign(static_cast<size_t>(materialCount), {255u, 255u, 255u, 255u});
         state.materialUvTransforms.resize(static_cast<size_t>(materialCount));
         state.materialDualPasses.resize(static_cast<size_t>(materialCount));
+        state.materialEnvPasses.resize(static_cast<size_t>(materialCount));
         for (int32_t i = 0; i < materialCount; ++i)
         {
             uint32_t material = 0u;
@@ -285,6 +290,7 @@ namespace
                         rdram + material + kMaterialColorOffset, 4u);
             readMaterialUvTransform(rdram, material, state.materialUvTransforms[static_cast<size_t>(i)]);
             readMaterialDualPass(rdram, material, state.materialDualPasses[static_cast<size_t>(i)]);
+            readMaterialEnvPass(rdram, material, state.materialEnvPasses[static_cast<size_t>(i)]);
         }
     }
 
@@ -424,6 +430,49 @@ namespace
             if (uvSlot && readGuest(rdram, uvSlot + 4u, matrix))
                 readUvMatrix(rdram, matrix, out.uvTransform);
         }
+        return true;
+    }
+
+    bool readMaterialEnvPass(const uint8_t *rdram, uint32_t material, MeshDrawState::EnvPass &out)
+    {
+        uint32_t extension = 0u, effect = 0u;
+        if (!readMaterialMatFx(rdram, material, extension, effect) ||
+            (effect != kMatFxEnv && effect != kMatFxBumpEnv))
+            return false;
+        const uint32_t envSlot = findMatFxSlot(rdram, extension, kMatFxSlotEnv);
+        if (!envSlot)
+            return false;
+
+        uint32_t frame = 0u, texture = 0u, raster = 0u, fbAlpha = 0u;
+        float coefficient = 0.0f;
+        if (!readGuest(rdram, envSlot + 0u, frame) ||
+            !readGuest(rdram, envSlot + 4u, texture) || !texture || !guestPointer(texture, 4u) ||
+            !readGuest(rdram, texture + kTextureRasterOffset, raster) || !raster ||
+            !readGuest(rdram, envSlot + 8u, coefficient) || !std::isfinite(coefficient) || coefficient == 0.0f ||
+            !readGuest(rdram, envSlot + 12u, fbAlpha))
+            return false;
+
+        std::string textureName;
+        if (!prepareNativeRasterTexture(rdram, raster, textureName))
+            return false;
+
+        if (!frame)
+        {
+            uint32_t camera = 0u;
+            if (!readGuest(rdram, kRwCurrentCamera, camera) || !guestPointer(camera, kCameraFrameOffset + 4u) ||
+                !readGuest(rdram, camera + kCameraFrameOffset, frame))
+                return false;
+        }
+        Matrix4 ltm{};
+        if (!readFrameMatrix(rdram, frame, ltm))
+            return false;
+
+        out.enabled = true;
+        out.textureName = std::move(textureName);
+        out.coefficient = coefficient;
+        out.frameBufferAlpha = fbAlpha != 0u;
+        out.frameRight = {ltm[0], ltm[1], ltm[2]};
+        out.frameUp = {ltm[4], ltm[5], ltm[6]};
         return true;
     }
 
@@ -925,6 +974,7 @@ namespace
         drawState.materialColors.assign(localMaterialCount, {255u, 255u, 255u, 255u});
         drawState.materialUvTransforms.resize(localMaterialCount);
         drawState.materialDualPasses.resize(localMaterialCount);
+        drawState.materialEnvPasses.resize(localMaterialCount);
         for (uint32_t localMaterial = 0u; localMaterial < localMaterialCount; ++localMaterial)
         {
             const auto &indices = materialIndices[localMaterial];
@@ -944,6 +994,7 @@ namespace
             drawState.materialColors[localMaterial] = mesh.materials[localMaterial].color;
             readMaterialUvTransform(rdram, material, drawState.materialUvTransforms[localMaterial]);
             readMaterialDualPass(rdram, material, drawState.materialDualPasses[localMaterial]);
+            readMaterialEnvPass(rdram, material, drawState.materialEnvPasses[localMaterial]);
 
             uint32_t texture = 0u, raster = 0u;
             if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
@@ -1071,6 +1122,7 @@ namespace
                 drawState.materialColors.assign(materialCount, {255u, 255u, 255u, 255u});
                 drawState.materialUvTransforms.resize(materialCount);
                 drawState.materialDualPasses.resize(materialCount);
+                drawState.materialEnvPasses.resize(materialCount);
                 for (uint32_t localMaterial = 0u; localMaterial < materialCount; ++localMaterial)
                 {
                     uint32_t material = 0u;
@@ -1081,6 +1133,7 @@ namespace
                                     rdram + material + kMaterialColorOffset, 4u);
                         readMaterialUvTransform(rdram, material, drawState.materialUvTransforms[localMaterial]);
                         readMaterialDualPass(rdram, material, drawState.materialDualPasses[localMaterial]);
+                        readMaterialEnvPass(rdram, material, drawState.materialEnvPasses[localMaterial]);
                     }
                 }
             }

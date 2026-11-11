@@ -103,6 +103,20 @@ struct MeshDrawState
     };
     std::vector<DualPass> materialDualPasses;
 
+    struct EnvPass
+    {
+        bool enabled = false;
+        std::string textureName;
+        float coefficient = 0.0f;
+        bool frameBufferAlpha = false;
+        // World-space axes of the environment frame. librw-vita generates
+        // env UVs by transforming the world normal by inverse(frame LTM), then
+        // mapping x/y from [-1,1] to [0,1].
+        std::array<float, 3> frameRight{1.0f, 0.0f, 0.0f};
+        std::array<float, 3> frameUp{0.0f, 1.0f, 0.0f};
+    };
+    std::vector<EnvPass> materialEnvPasses;
+
     // RenderWare world lighting, kept in the same form used by librw-vita's
     // default shader: ambient, directional, point and spot lights.
     struct DirectionalLight

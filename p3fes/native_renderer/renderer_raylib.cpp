@@ -118,6 +118,7 @@ struct DrawPart
     std::vector<unsigned char> shadedColors;
     bool lighting = false;
     bool hasPrelight = false;
+    bool hasNormals = false;
     bool skinned = false;
 };
 
@@ -261,6 +262,7 @@ public:
             part.shadedColors.resize(source.vertices.size() * 4u);
             part.lighting = source.lighting && source.hasNormals;
             part.hasPrelight = source.hasPrelight;
+            part.hasNormals = source.hasNormals;
             part.skinned = source.skinned;
             if (!source.materials.empty())
             {
@@ -432,6 +434,43 @@ public:
                     diffuse.texture = dualTexture->second;
                     rlEnableColorBlend();
                     rlSetBlendFactors(rwBlendFactor(dual->srcBlend), rwBlendFactor(dual->dstBlend), RL_FUNC_ADD);
+                    rlSetBlendMode(RL_BLEND_CUSTOM);
+                    DrawMesh(part.mesh, drawMaterial, transform);
+                    rlSetBlendMode(RL_BLEND_ALPHA);
+                }
+            }
+
+            const MeshDrawState::EnvPass *env = part.materialIndex < state.materialEnvPasses.size()
+                ? &state.materialEnvPasses[part.materialIndex]
+                : nullptr;
+            if (env && env->enabled && part.hasNormals && !env->textureName.empty())
+            {
+                const auto envTexture = m_textures.find(textureKey(env->textureName));
+                if (envTexture != m_textures.end())
+                {
+                    const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
+                    for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                    {
+                        const Vertex &posed = part.posedVertices[i];
+                        const auto uv = environmentTexCoord(posed, model, *env);
+                        std::memcpy(part.mesh.texcoords + i * 2u, uv.data(), sizeof(float) * 2u);
+                        const float alpha = env->frameBufferAlpha
+                            ? static_cast<float>(part.shadedColors[i * 4u + 3u]) / 255.0f
+                            : 1.0f;
+                        const auto level = static_cast<unsigned char>(std::lround(255.0f * coefficient * alpha));
+                        part.shadedColors[i * 4u + 0u] = level;
+                        part.shadedColors[i * 4u + 1u] = level;
+                        part.shadedColors[i * 4u + 2u] = level;
+                        part.shadedColors[i * 4u + 3u] = 255u;
+                    }
+                    UpdateMeshBuffer(part.mesh, 1, part.mesh.texcoords,
+                                     part.mesh.vertexCount * static_cast<int>(sizeof(float) * 2u), 0);
+                    UpdateMeshBuffer(part.mesh, 3, part.shadedColors.data(),
+                                     static_cast<int>(part.shadedColors.size()), 0);
+                    diffuse.texture = envTexture->second;
+                    diffuse.color = WHITE;
+                    rlEnableColorBlend();
+                    rlSetBlendFactors(RL_ONE, RL_ONE, RL_FUNC_ADD);
                     rlSetBlendMode(RL_BLEND_CUSTOM);
                     DrawMesh(part.mesh, drawMaterial, transform);
                     rlSetBlendMode(RL_BLEND_ALPHA);

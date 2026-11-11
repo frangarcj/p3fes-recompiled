@@ -112,4 +112,14 @@ inline std::array<std::uint8_t, 4> shadeVertexColor(const Vertex &vertex,
     out[3] = static_cast<std::uint8_t>((static_cast<unsigned int>(vertex.color[3]) * materialColor[3] + 127u) / 255u);
     return out;
 }
+
+inline std::array<float, 2> environmentTexCoord(const Vertex &vertex,
+                                                const Matrix4 &model,
+                                                const MeshDrawState::EnvPass &pass)
+{
+    const auto normal = transformNormal(model, vertex.normal);
+    const float x = normal[0] * pass.frameRight[0] + normal[1] * pass.frameRight[1] + normal[2] * pass.frameRight[2];
+    const float y = normal[0] * pass.frameUp[0] + normal[1] * pass.frameUp[1] + normal[2] * pass.frameUp[2];
+    return {0.5f * x + 0.5f, -0.5f * y + 0.5f};
+}
 } // namespace p3fes::native_renderer
