@@ -110,6 +110,7 @@ namespace
     constexpr uint32_t kCameraViewOffsetYOffset = 0x7Cu;
     constexpr uint32_t kCameraNearPlaneOffset = 0x80u;
     constexpr uint32_t kCameraFarPlaneOffset = 0x84u;
+    constexpr uint32_t kCameraFogPlaneOffset = 0x88u;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
     constexpr uint32_t kPtankAtomicRender = 0x00474160u;
     constexpr uint32_t kRwIm3DTransform = 0x004F1ED0u;
@@ -130,12 +131,14 @@ namespace
     constexpr uint32_t kRwClamp1 = kRwGp - 17048u;
     constexpr uint32_t kRwTex1 = kRwGp - 17040u;
     constexpr uint32_t kRwAlpha1 = kRwGp - 17032u;
+    constexpr uint32_t kRwFogCol = kRwGp - 17056u;
     constexpr uint32_t kRwZbuf1 = kRwGp - 17088u;
     constexpr uint32_t kRwTest1 = kRwGp - 17072u;
     constexpr uint32_t kRwCullMode = kRwGp - 16964u;
     constexpr uint32_t kRwCurrentRaster = kRwGp - 16948u;
     constexpr uint32_t kPtankAtomicExtensionOffset = kRwGp - 17792u;
     constexpr uint64_t kGsPrimTextureEnable = 0x10u;
+    constexpr uint64_t kGsPrimFogEnable = 0x20u;
     constexpr uint64_t kGsPrimAlphaBlendEnable = 0x40u;
     constexpr float kRwScreenWidth = 640.0f;
     constexpr float kRwScreenHeight = 448.0f;
@@ -271,6 +274,7 @@ namespace
 #if !defined(__ANDROID__)
     using p3fes::native_renderer::Camera;
     using p3fes::native_renderer::ClearColor;
+    using p3fes::native_renderer::FogState;
     using p3fes::native_renderer::Matrix4;
     using p3fes::native_renderer::MeshData;
     using p3fes::native_renderer::MeshDrawState;
@@ -294,6 +298,27 @@ namespace
                                  MeshDrawState::UvTransform &out);
     bool readMaterialDualPass(const uint8_t *rdram, uint32_t material, MeshDrawState::DualPass &out);
     bool readMaterialEnvPass(const uint8_t *rdram, uint32_t material, MeshDrawState::EnvPass &out);
+
+    void readNativeFogState(const uint8_t *rdram, uint64_t renderFlags, FogState &fog)
+    {
+        if ((renderFlags & kGsPrimFogEnable) == 0u)
+            return;
+        uint32_t camera = 0u;
+        uint64_t fogCol = 0u;
+        float start = 0.0f, end = 0.0f;
+        if (!readGuest(rdram, kRwCurrentCamera, camera) || !guestPointer(camera, kCameraFogPlaneOffset + sizeof(float)) ||
+            !readGuest(rdram, camera + kCameraFogPlaneOffset, start) ||
+            !readGuest(rdram, camera + kCameraFarPlaneOffset, end) ||
+            !readGuest(rdram, kRwFogCol, fogCol) || !std::isfinite(start) || !std::isfinite(end) ||
+            !(end > start))
+            return;
+        fog.enabled = true;
+        fog.start = start;
+        fog.end = end;
+        fog.color = {static_cast<uint8_t>(fogCol & 0xFFu),
+                     static_cast<uint8_t>((fogCol >> 8u) & 0xFFu),
+                     static_cast<uint8_t>((fogCol >> 16u) & 0xFFu)};
+    }
 
     void readNativeMeshDrawState(const uint8_t *rdram, uint32_t geometry, MeshDrawState &state)
     {
@@ -356,7 +381,10 @@ namespace
         if (readGuest(rdram, kRwTex1, tex1))
             state.linearFilter = (tex1 & (1ull << 5u)) != 0u; // GS TEX1.MMAG
         if (readGuest(rdram, kRwRenderFlags, renderFlags))
+        {
             state.blendEnabled = (renderFlags & kGsPrimAlphaBlendEnable) != 0u;
+            readNativeFogState(rdram, renderFlags, state.fog);
+        }
         if (state.blendEnabled && readGuest(rdram, kRwSrcBlend, srcBlend) && readGuest(rdram, kRwDstBlend, dstBlend) &&
             srcBlend >= 1u && srcBlend <= 11u && dstBlend >= 1u && dstBlend <= 11u)
         {
@@ -1295,6 +1323,7 @@ namespace
         state.clampU = wms == 1u || wms == 2u;
         state.clampV = wmt == 1u || wmt == 2u;
         state.linearFilter = (tex1 & (1ull << 5u)) != 0u; // GS TEX1.MMAG
+        readNativeFogState(rdram, flags, state.fog);
         return state;
     }
 

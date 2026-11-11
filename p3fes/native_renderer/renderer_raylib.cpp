@@ -22,14 +22,40 @@ namespace
 {
 constexpr std::size_t kMaterialMapCount = static_cast<std::size_t>(MATERIAL_MAP_BRDF) + 1u;
 
-constexpr const char *kAlphaTestFragmentShader = R"(#version 330
+constexpr const char *kStateVertexShader = R"(#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+out vec2 fragTexCoord;
+out vec4 fragColor;
+out float fragFogCoord;
+uniform mat4 mvp;
+uniform int uFogCoordMode;
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+    // librw-vita uses clip W for ordinary 3-D/Im3D and the incoming Z for
+    // Im2D. Both are positive RenderWare camera-space distances here.
+    fragFogCoord = (uFogCoordMode != 0) ? vertexPosition.z : gl_Position.w;
+}
+)";
+
+constexpr const char *kStateFragmentShader = R"(#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
+in float fragFogCoord;
 out vec4 finalColor;
 uniform sampler2D texture0;
 uniform vec4 colDiffuse;
+uniform int uAlphaEnabled;
 uniform int uAlphaFunc;
 uniform int uAlphaRef;
+uniform int uFogEnabled;
+uniform float uFogStart;
+uniform float uFogEnd;
+uniform vec3 uFogColor;
 bool alphaPass(int a)
 {
     if (uAlphaFunc == 0) return false;
@@ -44,8 +70,16 @@ bool alphaPass(int a)
 void main()
 {
     finalColor = texture(texture0, fragTexCoord)*colDiffuse*fragColor;
-    int alpha = int(clamp(finalColor.a, 0.0, 1.0)*255.0 + 0.5);
-    if (!alphaPass(alpha)) discard;
+    if (uAlphaEnabled != 0)
+    {
+        int alpha = int(clamp(finalColor.a, 0.0, 1.0)*255.0 + 0.5);
+        if (!alphaPass(alpha)) discard;
+    }
+    if (uFogEnabled != 0)
+    {
+        float fog = clamp((fragFogCoord - uFogEnd)/(uFogStart - uFogEnd), 0.0, 1.0);
+        finalColor.rgb = mix(uFogColor, finalColor.rgb, fog);
+    }
 }
 )";
 
@@ -184,12 +218,20 @@ public:
         if (!IsWindowReady())
             return false;
         m_material = LoadMaterialDefault();
-        m_alphaShader = LoadShaderFromMemory(nullptr, kAlphaTestFragmentShader);
-        if (m_alphaShader.id != rlGetShaderIdDefault())
+        m_stateShader = LoadShaderFromMemory(kStateVertexShader, kStateFragmentShader);
+        if (m_stateShader.id != rlGetShaderIdDefault())
         {
-            m_alphaFuncLoc = GetShaderLocation(m_alphaShader, "uAlphaFunc");
-            m_alphaRefLoc = GetShaderLocation(m_alphaShader, "uAlphaRef");
-            m_alphaShaderReady = m_alphaFuncLoc >= 0 && m_alphaRefLoc >= 0;
+            m_alphaEnabledLoc = GetShaderLocation(m_stateShader, "uAlphaEnabled");
+            m_alphaFuncLoc = GetShaderLocation(m_stateShader, "uAlphaFunc");
+            m_alphaRefLoc = GetShaderLocation(m_stateShader, "uAlphaRef");
+            m_fogEnabledLoc = GetShaderLocation(m_stateShader, "uFogEnabled");
+            m_fogStartLoc = GetShaderLocation(m_stateShader, "uFogStart");
+            m_fogEndLoc = GetShaderLocation(m_stateShader, "uFogEnd");
+            m_fogColorLoc = GetShaderLocation(m_stateShader, "uFogColor");
+            m_fogCoordModeLoc = GetShaderLocation(m_stateShader, "uFogCoordMode");
+            m_stateShaderReady = m_alphaEnabledLoc >= 0 && m_alphaFuncLoc >= 0 && m_alphaRefLoc >= 0 &&
+                                 m_fogEnabledLoc >= 0 && m_fogStartLoc >= 0 && m_fogEndLoc >= 0 &&
+                                 m_fogColorLoc >= 0 && m_fogCoordModeLoc >= 0;
         }
         m_open = true;
         return true;
@@ -206,10 +248,10 @@ public:
         for (auto &[name, texture] : m_textures)
             UnloadTexture(texture);
         m_textures.clear();
-        if (m_alphaShader.id != 0u)
-            UnloadShader(m_alphaShader);
-        m_alphaShader = {};
-        m_alphaShaderReady = false;
+        if (m_stateShader.id != 0u)
+            UnloadShader(m_stateShader);
+        m_stateShader = {};
+        m_stateShaderReady = false;
         UnloadMaterial(m_material);
         if (m_ownsWindow)
             CloseWindow();
@@ -439,10 +481,10 @@ public:
         for (DrawPart &part : found->second)
         {
             ::Material drawMaterial = m_material;
-            if (state.alphaTest.enabled && m_alphaShaderReady)
+            if ((state.alphaTest.enabled || state.fog.enabled) && m_stateShaderReady)
             {
-                setAlphaTestUniforms(state.alphaTest);
-                drawMaterial.shader = m_alphaShader;
+                setStateShaderUniforms(state.alphaTest, state.fog, 0);
+                drawMaterial.shader = m_stateShader;
             }
             std::array<MaterialMap, kMaterialMapCount> maps{};
             std::copy_n(m_material.maps, kMaterialMapCount, maps.data());
@@ -636,13 +678,13 @@ public:
             }
         }
         rlSetTexture(textureId);
-        const bool alphaShader = state.alphaTest.enabled && m_alphaShaderReady;
-        if (alphaShader)
+        const bool stateShader = (state.alphaTest.enabled || state.fog.enabled) && m_stateShaderReady;
+        if (stateShader)
         {
-            setAlphaTestUniforms(state.alphaTest);
+            setStateShaderUniforms(state.alphaTest, state.fog, 0);
             const Vector4 white{1.0f, 1.0f, 1.0f, 1.0f};
-            SetShaderValue(m_alphaShader, m_alphaShader.locs[SHADER_LOC_COLOR_DIFFUSE], &white, SHADER_UNIFORM_VEC4);
-            BeginShaderMode(m_alphaShader);
+            SetShaderValue(m_stateShader, m_stateShader.locs[SHADER_LOC_COLOR_DIFFUSE], &white, SHADER_UNIFORM_VEC4);
+            BeginShaderMode(m_stateShader);
         }
         rlPushMatrix();
         rlMultMatrixf(model.data());
@@ -655,7 +697,7 @@ public:
         }
         rlEnd();
         rlPopMatrix();
-        if (alphaShader)
+        if (stateShader)
             EndShaderMode();
         rlSetTexture(0);
 
@@ -692,14 +734,23 @@ public:
     }
 
 private:
-    void setAlphaTestUniforms(const AlphaTestState &alpha)
+    void setStateShaderUniforms(const AlphaTestState &alpha, const FogState &fog, int fogCoordMode)
     {
-        if (!m_alphaShaderReady)
+        if (!m_stateShaderReady)
             return;
+        const int alphaEnabled = alpha.enabled ? 1 : 0;
         const int function = alpha.function & 0x7u;
         const int reference = alpha.reference;
-        SetShaderValue(m_alphaShader, m_alphaFuncLoc, &function, SHADER_UNIFORM_INT);
-        SetShaderValue(m_alphaShader, m_alphaRefLoc, &reference, SHADER_UNIFORM_INT);
+        const int fogEnabled = fog.enabled ? 1 : 0;
+        const float fogColor[3]{fog.color[0] / 255.0f, fog.color[1] / 255.0f, fog.color[2] / 255.0f};
+        SetShaderValue(m_stateShader, m_alphaEnabledLoc, &alphaEnabled, SHADER_UNIFORM_INT);
+        SetShaderValue(m_stateShader, m_alphaFuncLoc, &function, SHADER_UNIFORM_INT);
+        SetShaderValue(m_stateShader, m_alphaRefLoc, &reference, SHADER_UNIFORM_INT);
+        SetShaderValue(m_stateShader, m_fogEnabledLoc, &fogEnabled, SHADER_UNIFORM_INT);
+        SetShaderValue(m_stateShader, m_fogStartLoc, &fog.start, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(m_stateShader, m_fogEndLoc, &fog.end, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(m_stateShader, m_fogColorLoc, fogColor, SHADER_UNIFORM_VEC3);
+        SetShaderValue(m_stateShader, m_fogCoordModeLoc, &fogCoordMode, SHADER_UNIFORM_INT);
     }
 
     void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
@@ -758,13 +809,13 @@ private:
             break;
         }
         rlSetTexture(textureId);
-        const bool alphaShader = state.alphaTest.enabled && m_alphaShaderReady;
-        if (alphaShader)
+        const bool stateShader = (state.alphaTest.enabled || state.fog.enabled) && m_stateShaderReady;
+        if (stateShader)
         {
-            setAlphaTestUniforms(state.alphaTest);
+            setStateShaderUniforms(state.alphaTest, state.fog, 1);
             const Vector4 white{1.0f, 1.0f, 1.0f, 1.0f};
-            SetShaderValue(m_alphaShader, m_alphaShader.locs[SHADER_LOC_COLOR_DIFFUSE], &white, SHADER_UNIFORM_VEC4);
-            BeginShaderMode(m_alphaShader);
+            SetShaderValue(m_stateShader, m_stateShader.locs[SHADER_LOC_COLOR_DIFFUSE], &white, SHADER_UNIFORM_VEC4);
+            BeginShaderMode(m_stateShader);
         }
         rlDisableBackfaceCulling();
         rlBegin(primitive);
@@ -775,7 +826,7 @@ private:
             rlVertex3f(v.x * sx, v.y * sy, v.z);
         }
         rlEnd();
-        if (alphaShader)
+        if (stateShader)
             EndShaderMode();
         rlSetTexture(0);
         rlEnableColorBlend();
@@ -786,10 +837,16 @@ private:
     bool m_in3D = false;
     bool m_exactCamera = false;
     ::Material m_material{};
-    Shader m_alphaShader{};
+    Shader m_stateShader{};
+    int m_alphaEnabledLoc = -1;
     int m_alphaFuncLoc = -1;
     int m_alphaRefLoc = -1;
-    bool m_alphaShaderReady = false;
+    int m_fogEnabledLoc = -1;
+    int m_fogStartLoc = -1;
+    int m_fogEndLoc = -1;
+    int m_fogColorLoc = -1;
+    int m_fogCoordModeLoc = -1;
+    bool m_stateShaderReady = false;
     Camera3D m_camera{};
     Matrix m_exactProjection{};
     Matrix m_exactView{};

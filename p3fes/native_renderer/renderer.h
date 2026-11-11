@@ -74,6 +74,14 @@ struct AlphaTestState
     std::uint8_t reference = 0u;
 };
 
+struct FogState
+{
+    bool enabled = false;
+    float start = 0.0f;
+    float end = 1.0f;
+    std::array<std::uint8_t, 3> color{0u, 0u, 0u};
+};
+
 struct ScreenDrawState
 {
     ScreenBlend blend = ScreenBlend::Alpha;
@@ -81,6 +89,7 @@ struct ScreenDrawState
     bool clampV = false;
     bool linearFilter = true;
     AlphaTestState alphaTest{};
+    FogState fog{};
 };
 
 struct MeshDrawState
@@ -100,6 +109,7 @@ struct MeshDrawState
     bool clampV = false;
     bool linearFilter = true;
     AlphaTestState alphaTest{};
+    FogState fog{};
 
     // Optional per-draw RenderWare material colours. Persona 3 mutates these
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,

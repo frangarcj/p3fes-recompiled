@@ -131,6 +131,21 @@ void applyAlphaTest(const AlphaTestState &alpha)
     glAlphaFunc(gsAlphaFunc(alpha.function), alpha.reference / 255.0f);
 }
 
+void applyFog(const FogState &fog)
+{
+    if (!fog.enabled)
+    {
+        glDisable(GL_FOG);
+        return;
+    }
+    const GLfloat color[4]{fog.color[0] / 255.0f, fog.color[1] / 255.0f, fog.color[2] / 255.0f, 1.0f};
+    glEnable(GL_FOG);
+    glFogi(GL_FOG_MODE, GL_LINEAR);
+    glFogf(GL_FOG_START, fog.start);
+    glFogf(GL_FOG_END, fog.end);
+    glFogfv(GL_FOG_COLOR, color);
+}
+
 Vec3 subtract(const Vec3 &a, const Vec3 &b)
 {
     return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
@@ -468,6 +483,7 @@ public:
             return;
 
         applyAlphaTest(state.alphaTest);
+        applyFog(state.fog);
         if (state.depthTest)
             glEnable(GL_DEPTH_TEST);
         else
@@ -642,6 +658,7 @@ public:
         glDisable(GL_TEXTURE_2D);
         glPopMatrix();
         glDisable(GL_ALPHA_TEST);
+        glDisable(GL_FOG);
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         glDisable(GL_CULL_FACE);
@@ -656,6 +673,7 @@ public:
             apply3D();
 
         applyAlphaTest(state.alphaTest);
+        applyFog(state.fog);
 
         std::vector<GpuVertex> gpu(vertices.size());
         for (std::size_t i = 0; i < vertices.size(); ++i)
@@ -726,6 +744,7 @@ public:
         glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_TEXTURE_2D);
         glDisable(GL_ALPHA_TEST);
+        glDisable(GL_FOG);
 
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
@@ -771,6 +790,7 @@ private:
             gpu.push_back({v.x, v.y, v.z, v.u, v.v, v.color[0], v.color[1], v.color[2], v.color[3]});
 
         applyAlphaTest(state.alphaTest);
+        applyFog(state.fog);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
         GLuint texture = 0u;
@@ -837,6 +857,7 @@ private:
         glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_TEXTURE_2D);
         glDisable(GL_ALPHA_TEST);
+        glDisable(GL_FOG);
         glEnable(GL_BLEND);
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
