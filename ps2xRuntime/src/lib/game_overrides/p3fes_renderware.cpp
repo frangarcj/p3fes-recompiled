@@ -6,6 +6,10 @@
 // reaches AtomicDefaultRenderCallBack, which is the useful native-renderer seam.
 // The hook is opt-in and still calls the original until the native path can
 // submit the corresponding geometry itself.
+// RenderWare camera -> OpenGL matrix conversion is adapted from
+// Rinnegatamante/librw-vita @ 5e14b3f8123f8b950917ae46748dd655c723b09f,
+// src/gl/gl3device.cpp (MIT), for the same positive-Z RenderWare camera model;
+// see LICENSE.librw-vita.txt beside this file.
 #include "game_overrides.h"
 #include "p3fes_native_present.h"
 #include "ps2_runtime.h"
@@ -56,7 +60,13 @@ namespace
     constexpr uint32_t kFrameLtmOffset = 0x50u;
     constexpr uint32_t kRwCurrentCamera = 0x00960070u;
     constexpr uint32_t kCameraFrameOffset = 0x04u;
+    constexpr uint32_t kCameraProjectionOffset = 0x14u;
+    constexpr uint32_t kCameraViewWindowXOffset = 0x68u;
     constexpr uint32_t kCameraViewWindowYOffset = 0x6Cu;
+    constexpr uint32_t kCameraViewOffsetXOffset = 0x78u;
+    constexpr uint32_t kCameraViewOffsetYOffset = 0x7Cu;
+    constexpr uint32_t kCameraNearPlaneOffset = 0x80u;
+    constexpr uint32_t kCameraFarPlaneOffset = 0x84u;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
     constexpr uint32_t kSkyIm2DRenderLine = 0x004ECA60u;
     constexpr uint32_t kSkyIm2DRenderTriangle = 0x004ECCE0u;
@@ -256,6 +266,63 @@ namespace
         readGuest(rdram, camera + kCameraViewWindowYOffset, viewWindowY);
         if (std::isfinite(viewWindowY) && viewWindowY > 0.001f)
             out.fovy = 2.0f * std::atan(viewWindowY) * 57.29577951308232f;
+
+        // Reuse librw-vita's RenderWare -> OpenGL camera conversion instead
+        // of approximating the game camera with lookAt/fovy. RW looks down
+        // positive Z, so its host GL view flips X after inverting the frame.
+        int32_t projection = 0;
+        float viewWindowX = 0.0f, viewOffsetX = 0.0f, viewOffsetY = 0.0f;
+        float nearPlane = 0.0f, farPlane = 0.0f;
+        if (readGuest(rdram, camera + kCameraProjectionOffset, projection) &&
+            readGuest(rdram, camera + kCameraViewWindowXOffset, viewWindowX) &&
+            readGuest(rdram, camera + kCameraViewOffsetXOffset, viewOffsetX) &&
+            readGuest(rdram, camera + kCameraViewOffsetYOffset, viewOffsetY) &&
+            readGuest(rdram, camera + kCameraNearPlaneOffset, nearPlane) &&
+            readGuest(rdram, camera + kCameraFarPlaneOffset, farPlane) &&
+            (projection == 1 || projection == 2) && std::isfinite(viewWindowX) &&
+            std::isfinite(viewWindowY) && std::isfinite(viewOffsetX) && std::isfinite(viewOffsetY) &&
+            std::isfinite(nearPlane) && std::isfinite(farPlane) && viewWindowX > 0.001f &&
+            viewWindowY > 0.001f && nearPlane > 0.0f && farPlane > nearPlane)
+        {
+            const std::array<float, 3> right{ltm[0], ltm[1], ltm[2]};
+            const std::array<float, 3> up{ltm[4], ltm[5], ltm[6]};
+            const std::array<float, 3> at{ltm[8], ltm[9], ltm[10]};
+            const std::array<float, 3> pos{ltm[12], ltm[13], ltm[14]};
+            const auto dot3 = [](const auto &a, const auto &b) {
+                return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            };
+            out.view = {
+                -right[0], up[0], at[0], 0.0f,
+                -right[1], up[1], at[1], 0.0f,
+                -right[2], up[2], at[2], 0.0f,
+                dot3(right, pos), -dot3(up, pos), -dot3(at, pos), 1.0f,
+            };
+
+            const float invwx = 1.0f / viewWindowX;
+            const float invwy = 1.0f / viewWindowY;
+            const float invz = 1.0f / (farPlane - nearPlane);
+            const float ox = viewOffsetX * invwx;
+            const float oy = viewOffsetY * invwy;
+            if (projection == 1) // rwPERSPECTIVE
+            {
+                out.projection = {
+                    invwx, 0.0f, 0.0f, 0.0f,
+                    0.0f, invwy, 0.0f, 0.0f,
+                    ox, oy, (farPlane + nearPlane) * invz, 1.0f,
+                    -ox, -oy, -2.0f * nearPlane * farPlane * invz, 0.0f,
+                };
+            }
+            else // rwPARALLEL
+            {
+                out.projection = {
+                    invwx, 0.0f, 0.0f, 0.0f,
+                    0.0f, invwy, 0.0f, 0.0f,
+                    ox, oy, -(farPlane + nearPlane) * invz, 0.0f,
+                    -ox, -oy, 2.0f * invz, 1.0f,
+                };
+            }
+            out.useMatrices = true;
+        }
         return true;
     }
 

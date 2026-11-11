@@ -564,19 +564,28 @@ private:
 
     void apply3D()
     {
-        const float aspect = static_cast<float>(std::max(GetScreenWidth(), 1)) /
-                             static_cast<float>(std::max(GetScreenHeight(), 1));
-        constexpr float nearPlane = 0.1f;
-        constexpr float farPlane = 10000.0f;
-        const float radians = m_camera.fovy * 0.008726646259971648f;
-        const float top = nearPlane * std::tan(std::max(radians, 0.01f));
-        const float right = top * aspect;
         glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glFrustumf(-right, right, -top, top, nearPlane, farPlane);
-        const std::array<float, 16> view = lookAt(m_camera);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadMatrixf(view.data());
+        if (m_camera.useMatrices)
+        {
+            glLoadMatrixf(m_camera.projection.data());
+            glMatrixMode(GL_MODELVIEW);
+            glLoadMatrixf(m_camera.view.data());
+        }
+        else
+        {
+            const float aspect = static_cast<float>(std::max(GetScreenWidth(), 1)) /
+                                 static_cast<float>(std::max(GetScreenHeight(), 1));
+            constexpr float nearPlane = 0.1f;
+            constexpr float farPlane = 10000.0f;
+            const float radians = m_camera.fovy * 0.008726646259971648f;
+            const float top = nearPlane * std::tan(std::max(radians, 0.01f));
+            const float right = top * aspect;
+            glLoadIdentity();
+            glFrustumf(-right, right, -top, top, nearPlane, farPlane);
+            const std::array<float, 16> view = lookAt(m_camera);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadMatrixf(view.data());
+        }
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_TRUE);

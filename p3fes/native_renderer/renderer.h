@@ -30,6 +30,12 @@ struct Camera
     std::array<float, 3> target{};
     std::array<float, 3> up{0.0f, 1.0f, 0.0f};
     float fovy = 45.0f;
+    // In-game RenderWare cameras provide their exact host view/projection
+    // conversion. Standalone viewers can leave this false and use the
+    // position/target/fovy fields above.
+    bool useMatrices = false;
+    Matrix4 view = kIdentityMatrix;
+    Matrix4 projection = kIdentityMatrix;
 };
 
 struct ClearColor

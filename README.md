@@ -196,6 +196,8 @@ Debug traces: `PS2X_SPU2_DIAG`, `PS2X_GS_DIAG`, `PS2X_IPU_TRACE`, `PS2X_DMA_LOG`
 - Taylor N. Albarnaz / LightVelox's Shadow of the Colossus fork of PS2Recomp: the OpenGL GS backend (via god-of-war-recomp).
 - [Celosia](https://github.com/HenryKun55/celosia) by HenryKun55: the Vita SDL2/vitaGL host shim and
   reference architecture for sharing a PS2Recomp runtime between Apple Silicon and PS Vita.
+- [librw-vita](https://github.com/Rinnegatamante/librw-vita) by aap/Rinnegatamante contributors: the MIT-licensed
+  RenderWare-to-OpenGL/Vita camera and rendering reference used by the progressive native path.
 - [black-recomp](https://github.com/SirBraga/black-recomp) by SirBraga: the conservative row-parallel CPU GS
   raster-worker pattern reused for large independent Persona 3 post-process triangles.
 - [urban-reign-recomp](https://github.com/thiagordsfx/urban-reign-recomp) by thiagordsfx: the PCSX2 GS bridge design.

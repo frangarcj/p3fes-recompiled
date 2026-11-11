@@ -27,6 +27,15 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
+Matrix rayMatrix(const Matrix4 &m)
+{
+    return Matrix{
+        m[0], m[4], m[8], m[12],
+        m[1], m[5], m[9], m[13],
+        m[2], m[6], m[10], m[14],
+        m[3], m[7], m[11], m[15]};
+}
+
 std::vector<std::uint16_t> triangleList(const MeshData &mesh,
                                         std::size_t begin,
                                         std::size_t count,
@@ -266,6 +275,7 @@ public:
 
     void beginFrame(const Camera &camera, ClearColor clear) override
     {
+        m_exactCamera = camera.useMatrices;
         Camera3D rayCamera{};
         rayCamera.position = {camera.position[0], camera.position[1], camera.position[2]};
         rayCamera.target = {camera.target[0], camera.target[1], camera.target[2]};
@@ -276,7 +286,17 @@ public:
 
         BeginDrawing();
         ClearBackground({clear.r, clear.g, clear.b, clear.a});
-        BeginMode3D(m_camera);
+        if (m_exactCamera)
+        {
+            m_hostProjection = rlGetMatrixProjection();
+            m_hostModelview = rlGetMatrixModelview();
+            m_exactProjection = rayMatrix(camera.projection);
+            m_exactView = rayMatrix(camera.view);
+            rlSetMatrixProjection(m_exactProjection);
+            rlSetMatrixModelview(m_exactView);
+        }
+        else
+            BeginMode3D(m_camera);
         m_in3D = true;
     }
 
@@ -284,7 +304,13 @@ public:
     {
         if (!m_in3D)
         {
-            BeginMode3D(m_camera);
+            if (m_exactCamera)
+            {
+                rlSetMatrixProjection(m_exactProjection);
+                rlSetMatrixModelview(m_exactView);
+            }
+            else
+                BeginMode3D(m_camera);
             m_in3D = true;
         }
         auto found = m_meshes.find(id);
@@ -311,11 +337,7 @@ public:
             // Matrix4 uses the normal OpenGL column-major order. raylib's
             // Matrix struct names are laid out by rows, so spell the mapping
             // out rather than relying on the struct's memory layout.
-            const Matrix transform{
-                model[0], model[4], model[8], model[12],
-                model[1], model[5], model[9], model[13],
-                model[2], model[6], model[10], model[14],
-                model[3], model[7], model[11], model[15]};
+            const Matrix transform = rayMatrix(model);
             DrawMesh(part.mesh, drawMaterial, transform);
         }
     }
@@ -338,7 +360,7 @@ public:
 
     void endFrame() override
     {
-        if (m_in3D)
+        if (m_in3D && !m_exactCamera)
             EndMode3D();
         m_in3D = false;
         EndDrawing();
@@ -354,7 +376,13 @@ private:
             return;
         if (m_in3D)
         {
-            EndMode3D();
+            if (m_exactCamera)
+            {
+                rlSetMatrixProjection(m_hostProjection);
+                rlSetMatrixModelview(m_hostModelview);
+            }
+            else
+                EndMode3D();
             m_in3D = false;
         }
         const float sx = static_cast<float>(std::max(GetScreenWidth(), 1)) / sourceWidth;
@@ -411,8 +439,13 @@ private:
     bool m_open = false;
     bool m_ownsWindow = false;
     bool m_in3D = false;
+    bool m_exactCamera = false;
     ::Material m_material{};
     Camera3D m_camera{};
+    Matrix m_exactProjection{};
+    Matrix m_exactView{};
+    Matrix m_hostProjection{};
+    Matrix m_hostModelview{};
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
     std::unordered_map<std::string, Texture2D> m_textures;
 };
