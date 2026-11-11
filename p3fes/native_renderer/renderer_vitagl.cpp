@@ -427,6 +427,17 @@ public:
             const auto &color = part.materialIndex < state.materialColors.size()
                 ? state.materialColors[part.materialIndex]
                 : part.color;
+            const MeshDrawState::BlendState *blend = part.materialIndex < state.materialBlends.size()
+                ? &state.materialBlends[part.materialIndex]
+                : nullptr;
+            glBlendEquation(GL_FUNC_ADD);
+            if (blend && blend->enabled)
+            {
+                glEnable(GL_BLEND);
+                glBlendFunc(rwBlendFactor(blend->src), rwBlendFactor(blend->dst));
+            }
+            else
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             if (part.gpuVertices.size() == part.sourceVertices.size())
             {
                 const MeshDrawState::UvTransform *uvTransform =
@@ -545,6 +556,8 @@ public:
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 }
             }
+            glBlendEquation(GL_FUNC_ADD);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         }
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);

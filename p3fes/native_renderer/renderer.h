@@ -117,6 +117,16 @@ struct MeshDrawState
     };
     std::vector<EnvPass> materialEnvPasses;
 
+    struct BlendState
+    {
+        bool enabled = false;
+        // Raw RenderWare BlendFunction values (ZERO=1, ONE=2,
+        // SRCCOLOR=3, INVSRCCOLOR=4, SRCALPHA=5, INVSRCALPHA=6, ...).
+        std::uint8_t src = 5u;
+        std::uint8_t dst = 6u;
+    };
+    std::vector<BlendState> materialBlends;
+
     // RenderWare world lighting, kept in the same form used by librw-vita's
     // default shader: ambient, directional, point and spot lights.
     struct DirectionalLight

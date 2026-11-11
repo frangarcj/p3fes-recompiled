@@ -1031,7 +1031,8 @@ namespace
         return true;
     }
 
-    bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic, R5900Context *ctx, PS2Runtime *runtime)
+    bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic, R5900Context *ctx, PS2Runtime *runtime,
+                          const MeshDrawState::BlendState *blendOverride = nullptr)
     {
         AtomicSummary summary;
         if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u)
@@ -1063,6 +1064,11 @@ namespace
             return false;
         MeshDrawState drawState;
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
+        if (blendOverride && blendOverride->enabled)
+        {
+            const std::size_t materialCount = std::max<std::size_t>(drawState.materialColors.size(), 1u);
+            drawState.materialBlends.assign(materialCount, *blendOverride);
+        }
         if ((summary.geometryFlags & kGeometryLightingFlag) != 0u)
             readNativeLighting(rdram, false, atomic, drawState);
         if (!prepareNativeSkinPalette(rdram, atomic, summary.geometry, ctx, runtime, drawState))
@@ -1786,9 +1792,20 @@ namespace
                     instanceResult = 0u;
             }
 
+            MeshDrawState::BlendState blend;
+            uint32_t blendEnabled = 0u, srcBlend = 0u, dstBlend = 0u;
+            if (readGuest(rdram, tank + 100u, blendEnabled) && blendEnabled != 0u &&
+                readGuest(rdram, tank + 92u, srcBlend) && readGuest(rdram, tank + 96u, dstBlend) &&
+                srcBlend >= 1u && srcBlend <= 11u && dstBlend >= 1u && dstBlend <= 11u)
+            {
+                blend.enabled = true;
+                blend.src = static_cast<uint8_t>(srcBlend);
+                blend.dst = static_cast<uint8_t>(dstBlend);
+            }
+
             bool drawn = false;
             if (instanceResult == 1u)
-                drawn = drawNativeAtomic(rdram, atomic, ctx, runtime);
+                drawn = drawNativeAtomic(rdram, atomic, ctx, runtime, blend.enabled ? &blend : nullptr);
             if (!g_ptankDiagPrinted.exchange(true, std::memory_order_relaxed))
                 std::fprintf(stderr,
                              "[p3fes-native] first PTank: atomic=0x%08X count=%d lock=0x%08X instance=0x%08X result=%u native=%u\n",
