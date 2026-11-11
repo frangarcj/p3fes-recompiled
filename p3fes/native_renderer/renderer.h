@@ -85,6 +85,7 @@ struct FogState
 struct ScreenDrawState
 {
     ScreenBlend blend = ScreenBlend::Alpha;
+    bool gouraudShading = true;
     bool clampU = false;
     bool clampV = false;
     bool linearFilter = true;
@@ -105,6 +106,7 @@ struct MeshDrawState
     bool depthWrite = true;
     CullMode cullMode = CullMode::Back;
     bool blendEnabled = true;
+    bool gouraudShading = true;
     bool clampU = false;
     bool clampV = false;
     bool linearFilter = true;

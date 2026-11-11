@@ -140,6 +140,7 @@ namespace
     constexpr uint64_t kGsPrimTextureEnable = 0x10u;
     constexpr uint64_t kGsPrimFogEnable = 0x20u;
     constexpr uint64_t kGsPrimAlphaBlendEnable = 0x40u;
+    constexpr uint64_t kGsPrimGouraud = 0x08u;
     constexpr float kRwScreenWidth = 640.0f;
     constexpr float kRwScreenHeight = 448.0f;
     constexpr uint32_t kMaxVertices = 1u << 20;
@@ -383,6 +384,7 @@ namespace
         if (readGuest(rdram, kRwRenderFlags, renderFlags))
         {
             state.blendEnabled = (renderFlags & kGsPrimAlphaBlendEnable) != 0u;
+            state.gouraudShading = (renderFlags & kGsPrimGouraud) != 0u;
             readNativeFogState(rdram, renderFlags, state.fog);
         }
         if (state.blendEnabled && readGuest(rdram, kRwSrcBlend, srcBlend) && readGuest(rdram, kRwDstBlend, dstBlend) &&
@@ -1300,6 +1302,7 @@ namespace
         readGuest(rdram, kRwAlpha1, alpha);
         readGuest(rdram, kRwClamp1, clamp);
         readGuest(rdram, kRwTex1, tex1);
+        state.gouraudShading = (flags & kGsPrimGouraud) != 0u;
         if (readGuest(rdram, kRwTest1, test))
         {
             state.alphaTest.enabled = (test & 0x1u) != 0u;

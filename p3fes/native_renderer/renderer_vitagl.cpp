@@ -146,6 +146,11 @@ void applyFog(const FogState &fog)
     glFogfv(GL_FOG_COLOR, color);
 }
 
+void applyShadeMode(bool gouraud)
+{
+    glShadeModel(gouraud ? GL_SMOOTH : GL_FLAT);
+}
+
 Vec3 subtract(const Vec3 &a, const Vec3 &b)
 {
     return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
@@ -484,6 +489,7 @@ public:
 
         applyAlphaTest(state.alphaTest);
         applyFog(state.fog);
+        applyShadeMode(state.gouraudShading);
         if (state.depthTest)
             glEnable(GL_DEPTH_TEST);
         else
@@ -659,6 +665,7 @@ public:
         glPopMatrix();
         glDisable(GL_ALPHA_TEST);
         glDisable(GL_FOG);
+        glShadeModel(GL_SMOOTH);
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         glDisable(GL_CULL_FACE);
@@ -674,6 +681,7 @@ public:
 
         applyAlphaTest(state.alphaTest);
         applyFog(state.fog);
+        applyShadeMode(state.gouraudShading);
 
         std::vector<GpuVertex> gpu(vertices.size());
         for (std::size_t i = 0; i < vertices.size(); ++i)
@@ -745,6 +753,7 @@ public:
         glDisable(GL_TEXTURE_2D);
         glDisable(GL_ALPHA_TEST);
         glDisable(GL_FOG);
+        glShadeModel(GL_SMOOTH);
 
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
@@ -791,6 +800,7 @@ private:
 
         applyAlphaTest(state.alphaTest);
         applyFog(state.fog);
+        applyShadeMode(state.gouraudShading);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
         GLuint texture = 0u;
@@ -858,6 +868,7 @@ private:
         glDisable(GL_TEXTURE_2D);
         glDisable(GL_ALPHA_TEST);
         glDisable(GL_FOG);
+        glShadeModel(GL_SMOOTH);
         glEnable(GL_BLEND);
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
