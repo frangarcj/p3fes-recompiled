@@ -91,6 +91,18 @@ struct MeshDrawState
     };
     std::vector<UvTransform> materialUvTransforms;
 
+    struct DualPass
+    {
+        bool enabled = false;
+        std::string textureName;
+        UvTransform uvTransform{};
+        // Raw RenderWare BlendFunction values (ZERO=1, ONE=2,
+        // SRCALPHA=5, INVSRCALPHA=6, DESTALPHA=7, ...).
+        std::uint8_t srcBlend = 5u;
+        std::uint8_t dstBlend = 6u;
+    };
+    std::vector<DualPass> materialDualPasses;
+
     // RenderWare world lighting, kept in the same form used by librw-vita's
     // default shader: ambient, directional, point and spot lights.
     struct DirectionalLight

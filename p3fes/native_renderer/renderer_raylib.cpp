@@ -30,6 +30,25 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
+int rwBlendFactor(std::uint8_t factor)
+{
+    switch (factor)
+    {
+    case 1u: return RL_ZERO;
+    case 2u: return RL_ONE;
+    case 3u: return RL_SRC_COLOR;
+    case 4u: return RL_ONE_MINUS_SRC_COLOR;
+    case 5u: return RL_SRC_ALPHA;
+    case 6u: return RL_ONE_MINUS_SRC_ALPHA;
+    case 7u: return RL_DST_ALPHA;
+    case 8u: return RL_ONE_MINUS_DST_ALPHA;
+    case 9u: return RL_DST_COLOR;
+    case 10u: return RL_ONE_MINUS_DST_COLOR;
+    case 11u: return RL_SRC_ALPHA_SATURATE;
+    default: return RL_ONE;
+    }
+}
+
 Matrix rayMatrix(const Matrix4 &m)
 {
     return Matrix{
@@ -394,6 +413,30 @@ public:
             // out rather than relying on the struct's memory layout.
             const Matrix transform = rayMatrix(model);
             DrawMesh(part.mesh, drawMaterial, transform);
+
+            const MeshDrawState::DualPass *dual = part.materialIndex < state.materialDualPasses.size()
+                ? &state.materialDualPasses[part.materialIndex]
+                : nullptr;
+            if (dual && dual->enabled && !dual->textureName.empty())
+            {
+                const auto dualTexture = m_textures.find(textureKey(dual->textureName));
+                if (dualTexture != m_textures.end())
+                {
+                    for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                    {
+                        const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
+                        std::memcpy(part.mesh.texcoords + i * 2u, uv.data(), sizeof(float) * 2u);
+                    }
+                    UpdateMeshBuffer(part.mesh, 1, part.mesh.texcoords,
+                                     part.mesh.vertexCount * static_cast<int>(sizeof(float) * 2u), 0);
+                    diffuse.texture = dualTexture->second;
+                    rlEnableColorBlend();
+                    rlSetBlendFactors(rwBlendFactor(dual->srcBlend), rwBlendFactor(dual->dstBlend), RL_FUNC_ADD);
+                    rlSetBlendMode(RL_BLEND_CUSTOM);
+                    DrawMesh(part.mesh, drawMaterial, transform);
+                    rlSetBlendMode(RL_BLEND_ALPHA);
+                }
+            }
         }
     }
 

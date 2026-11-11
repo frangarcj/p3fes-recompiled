@@ -73,6 +73,25 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
+GLenum rwBlendFactor(std::uint8_t factor)
+{
+    switch (factor)
+    {
+    case 1u: return GL_ZERO;
+    case 2u: return GL_ONE;
+    case 3u: return GL_SRC_COLOR;
+    case 4u: return GL_ONE_MINUS_SRC_COLOR;
+    case 5u: return GL_SRC_ALPHA;
+    case 6u: return GL_ONE_MINUS_SRC_ALPHA;
+    case 7u: return GL_DST_ALPHA;
+    case 8u: return GL_ONE_MINUS_DST_ALPHA;
+    case 9u: return GL_DST_COLOR;
+    case 10u: return GL_ONE_MINUS_DST_COLOR;
+    case 11u: return GL_SRC_ALPHA_SATURATE;
+    default: return GL_ONE;
+    }
+}
+
 Vec3 subtract(const Vec3 &a, const Vec3 &b)
 {
     return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
@@ -455,6 +474,35 @@ public:
                 glDisable(GL_TEXTURE_2D);
             }
             glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
+
+            const MeshDrawState::DualPass *dual = part.materialIndex < state.materialDualPasses.size()
+                ? &state.materialDualPasses[part.materialIndex]
+                : nullptr;
+            if (dual && dual->enabled && !dual->textureName.empty())
+            {
+                const auto dualTexture = m_textures.find(textureKey(dual->textureName));
+                if (dualTexture != m_textures.end())
+                {
+                    for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                    {
+                        const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
+                        part.gpuVertices[i].uv[0] = uv[0];
+                        part.gpuVertices[i].uv[1] = uv[1];
+                    }
+                    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                    static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
+                                    part.gpuVertices.data());
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, dualTexture->second);
+                    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+                    glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
+                    glEnable(GL_BLEND);
+                    glBlendEquation(GL_FUNC_ADD);
+                    glBlendFunc(rwBlendFactor(dual->srcBlend), rwBlendFactor(dual->dstBlend));
+                    glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                }
+            }
         }
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);
