@@ -330,7 +330,12 @@ namespace
         if (readGuest(rdram, kRwZbuf1, zbuf))
             state.depthWrite = ((zbuf >> 32u) & 1u) == 0u; // GS ZBUF.ZMSK: 1 disables writes.
         if (readGuest(rdram, kRwTest1, test))
+        {
             state.depthTest = ((test >> 17u) & 0x3u) != 1u; // RW's disabled mode uses ZTST=ALWAYS.
+            state.alphaTest.enabled = (test & 0x1u) != 0u;
+            state.alphaTest.function = static_cast<uint8_t>((test >> 1u) & 0x7u);
+            state.alphaTest.reference = static_cast<uint8_t>((test >> 4u) & 0xFFu);
+        }
         if (readGuest(rdram, kRwCullMode, cull))
         {
             switch (cull)
@@ -1262,11 +1267,17 @@ namespace
     ScreenDrawState nativeIm2DState(const uint8_t *rdram)
     {
         ScreenDrawState state;
-        uint64_t flags = 0u, alpha = 0u, clamp = 0u, tex1 = 0u;
+        uint64_t flags = 0u, alpha = 0u, clamp = 0u, tex1 = 0u, test = 0u;
         readGuest(rdram, kRwRenderFlags, flags);
         readGuest(rdram, kRwAlpha1, alpha);
         readGuest(rdram, kRwClamp1, clamp);
         readGuest(rdram, kRwTex1, tex1);
+        if (readGuest(rdram, kRwTest1, test))
+        {
+            state.alphaTest.enabled = (test & 0x1u) != 0u;
+            state.alphaTest.function = static_cast<uint8_t>((test >> 1u) & 0x7u);
+            state.alphaTest.reference = static_cast<uint8_t>((test >> 4u) & 0xFFu);
+        }
 
         if ((flags & kGsPrimAlphaBlendEnable) == 0u)
             state.blend = ScreenBlend::Opaque;

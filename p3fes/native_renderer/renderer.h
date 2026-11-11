@@ -65,12 +65,22 @@ enum class ScreenBlend : std::uint8_t
     Opaque,
 };
 
+struct AlphaTestState
+{
+    bool enabled = false;
+    // Raw GS TEST.ATST encoding: 0 NEVER, 1 ALWAYS, 2 LESS, 3 LEQUAL,
+    // 4 EQUAL, 5 GEQUAL, 6 GREATER, 7 NOTEQUAL.
+    std::uint8_t function = 1u;
+    std::uint8_t reference = 0u;
+};
+
 struct ScreenDrawState
 {
     ScreenBlend blend = ScreenBlend::Alpha;
     bool clampU = false;
     bool clampV = false;
     bool linearFilter = true;
+    AlphaTestState alphaTest{};
 };
 
 struct MeshDrawState
@@ -89,6 +99,7 @@ struct MeshDrawState
     bool clampU = false;
     bool clampV = false;
     bool linearFilter = true;
+    AlphaTestState alphaTest{};
 
     // Optional per-draw RenderWare material colours. Persona 3 mutates these
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,

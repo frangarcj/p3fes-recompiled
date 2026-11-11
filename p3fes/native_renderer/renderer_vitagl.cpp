@@ -104,6 +104,33 @@ GLenum rwBlendFactor(std::uint8_t factor)
     }
 }
 
+GLenum gsAlphaFunc(std::uint8_t function)
+{
+    switch (function & 0x7u)
+    {
+    case 0u: return GL_NEVER;
+    case 1u: return GL_ALWAYS;
+    case 2u: return GL_LESS;
+    case 3u: return GL_LEQUAL;
+    case 4u: return GL_EQUAL;
+    case 5u: return GL_GEQUAL;
+    case 6u: return GL_GREATER;
+    case 7u: return GL_NOTEQUAL;
+    default: return GL_ALWAYS;
+    }
+}
+
+void applyAlphaTest(const AlphaTestState &alpha)
+{
+    if (!alpha.enabled)
+    {
+        glDisable(GL_ALPHA_TEST);
+        return;
+    }
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(gsAlphaFunc(alpha.function), alpha.reference / 255.0f);
+}
+
 Vec3 subtract(const Vec3 &a, const Vec3 &b)
 {
     return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
@@ -440,7 +467,7 @@ public:
         if (found == m_meshes.end())
             return;
 
-
+        applyAlphaTest(state.alphaTest);
         if (state.depthTest)
             glEnable(GL_DEPTH_TEST);
         else
@@ -614,6 +641,7 @@ public:
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glDisable(GL_TEXTURE_2D);
         glPopMatrix();
+        glDisable(GL_ALPHA_TEST);
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         glDisable(GL_CULL_FACE);
@@ -626,6 +654,8 @@ public:
             return;
         if (!m_in3D)
             apply3D();
+
+        applyAlphaTest(state.alphaTest);
 
         std::vector<GpuVertex> gpu(vertices.size());
         for (std::size_t i = 0; i < vertices.size(); ++i)
@@ -695,6 +725,7 @@ public:
         glPopMatrix();
         glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_TEXTURE_2D);
+        glDisable(GL_ALPHA_TEST);
 
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
@@ -739,6 +770,7 @@ private:
         for (const ScreenVertex &v : vertices)
             gpu.push_back({v.x, v.y, v.z, v.u, v.v, v.color[0], v.color[1], v.color[2], v.color[3]});
 
+        applyAlphaTest(state.alphaTest);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
         GLuint texture = 0u;
@@ -804,6 +836,7 @@ private:
         glDisableClientState(GL_VERTEX_ARRAY);
         glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_TEXTURE_2D);
+        glDisable(GL_ALPHA_TEST);
         glEnable(GL_BLEND);
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);

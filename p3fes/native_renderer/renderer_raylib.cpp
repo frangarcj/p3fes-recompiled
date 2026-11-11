@@ -22,6 +22,33 @@ namespace
 {
 constexpr std::size_t kMaterialMapCount = static_cast<std::size_t>(MATERIAL_MAP_BRDF) + 1u;
 
+constexpr const char *kAlphaTestFragmentShader = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+out vec4 finalColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform int uAlphaFunc;
+uniform int uAlphaRef;
+bool alphaPass(int a)
+{
+    if (uAlphaFunc == 0) return false;
+    if (uAlphaFunc == 1) return true;
+    if (uAlphaFunc == 2) return a < uAlphaRef;
+    if (uAlphaFunc == 3) return a <= uAlphaRef;
+    if (uAlphaFunc == 4) return a == uAlphaRef;
+    if (uAlphaFunc == 5) return a >= uAlphaRef;
+    if (uAlphaFunc == 6) return a > uAlphaRef;
+    return a != uAlphaRef;
+}
+void main()
+{
+    finalColor = texture(texture0, fragTexCoord)*colDiffuse*fragColor;
+    int alpha = int(clamp(finalColor.a, 0.0, 1.0)*255.0 + 0.5);
+    if (!alphaPass(alpha)) discard;
+}
+)";
+
 std::string textureKey(std::string_view name)
 {
     std::string out(name);
@@ -157,6 +184,13 @@ public:
         if (!IsWindowReady())
             return false;
         m_material = LoadMaterialDefault();
+        m_alphaShader = LoadShaderFromMemory(nullptr, kAlphaTestFragmentShader);
+        if (m_alphaShader.id != rlGetShaderIdDefault())
+        {
+            m_alphaFuncLoc = GetShaderLocation(m_alphaShader, "uAlphaFunc");
+            m_alphaRefLoc = GetShaderLocation(m_alphaShader, "uAlphaRef");
+            m_alphaShaderReady = m_alphaFuncLoc >= 0 && m_alphaRefLoc >= 0;
+        }
         m_open = true;
         return true;
     }
@@ -172,6 +206,10 @@ public:
         for (auto &[name, texture] : m_textures)
             UnloadTexture(texture);
         m_textures.clear();
+        if (m_alphaShader.id != 0u)
+            UnloadShader(m_alphaShader);
+        m_alphaShader = {};
+        m_alphaShaderReady = false;
         UnloadMaterial(m_material);
         if (m_ownsWindow)
             CloseWindow();
@@ -401,6 +439,11 @@ public:
         for (DrawPart &part : found->second)
         {
             ::Material drawMaterial = m_material;
+            if (state.alphaTest.enabled && m_alphaShaderReady)
+            {
+                setAlphaTestUniforms(state.alphaTest);
+                drawMaterial.shader = m_alphaShader;
+            }
             std::array<MaterialMap, kMaterialMapCount> maps{};
             std::copy_n(m_material.maps, kMaterialMapCount, maps.data());
             drawMaterial.maps = maps.data();
@@ -593,6 +636,14 @@ public:
             }
         }
         rlSetTexture(textureId);
+        const bool alphaShader = state.alphaTest.enabled && m_alphaShaderReady;
+        if (alphaShader)
+        {
+            setAlphaTestUniforms(state.alphaTest);
+            const Vector4 white{1.0f, 1.0f, 1.0f, 1.0f};
+            SetShaderValue(m_alphaShader, m_alphaShader.locs[SHADER_LOC_COLOR_DIFFUSE], &white, SHADER_UNIFORM_VEC4);
+            BeginShaderMode(m_alphaShader);
+        }
         rlPushMatrix();
         rlMultMatrixf(model.data());
         rlBegin(RL_LINES);
@@ -604,6 +655,8 @@ public:
         }
         rlEnd();
         rlPopMatrix();
+        if (alphaShader)
+            EndShaderMode();
         rlSetTexture(0);
 
         rlEnableDepthTest();
@@ -639,6 +692,16 @@ public:
     }
 
 private:
+    void setAlphaTestUniforms(const AlphaTestState &alpha)
+    {
+        if (!m_alphaShaderReady)
+            return;
+        const int function = alpha.function & 0x7u;
+        const int reference = alpha.reference;
+        SetShaderValue(m_alphaShader, m_alphaFuncLoc, &function, SHADER_UNIFORM_INT);
+        SetShaderValue(m_alphaShader, m_alphaRefLoc, &reference, SHADER_UNIFORM_INT);
+    }
+
     void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
                              float sourceWidth, float sourceHeight,
                              std::string_view textureName,
@@ -695,6 +758,14 @@ private:
             break;
         }
         rlSetTexture(textureId);
+        const bool alphaShader = state.alphaTest.enabled && m_alphaShaderReady;
+        if (alphaShader)
+        {
+            setAlphaTestUniforms(state.alphaTest);
+            const Vector4 white{1.0f, 1.0f, 1.0f, 1.0f};
+            SetShaderValue(m_alphaShader, m_alphaShader.locs[SHADER_LOC_COLOR_DIFFUSE], &white, SHADER_UNIFORM_VEC4);
+            BeginShaderMode(m_alphaShader);
+        }
         rlDisableBackfaceCulling();
         rlBegin(primitive);
         for (const ScreenVertex &v : vertices)
@@ -704,6 +775,8 @@ private:
             rlVertex3f(v.x * sx, v.y * sy, v.z);
         }
         rlEnd();
+        if (alphaShader)
+            EndShaderMode();
         rlSetTexture(0);
         rlEnableColorBlend();
         rlSetBlendMode(RL_BLEND_ALPHA);
@@ -713,6 +786,10 @@ private:
     bool m_in3D = false;
     bool m_exactCamera = false;
     ::Material m_material{};
+    Shader m_alphaShader{};
+    int m_alphaFuncLoc = -1;
+    int m_alphaRefLoc = -1;
+    bool m_alphaShaderReady = false;
     Camera3D m_camera{};
     Matrix m_exactProjection{};
     Matrix m_exactView{};
