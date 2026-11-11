@@ -445,13 +445,18 @@ public:
                 ? &state.materialBlends[part.materialIndex]
                 : nullptr;
             glBlendEquation(GL_FUNC_ADD);
-            if (blend && blend->enabled)
+            if (!state.blendEnabled)
+                glDisable(GL_BLEND);
+            else if (blend && blend->enabled)
             {
                 glEnable(GL_BLEND);
                 glBlendFunc(rwBlendFactor(blend->src), rwBlendFactor(blend->dst));
             }
             else
+            {
+                glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            }
             if (part.gpuVertices.size() == part.sourceVertices.size())
             {
                 const MeshDrawState::UvTransform *uvTransform =
@@ -571,6 +576,7 @@ public:
                 }
             }
             glBlendEquation(GL_FUNC_ADD);
+            glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         }
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);

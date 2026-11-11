@@ -386,14 +386,19 @@ public:
             const MeshDrawState::BlendState *blend = part.materialIndex < state.materialBlends.size()
                 ? &state.materialBlends[part.materialIndex]
                 : nullptr;
-            if (blend && blend->enabled)
+            if (!state.blendEnabled)
+                rlDisableColorBlend();
+            else if (blend && blend->enabled)
             {
                 rlEnableColorBlend();
                 rlSetBlendFactors(rwBlendFactor(blend->src), rwBlendFactor(blend->dst), RL_FUNC_ADD);
                 rlSetBlendMode(RL_BLEND_CUSTOM);
             }
             else
+            {
+                rlEnableColorBlend();
                 rlSetBlendMode(RL_BLEND_ALPHA);
+            }
             if (part.mesh.colors && part.sourceVertices.size() == static_cast<std::size_t>(part.mesh.vertexCount))
             {
                 const MeshDrawState::UvTransform *uvTransform =
@@ -504,6 +509,7 @@ public:
                 }
             }
             rlSetBlendMode(RL_BLEND_ALPHA);
+            rlEnableColorBlend();
         }
 
         rlEnableDepthTest();

@@ -118,6 +118,8 @@ namespace
     constexpr uint32_t kSkyIm2DRenderIndexedPrimitive = 0x004EEB50u;
     constexpr uint32_t kRwGp = 0x007D2CF0u;
     constexpr uint32_t kRwRenderFlags = kRwGp - 20272u;
+    constexpr uint32_t kRwSrcBlend = kRwGp - 20264u;
+    constexpr uint32_t kRwDstBlend = kRwGp - 20260u;
     constexpr uint32_t kRwMatFxPluginOffset = kRwGp - 17848u;
     constexpr uint32_t kRwRasterPluginOffset = kRwGp - 16968u;
     constexpr uint32_t kRwClamp1 = kRwGp - 17048u;
@@ -303,7 +305,8 @@ namespace
     void readNativeGlobalMeshState(const uint8_t *rdram, MeshDrawState &state)
     {
         uint64_t zbuf = 0u, test = 0u;
-        uint32_t cull = 2u;
+        uint64_t renderFlags = 0u;
+        uint32_t cull = 2u, srcBlend = 5u, dstBlend = 6u;
         if (readGuest(rdram, kRwZbuf1, zbuf))
             state.depthWrite = ((zbuf >> 32u) & 1u) == 0u; // GS ZBUF.ZMSK: 1 disables writes.
         if (readGuest(rdram, kRwTest1, test))
@@ -317,6 +320,18 @@ namespace
             case 2u:
             default: state.cullMode = MeshDrawState::CullMode::Back; break;
             }
+        }
+        if (readGuest(rdram, kRwRenderFlags, renderFlags))
+            state.blendEnabled = (renderFlags & kGsPrimAlphaBlendEnable) != 0u;
+        if (state.blendEnabled && readGuest(rdram, kRwSrcBlend, srcBlend) && readGuest(rdram, kRwDstBlend, dstBlend) &&
+            srcBlend >= 1u && srcBlend <= 11u && dstBlend >= 1u && dstBlend <= 11u)
+        {
+            const std::size_t materialCount = std::max<std::size_t>(state.materialColors.size(), 1u);
+            MeshDrawState::BlendState blend;
+            blend.enabled = true;
+            blend.src = static_cast<uint8_t>(srcBlend);
+            blend.dst = static_cast<uint8_t>(dstBlend);
+            state.materialBlends.assign(materialCount, blend);
         }
     }
 
@@ -1090,6 +1105,7 @@ namespace
         readNativeGlobalMeshState(rdram, drawState);
         if (blendOverride && blendOverride->enabled)
         {
+            drawState.blendEnabled = true;
             const std::size_t materialCount = std::max<std::size_t>(drawState.materialColors.size(), 1u);
             drawState.materialBlends.assign(materialCount, *blendOverride);
         }
@@ -1111,7 +1127,6 @@ namespace
             return false;
         const MeshId meshId = (1ull << 63u) | sector;
         MeshDrawState drawState;
-        readNativeGlobalMeshState(rdram, drawState);
         if (g_definedMeshes.find(meshId) == g_definedMeshes.end())
         {
             MeshData mesh;
@@ -1172,6 +1187,7 @@ namespace
                 }
             }
         }
+        readNativeGlobalMeshState(rdram, drawState);
         readNativeLighting(rdram, true, sector, drawState);
         p3fes_native_present::drawMesh(meshId, p3fes::native_renderer::kIdentityMatrix, std::move(drawState));
         return true;
