@@ -1,5 +1,6 @@
 #include "Common.h"
 #include <cstdio>
+#include <unordered_set>
 #include "Interrupt.h"
 
 namespace ps2_syscalls
@@ -37,10 +38,23 @@ namespace ps2_syscalls
                                               getRegU32(ctx, 7),
                                               getRegU32(ctx, 28),
                                               getRegU32(ctx, 29));
-            // Always logged (rare): which interrupt causes the game hooks, and with which handler.
-            std::fprintf(stderr, "[intc] Add%sHandler cause=%u handler=%08x next=%d arg=%08x -> id %d (ra=%08x)\n",
-                         dmac ? "Dmac" : "Intc", getRegU32(ctx, 4), getRegU32(ctx, 5), (int)getRegU32(ctx, 6),
-                         getRegU32(ctx, 7), id, getRegU32(ctx, 31));
+            // Some middleware installs/removes a transient handler for every
+            // transfer (Sofdec's IPU CSC path does this for DMAC channel 3).
+            // Logging every registration becomes a major host-side cost under
+            // Vita3K and on real hardware debug output. Keep the useful first
+            // sighting of each cause/handler pair without spamming every frame.
+            static std::unordered_set<uint64_t> loggedHandlers;
+            const uint32_t cause = getRegU32(ctx, 4);
+            const uint32_t handler = getRegU32(ctx, 5);
+            const uint64_t logKey = (static_cast<uint64_t>(dmac) << 63u) |
+                                    (static_cast<uint64_t>(cause) << 32u) |
+                                    handler;
+            if (loggedHandlers.insert(logKey).second)
+            {
+                std::fprintf(stderr, "[intc] Add%sHandler cause=%u handler=%08x next=%d arg=%08x -> id %d (ra=%08x)\n",
+                             dmac ? "Dmac" : "Intc", cause, handler, (int)getRegU32(ctx, 6),
+                             getRegU32(ctx, 7), id, getRegU32(ctx, 31));
+            }
             setReturnS32(ctx, id);
         }
 
