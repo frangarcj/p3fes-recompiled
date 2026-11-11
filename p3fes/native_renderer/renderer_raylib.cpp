@@ -1,5 +1,6 @@
 #include "renderer.h"
 #include "lighting.h"
+#include "skinning.h"
 
 #include <raylib.h>
 #include <raymath.h>
@@ -93,9 +94,11 @@ struct DrawPart
     std::uint32_t materialIndex = 0;
     Material material{};
     std::vector<Vertex> sourceVertices;
+    std::vector<Vertex> posedVertices;
     std::vector<unsigned char> shadedColors;
     bool lighting = false;
     bool hasPrelight = false;
+    bool skinned = false;
 };
 
 class RaylibRenderer final : public Renderer
@@ -234,9 +237,11 @@ public:
             DrawPart part;
             part.materialIndex = submesh.materialIndex;
             part.sourceVertices = source.vertices;
+            part.posedVertices = source.vertices;
             part.shadedColors.resize(source.vertices.size() * 4u);
             part.lighting = source.lighting && source.hasNormals;
             part.hasPrelight = source.hasPrelight;
+            part.skinned = source.skinned;
             if (!source.materials.empty())
             {
                 part.color = source.materials[submesh.materialIndex].color;
@@ -344,9 +349,23 @@ public:
             {
                 for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                 {
-                    const auto shaded = shadeVertexColor(part.sourceVertices[i], part.material, color,
+                    Vertex &posed = part.posedVertices[i];
+                    posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette) : part.sourceVertices[i];
+                    const auto shaded = shadeVertexColor(posed, part.material, color,
                                                          part.lighting, part.hasPrelight, state, model);
                     std::memcpy(part.shadedColors.data() + i * 4u, shaded.data(), 4u);
+                    if (part.skinned)
+                    {
+                        std::memcpy(part.mesh.vertices + i * 3u, posed.position.data(), sizeof(float) * 3u);
+                        std::memcpy(part.mesh.normals + i * 3u, posed.normal.data(), sizeof(float) * 3u);
+                    }
+                }
+                if (part.skinned)
+                {
+                    UpdateMeshBuffer(part.mesh, 0, part.mesh.vertices,
+                                     part.mesh.vertexCount * static_cast<int>(sizeof(float) * 3u), 0);
+                    UpdateMeshBuffer(part.mesh, 2, part.mesh.normals,
+                                     part.mesh.vertexCount * static_cast<int>(sizeof(float) * 3u), 0);
                 }
                 UpdateMeshBuffer(part.mesh, 3, part.shadedColors.data(),
                                  static_cast<int>(part.shadedColors.size()), 0);

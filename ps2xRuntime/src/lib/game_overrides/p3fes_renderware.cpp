@@ -55,6 +55,13 @@ namespace
     constexpr uint32_t kMorphVerticesOffset = 0x14u;
     constexpr uint32_t kMorphNormalsOffset = 0x18u;
     constexpr uint32_t kMorphSize = 0x1Cu;
+    constexpr uint32_t kSkinAtomicExtensionOffset = 0x0095DE14u;
+    constexpr uint32_t kSkinGeometryExtensionOffset = 0x0095DE18u;
+    constexpr uint32_t kSkinMatrixPaletteUpdate = 0x0046B510u;
+    constexpr uint32_t kSkinNumBonesOffset = 0x00u;
+    constexpr uint32_t kSkinVertexIndicesOffset = 0x14u;
+    constexpr uint32_t kSkinVertexWeightsOffset = 0x18u;
+    constexpr uint32_t kMaxSkinBones = 256u;
     constexpr uint32_t kTriangleMaterialOffset = 0x06u;
     constexpr uint32_t kMaterialTextureOffset = 0x00u;
     constexpr uint32_t kMaterialColorOffset = 0x04u;
@@ -521,6 +528,91 @@ namespace
         return true;
     }
 
+    bool decodeNativeSkinWeights(const uint8_t *rdram, uint32_t geometry, MeshData &mesh)
+    {
+        uint32_t extensionOffset = 0u;
+        if (!readGuest(rdram, kSkinGeometryExtensionOffset, extensionOffset) || extensionOffset == 0u ||
+            !guestPointer(geometry + extensionOffset, sizeof(uint32_t)))
+            return true; // Skin plugin not installed / geometry is not skinned.
+
+        uint32_t skin = 0u;
+        if (!readGuest(rdram, geometry + extensionOffset, skin) || skin == 0u)
+            return true;
+        if (!guestPointer(skin, kSkinVertexWeightsOffset + sizeof(uint32_t)))
+            return false;
+
+        int32_t boneCountSigned = 0;
+        uint32_t indices = 0u, weights = 0u;
+        if (!readGuest(rdram, skin + kSkinNumBonesOffset, boneCountSigned) ||
+            boneCountSigned <= 0 || static_cast<uint32_t>(boneCountSigned) > kMaxSkinBones ||
+            !readGuest(rdram, skin + kSkinVertexIndicesOffset, indices) ||
+            !readGuest(rdram, skin + kSkinVertexWeightsOffset, weights) ||
+            !guestPointer(indices, static_cast<uint32_t>(mesh.vertices.size()) * 4u) ||
+            !guestPointer(weights, static_cast<uint32_t>(mesh.vertices.size()) * 16u))
+            return false;
+
+        mesh.skinned = true;
+        mesh.boneCount = static_cast<uint32_t>(boneCountSigned);
+        for (uint32_t i = 0u; i < mesh.vertices.size(); ++i)
+        {
+            Vertex &vertex = mesh.vertices[i];
+            std::memcpy(vertex.bones.data(), rdram + indices + i * 4u, 4u);
+            for (uint32_t slot = 0u; slot < 4u; ++slot)
+            {
+                uint32_t bits = 0u;
+                std::memcpy(&bits, rdram + weights + i * 16u + slot * 4u, sizeof(bits));
+                // skinPrepareWeights (0x48A4B0) stores (bone+1)<<2 in the
+                // lowest ten mantissa bits for the VU1 programs. Remove those
+                // tag bits to recover the source weight; the separate index
+                // array above remains the authoritative bone number.
+                bits &= ~0x3FFu;
+                float weight = 0.0f;
+                std::memcpy(&weight, &bits, sizeof(weight));
+                vertex.weights[slot] = std::isfinite(weight) && weight > 0.0f ? weight : 0.0f;
+            }
+        }
+        return true;
+    }
+
+    bool prepareNativeSkinPalette(uint8_t *rdram, uint32_t atomic, uint32_t geometry,
+                                  R5900Context *ctx, PS2Runtime *runtime, MeshDrawState &state)
+    {
+        if (!ctx || !runtime)
+            return false;
+        uint32_t extensionOffset = 0u, skin = 0u;
+        if (!readGuest(rdram, kSkinGeometryExtensionOffset, extensionOffset) || extensionOffset == 0u ||
+            !guestPointer(geometry + extensionOffset, sizeof(uint32_t)) ||
+            !readGuest(rdram, geometry + extensionOffset, skin) || skin == 0u)
+            return true; // Not a skinned geometry.
+
+        int32_t boneCountSigned = 0;
+        if (!guestPointer(skin, kSkinVertexWeightsOffset + sizeof(uint32_t)) ||
+            !readGuest(rdram, skin + kSkinNumBonesOffset, boneCountSigned) || boneCountSigned <= 0 ||
+            static_cast<uint32_t>(boneCountSigned) > kMaxSkinBones)
+            return false;
+
+        PS2Runtime::RecompiledFunction update = runtime->lookupFunction(kSkinMatrixPaletteUpdate);
+        if (!update)
+            return false;
+
+        // Reuse RenderWare's own palette builder. This preserves all of its
+        // hierarchy flag/inverse-bind/inverse-atomic-LTM rules and avoids a
+        // second subtly different matrix implementation. The original skin
+        // render path calls this same helper before VU1 submission.
+        ctx->r[4] = _mm_cvtsi32_si128(static_cast<int32_t>(atomic));
+        ctx->r[5] = _mm_cvtsi32_si128(static_cast<int32_t>(skin));
+        update(rdram, ctx, runtime);
+        const uint32_t palette = getRegU32(ctx, 2);
+        const uint32_t boneCount = static_cast<uint32_t>(boneCountSigned);
+        if (!guestPointer(palette, boneCount * 64u))
+            return false;
+
+        state.skinPalette.resize(boneCount);
+        for (uint32_t bone = 0u; bone < boneCount; ++bone)
+            std::memcpy(state.skinPalette[bone].data(), rdram + palette + bone * 64u, 64u);
+        return true;
+    }
+
     bool decodeNativeMesh(const uint8_t *rdram, const AtomicSummary &summary, MeshData &mesh, MeshId &meshId)
     {
         if (summary.vertices == 0u || summary.triangles == 0u || summary.morphTargets == 0u)
@@ -566,6 +658,8 @@ namespace
             if (hasPrelight)
                 std::memcpy(v.color.data(), rdram + summary.prelitData + i * 4u, 4u);
         }
+        if (!decodeNativeSkinWeights(rdram, summary.geometry, mesh))
+            return false;
 
         uint32_t materialArray = 0u;
         int32_t materialCountSigned = 0;
@@ -761,7 +855,7 @@ namespace
         return true;
     }
 
-    bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic)
+    bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic, R5900Context *ctx, PS2Runtime *runtime)
     {
         AtomicSummary summary;
         if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u)
@@ -795,6 +889,12 @@ namespace
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
         if ((summary.geometryFlags & kGeometryLightingFlag) != 0u)
             readNativeLighting(rdram, false, atomic, drawState);
+        if (!prepareNativeSkinPalette(rdram, atomic, summary.geometry, ctx, runtime, drawState))
+        {
+            if (g_nativeErrors++ < 8u)
+                std::fprintf(stderr, "[p3fes-native] skin palette failed for atomic 0x%08X geometry 0x%08X\n",
+                             atomic, summary.geometry);
+        }
         p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
         return true;
     }
@@ -1405,10 +1505,11 @@ namespace
                 // Native mode is intentionally strict: once selected, an
                 // unsupported atomic is missing rather than silently falling
                 // back to the interlaced GS path.
-                drawNativeAtomic(rdram, atomic);
+                drawNativeAtomic(rdram, atomic, ctx, runtime);
                 // AtomicDefaultRenderCallBack returns the atomic on success.
                 // Native submission itself is the success path here, and
                 // callers do use $v0 as the RenderWare callback result.
+                ctx->r[4] = _mm_cvtsi32_si128(static_cast<int32_t>(atomic));
                 ctx->r[2] = ctx->r[4];
                 return;
             }

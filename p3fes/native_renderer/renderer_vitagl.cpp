@@ -2,6 +2,7 @@
 // drawn through the vitaGL/GXM context already owned by the Celosia host shim.
 #include "renderer.h"
 #include "lighting.h"
+#include "skinning.h"
 
 #include <raylib.h>
 #include <vitaGL.h>
@@ -58,6 +59,7 @@ struct DrawPart
     std::vector<GpuVertex> gpuVertices;
     bool lighting = false;
     bool hasPrelight = false;
+    bool skinned = false;
 };
 
 using Vec3 = std::array<float, 3>;
@@ -307,6 +309,7 @@ public:
             part.sourceVertices = source.vertices;
             part.lighting = source.lighting && source.hasNormals;
             part.hasPrelight = source.hasPrelight;
+            part.skinned = source.skinned;
             if (!source.materials.empty())
             {
                 part.color = source.materials[submesh.materialIndex].color;
@@ -406,7 +409,11 @@ public:
             {
                 for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                 {
-                    const auto shaded = shadeVertexColor(part.sourceVertices[i], part.material, color,
+                    const Vertex posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette)
+                                                      : part.sourceVertices[i];
+                    std::copy(posed.position.begin(), posed.position.end(), part.gpuVertices[i].position);
+                    std::copy(posed.normal.begin(), posed.normal.end(), part.gpuVertices[i].normal);
+                    const auto shaded = shadeVertexColor(posed, part.material, color,
                                                          part.lighting, part.hasPrelight, state, model);
                     std::copy(shaded.begin(), shaded.end(), part.gpuVertices[i].color);
                 }

@@ -107,6 +107,11 @@ struct MeshDrawState
     std::array<float, 3> ambientLight{};
     std::vector<DirectionalLight> directionalLights;
     std::vector<LocalLight> localLights;
+
+    // RenderWare's per-atomic skin palette, produced by the game's own
+    // _rpSkinMatrixUpdating. Matrices transform bind-pose vertices back into
+    // the atomic's local space; the regular model matrix is applied after.
+    std::vector<Matrix4> skinPalette;
 };
 
 class Renderer
