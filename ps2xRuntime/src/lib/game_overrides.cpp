@@ -12,6 +12,15 @@
 #include <optional>
 #include <vector>
 
+namespace ps2_game_overrides
+{
+    // Static-library builds (Vita) only extract archive members that satisfy a
+    // referenced symbol. p3fes_renderware.cpp otherwise contains only a static
+    // AutoRegister and gets discarded, so its constructor never runs. Keep one
+    // explicit reference to the built-in module to make registration reliable.
+    void forceLinkP3fesRenderWare();
+}
+
 namespace
 {
     std::mutex &registryMutex()
@@ -125,6 +134,7 @@ namespace ps2_game_overrides
                        uint32_t fileCrc32,
                        bool fileCrcValid)
     {
+        forceLinkP3fesRenderWare();
 
         std::vector<Descriptor> descriptors;
         {

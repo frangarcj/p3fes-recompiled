@@ -2262,7 +2262,16 @@ namespace
     {
         const char *native = std::getenv("P3FES_NATIVE_RW");
         const char *diag = std::getenv("P3FES_RW_HOOK_DIAG");
+#if defined(PLATFORM_VITA)
+        // Vita is the native-rendering target. Environment variables are not a
+        // practical launch-time switch on hardware (or when Vita3K starts an
+        // installed title), so make the progressive RenderWare path the
+        // platform default. Keeping an explicit "0" escape hatch is useful for
+        // development builds launched by tools that do provide an environment.
+        const bool nativeEnabled = !(native && *native == '0');
+#else
         const bool nativeEnabled = native && *native && *native != '0';
+#endif
         const bool diagEnabled = diag && *diag && *diag != '0';
         if (!nativeEnabled && !diagEnabled)
             return;
@@ -2340,3 +2349,8 @@ PS2_REGISTER_GAME_OVERRIDE("p3fes-renderware",
                            0x00100008u,
                            0x9B2AF129u,
                            applyP3fesRenderWare)
+
+namespace ps2_game_overrides
+{
+    void forceLinkP3fesRenderWare() {}
+}
