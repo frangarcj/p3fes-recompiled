@@ -357,6 +357,22 @@ public:
         if (found == m_meshes.end())
             return;
 
+        if (state.depthTest)
+            rlEnableDepthTest();
+        else
+            rlDisableDepthTest();
+        if (state.depthWrite)
+            rlEnableDepthMask();
+        else
+            rlDisableDepthMask();
+        if (state.cullMode == MeshDrawState::CullMode::None)
+            rlDisableBackfaceCulling();
+        else
+        {
+            rlEnableBackfaceCulling();
+            rlSetCullFace(state.cullMode == MeshDrawState::CullMode::Back ? RL_CULL_FACE_BACK : RL_CULL_FACE_FRONT);
+        }
+
         for (DrawPart &part : found->second)
         {
             ::Material drawMaterial = m_material;
@@ -489,6 +505,11 @@ public:
             }
             rlSetBlendMode(RL_BLEND_ALPHA);
         }
+
+        rlEnableDepthTest();
+        rlEnableDepthMask();
+        rlEnableBackfaceCulling();
+        rlSetCullFace(RL_CULL_FACE_BACK);
     }
 
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,

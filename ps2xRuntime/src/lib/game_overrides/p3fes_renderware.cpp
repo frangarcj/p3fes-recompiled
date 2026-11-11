@@ -123,6 +123,9 @@ namespace
     constexpr uint32_t kRwClamp1 = kRwGp - 17048u;
     constexpr uint32_t kRwTex1 = kRwGp - 17040u;
     constexpr uint32_t kRwAlpha1 = kRwGp - 17032u;
+    constexpr uint32_t kRwZbuf1 = kRwGp - 17088u;
+    constexpr uint32_t kRwTest1 = kRwGp - 17072u;
+    constexpr uint32_t kRwCullMode = kRwGp - 16964u;
     constexpr uint32_t kRwCurrentRaster = kRwGp - 16948u;
     constexpr uint32_t kPtankAtomicExtensionOffset = kRwGp - 17792u;
     constexpr uint64_t kGsPrimTextureEnable = 0x10u;
@@ -294,6 +297,26 @@ namespace
             readMaterialUvTransform(rdram, material, state.materialUvTransforms[static_cast<size_t>(i)]);
             readMaterialDualPass(rdram, material, state.materialDualPasses[static_cast<size_t>(i)]);
             readMaterialEnvPass(rdram, material, state.materialEnvPasses[static_cast<size_t>(i)]);
+        }
+    }
+
+    void readNativeGlobalMeshState(const uint8_t *rdram, MeshDrawState &state)
+    {
+        uint64_t zbuf = 0u, test = 0u;
+        uint32_t cull = 2u;
+        if (readGuest(rdram, kRwZbuf1, zbuf))
+            state.depthWrite = ((zbuf >> 32u) & 1u) == 0u; // GS ZBUF.ZMSK: 1 disables writes.
+        if (readGuest(rdram, kRwTest1, test))
+            state.depthTest = ((test >> 17u) & 0x3u) != 1u; // RW's disabled mode uses ZTST=ALWAYS.
+        if (readGuest(rdram, kRwCullMode, cull))
+        {
+            switch (cull)
+            {
+            case 1u: state.cullMode = MeshDrawState::CullMode::None; break;
+            case 3u: state.cullMode = MeshDrawState::CullMode::Front; break;
+            case 2u:
+            default: state.cullMode = MeshDrawState::CullMode::Back; break;
+            }
         }
     }
 
@@ -1064,6 +1087,7 @@ namespace
             return false;
         MeshDrawState drawState;
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
+        readNativeGlobalMeshState(rdram, drawState);
         if (blendOverride && blendOverride->enabled)
         {
             const std::size_t materialCount = std::max<std::size_t>(drawState.materialColors.size(), 1u);
@@ -1087,6 +1111,7 @@ namespace
             return false;
         const MeshId meshId = (1ull << 63u) | sector;
         MeshDrawState drawState;
+        readNativeGlobalMeshState(rdram, drawState);
         if (g_definedMeshes.find(meshId) == g_definedMeshes.end())
         {
             MeshData mesh;

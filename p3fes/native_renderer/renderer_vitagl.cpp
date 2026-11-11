@@ -416,6 +416,20 @@ public:
         if (found == m_meshes.end())
             return;
 
+
+        if (state.depthTest)
+            glEnable(GL_DEPTH_TEST);
+        else
+            glDisable(GL_DEPTH_TEST);
+        glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
+        if (state.cullMode == MeshDrawState::CullMode::None)
+            glDisable(GL_CULL_FACE);
+        else
+        {
+            glEnable(GL_CULL_FACE);
+            glCullFace(state.cullMode == MeshDrawState::CullMode::Back ? GL_BACK : GL_FRONT);
+        }
+
         glMatrixMode(GL_MODELVIEW);
         glPushMatrix();
         glMultMatrixf(model.data());
@@ -567,6 +581,9 @@ public:
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glDisable(GL_TEXTURE_2D);
         glPopMatrix();
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_CULL_FACE);
     }
 
     void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,

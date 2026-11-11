@@ -75,6 +75,17 @@ struct ScreenDrawState
 
 struct MeshDrawState
 {
+    enum class CullMode : std::uint8_t
+    {
+        None,
+        Back,
+        Front,
+    };
+
+    bool depthTest = true;
+    bool depthWrite = true;
+    CullMode cullMode = CullMode::Back;
+
     // Optional per-draw RenderWare material colours. Persona 3 mutates these
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,
     // so they cannot be baked permanently into the cached GPU mesh.
