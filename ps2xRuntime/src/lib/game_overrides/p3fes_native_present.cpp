@@ -1,4 +1,5 @@
 #include "p3fes_native_present.h"
+#include "../gs/gs_draw_control.h"
 
 #if !defined(__ANDROID__)
 
@@ -170,6 +171,7 @@ bool ensureTexture(const std::string &name)
 void setActive(bool active)
 {
     g_active.store(active, std::memory_order_release);
+    ps2x::gs::setPrimitiveRasterSuppressed(active);
     if (!active)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -371,6 +373,7 @@ void shutdownHost()
         g_buildingOpen = false;
     }
     g_active.store(false, std::memory_order_release);
+    ps2x::gs::setPrimitiveRasterSuppressed(false);
 }
 } // namespace p3fes_native_present
 

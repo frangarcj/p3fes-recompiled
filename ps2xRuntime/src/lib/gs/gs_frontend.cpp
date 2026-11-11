@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_frontend.h"
+#include "gs_draw_control.h"
 #include "runtime/gs/gs_cpu_backend.h"
 // CPU reference renderer by default; OpenGL/queue selectable.
 #include "runtime/gs/gs_threaded_backend.h"
@@ -1778,7 +1779,8 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        if (!ps2x::gs::primitiveRasterSuppressed())
+            m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
 
