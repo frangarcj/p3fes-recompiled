@@ -38,6 +38,8 @@ namespace
     constexpr uint32_t kGeometryNumTrianglesOffset = 0x10u;
     constexpr uint32_t kGeometryNumVerticesOffset = 0x14u;
     constexpr uint32_t kGeometryNumMorphTargetsOffset = 0x18u;
+    constexpr uint32_t kGeometryMatListArrayOffset = 0x20u;
+    constexpr uint32_t kGeometryMatListCountOffset = 0x24u;
     constexpr uint32_t kGeometryTrianglesOffset = 0x2Cu;
     constexpr uint32_t kGeometryPrelitOffset = 0x30u;
     constexpr uint32_t kGeometryUv0Offset = 0x34u;
@@ -45,6 +47,10 @@ namespace
     constexpr uint32_t kMorphVerticesOffset = 0x14u;
     constexpr uint32_t kMorphNormalsOffset = 0x18u;
     constexpr uint32_t kMorphSize = 0x1Cu;
+    constexpr uint32_t kTriangleMaterialOffset = 0x06u;
+    constexpr uint32_t kMaterialTextureOffset = 0x00u;
+    constexpr uint32_t kMaterialColorOffset = 0x04u;
+    constexpr uint32_t kTextureRasterOffset = 0x00u;
     constexpr uint32_t kFrameLtmOffset = 0x50u;
     constexpr uint32_t kRwCurrentCamera = 0x00960070u;
     constexpr uint32_t kCameraFrameOffset = 0x04u;
@@ -56,6 +62,7 @@ namespace
     constexpr uint32_t kSkyIm2DRenderIndexedPrimitive = 0x004EEB50u;
     constexpr uint32_t kRwGp = 0x007D2CF0u;
     constexpr uint32_t kRwRenderFlags = kRwGp - 20272u;
+    constexpr uint32_t kRwRasterPluginOffset = kRwGp - 16968u;
     constexpr uint32_t kRwClamp1 = kRwGp - 17048u;
     constexpr uint32_t kRwTex1 = kRwGp - 17040u;
     constexpr uint32_t kRwAlpha1 = kRwGp - 17032u;
@@ -183,6 +190,8 @@ namespace
     bool g_nativeFrameActive = false;
     uint32_t g_nativeErrors = 0u;
 
+    bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture, uint64_t &revision);
+
     bool readVec3(const uint8_t *rdram, uint32_t address, std::array<float, 3> &out)
     {
         return readGuest(rdram, address + 0u, out[0]) &&
@@ -271,20 +280,63 @@ namespace
                 std::memcpy(v.color.data(), rdram + summary.prelitData + i * 4u, 4u);
         }
 
-        mesh.indices.reserve(static_cast<size_t>(summary.triangles) * 3u);
+        uint32_t materialArray = 0u;
+        int32_t materialCountSigned = 0;
+        const bool hasMaterialList = readGuest(rdram, summary.geometry + kGeometryMatListArrayOffset, materialArray) &&
+                                     readGuest(rdram, summary.geometry + kGeometryMatListCountOffset, materialCountSigned) &&
+                                     materialCountSigned > 0 && materialCountSigned <= 4096 &&
+                                     guestPointer(materialArray, static_cast<uint32_t>(materialCountSigned) * sizeof(uint32_t));
+        const uint32_t materialCount = hasMaterialList ? static_cast<uint32_t>(materialCountSigned) : 1u;
+        std::vector<std::vector<uint32_t>> materialIndices(materialCount);
         for (uint32_t i = 0; i < summary.triangles; ++i)
         {
             const uint32_t tri = summary.triangleData + i * 8u;
-            uint16_t a = 0u, b = 0u, c = 0u;
+            uint16_t a = 0u, b = 0u, c = 0u, material = 0u;
             if (!readGuest(rdram, tri + 0u, a) || !readGuest(rdram, tri + 2u, b) || !readGuest(rdram, tri + 4u, c) ||
                 a >= summary.vertices || b >= summary.vertices || c >= summary.vertices)
                 return false;
-            mesh.indices.push_back(a);
-            mesh.indices.push_back(b);
-            mesh.indices.push_back(c);
+            readGuest(rdram, tri + kTriangleMaterialOffset, material);
+            const uint32_t materialIndex = material < materialCount ? material : 0u;
+            auto &indices = materialIndices[materialIndex];
+            indices.push_back(a);
+            indices.push_back(b);
+            indices.push_back(c);
         }
-        mesh.submeshes.push_back(Submesh{0u, static_cast<uint32_t>(mesh.indices.size()), 0u});
-        mesh.materials.push_back({{255u, 255u, 255u, 255u}, {}});
+
+        mesh.materials.resize(materialCount);
+        for (uint32_t materialIndex = 0u; materialIndex < materialCount; ++materialIndex)
+        {
+            const auto &indices = materialIndices[materialIndex];
+            if (!indices.empty())
+            {
+                const uint32_t firstIndex = static_cast<uint32_t>(mesh.indices.size());
+                mesh.indices.insert(mesh.indices.end(), indices.begin(), indices.end());
+                mesh.submeshes.push_back(Submesh{firstIndex, static_cast<uint32_t>(indices.size()), materialIndex});
+            }
+            if (!hasMaterialList)
+                continue;
+
+            uint32_t material = 0u;
+            if (!readGuest(rdram, materialArray + materialIndex * 4u, material) || !material || !guestPointer(material, 28u))
+                continue;
+            std::memcpy(mesh.materials[materialIndex].color.data(), rdram + material + kMaterialColorOffset, 4u);
+
+            uint32_t texture = 0u, raster = 0u;
+            if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
+                !readGuest(rdram, texture + kTextureRasterOffset, raster) || !raster)
+                continue;
+            TextureData nativeTexture;
+            uint64_t revision = 0u;
+            if (!decodeNativeRaster(rdram, raster, nativeTexture, revision))
+                continue;
+            mesh.materials[materialIndex].textureName = nativeTexture.name;
+            const auto known = g_rasterRevisions.find(raster);
+            if (known == g_rasterRevisions.end() || known->second != revision)
+            {
+                p3fes_native_present::defineTexture(nativeTexture, revision);
+                g_rasterRevisions[raster] = revision;
+            }
+        }
         return true;
     }
 
@@ -487,6 +539,17 @@ namespace
 
         const uint32_t type = info.type & 0x07u;
         if (type != 4u && type != 5u) // texture / camera-texture only
+            return false;
+
+        // RMD native textures can keep their CPU copy in PS2 swizzled PSMT8/
+        // PSMT4 order. The simple host decoder below is intentionally only
+        // for ordinary linear rasters (TMX/font/UI and equivalent material
+        // textures); leave swizzled native rasters for the dedicated decoder.
+        uint32_t pluginOffset = 0u;
+        uint8_t cacheFlags = 0u;
+        if (readGuest(rdram, kRwRasterPluginOffset, pluginOffset) && pluginOffset &&
+            guestPointer(raster + pluginOffset, 55u) && readGuest(rdram, raster + pluginOffset + 54u, cacheFlags) &&
+            (cacheFlags & 0x06u) != 0u)
             return false;
 
         size_t rowBytes = 0u;
