@@ -34,7 +34,10 @@ namespace GSPSMT8
 
     inline uint32_t addrPSMT8(uint32_t block, uint32_t width, uint32_t x, uint32_t y)
     {
-        const uint32_t pagesPerRow = ((width >> 1u) != 0u) ? (width >> 1u) : 1u;
+        // One PSMT8 page is 128 pixels wide while TBW is counted in
+        // 64-pixel units, so odd TBW values still need the partial page.
+        const uint32_t halfWidth = (width + 1u) >> 1u;
+        const uint32_t pagesPerRow = halfWidth != 0u ? halfWidth : 1u;
         const uint32_t page = (block >> 5u) + (y >> 6u) * pagesPerRow + (x >> 7u);
         const uint32_t blockId = (block & 0x1Fu) + blockTable8[(y >> 4) & 3u][(x >> 4) & 7u];
         const uint32_t pageOffset = (blockId >> 5u) << 13u;
