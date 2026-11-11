@@ -74,15 +74,31 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
-void applyMeshSampler(GLuint texture, const MeshDrawState &state)
+GLenum rwWrapMode(MeshDrawState::SamplerState::Address address)
+{
+    switch (address)
+    {
+    case MeshDrawState::SamplerState::Address::Mirror: return GL_MIRRORED_REPEAT;
+    case MeshDrawState::SamplerState::Address::Clamp: return GL_CLAMP_TO_EDGE;
+    case MeshDrawState::SamplerState::Address::Wrap:
+    default: return GL_REPEAT;
+    }
+}
+
+void applyMeshSampler(GLuint texture, const MeshDrawState &state,
+                      const MeshDrawState::SamplerState *sampler = nullptr)
 {
     if (!texture)
         return;
+    const bool materialSampler = sampler && sampler->valid;
+    const GLenum wrapS = materialSampler ? rwWrapMode(sampler->u) : (state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    const GLenum wrapT = materialSampler ? rwWrapMode(sampler->v) : (state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    const bool linear = materialSampler ? sampler->linearFilter : state.linearFilter;
     glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
 }
 
 GLenum rwBlendFactor(std::uint8_t factor)
@@ -570,7 +586,9 @@ public:
             {
                 glEnable(GL_TEXTURE_2D);
                 glBindTexture(GL_TEXTURE_2D, texture->second);
-                applyMeshSampler(texture->second, state);
+                const MeshDrawState::SamplerState *sampler = part.materialIndex < state.materialSamplers.size()
+                    ? &state.materialSamplers[part.materialIndex] : nullptr;
+                applyMeshSampler(texture->second, state, sampler);
                 glEnableClientState(GL_TEXTURE_COORD_ARRAY);
                 glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
             }
@@ -589,7 +607,7 @@ public:
                 const auto dualTexture = m_textures.find(textureKey(dual->textureName));
                 if (dualTexture != m_textures.end())
                 {
-                    applyMeshSampler(dualTexture->second, state);
+                    applyMeshSampler(dualTexture->second, state, &dual->sampler);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
                         const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
@@ -619,7 +637,7 @@ public:
                 const auto envTexture = m_textures.find(textureKey(env->textureName));
                 if (envTexture != m_textures.end())
                 {
-                    applyMeshSampler(envTexture->second, state);
+                    applyMeshSampler(envTexture->second, state, &env->sampler);
                     const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {

@@ -113,6 +113,21 @@ struct MeshDrawState
     AlphaTestState alphaTest{};
     FogState fog{};
 
+    struct SamplerState
+    {
+        enum class Address : std::uint8_t
+        {
+            Wrap,
+            Mirror,
+            Clamp,
+        };
+        bool valid = false;
+        Address u = Address::Wrap;
+        Address v = Address::Wrap;
+        bool linearFilter = true;
+    };
+    std::vector<SamplerState> materialSamplers;
+
     // Optional per-draw RenderWare material colours. Persona 3 mutates these
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,
     // so they cannot be baked permanently into the cached GPU mesh.
@@ -133,6 +148,7 @@ struct MeshDrawState
     {
         bool enabled = false;
         std::string textureName;
+        SamplerState sampler{};
         UvTransform uvTransform{};
         // Raw RenderWare BlendFunction values (ZERO=1, ONE=2,
         // SRCALPHA=5, INVSRCALPHA=6, DESTALPHA=7, ...).
@@ -145,6 +161,7 @@ struct MeshDrawState
     {
         bool enabled = false;
         std::string textureName;
+        SamplerState sampler{};
         float coefficient = 0.0f;
         bool frameBufferAlpha = false;
         // World-space axes of the environment frame. librw-vita generates

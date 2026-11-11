@@ -69,6 +69,7 @@ namespace
     constexpr uint32_t kMaterialSpecularOffset = 0x10u;
     constexpr uint32_t kMaterialDiffuseOffset = 0x14u;
     constexpr uint32_t kTextureRasterOffset = 0x00u;
+    constexpr uint32_t kTextureFilterAddressOffset = 0x50u;
     constexpr uint32_t kSectorTrianglesOffset = 0x04u;
     constexpr uint32_t kSectorVerticesOffset = 0x08u;
     constexpr uint32_t kSectorNormalsOffset = 0x0Cu;
@@ -299,6 +300,7 @@ namespace
                                  MeshDrawState::UvTransform &out);
     bool readMaterialDualPass(const uint8_t *rdram, uint32_t material, MeshDrawState::DualPass &out);
     bool readMaterialEnvPass(const uint8_t *rdram, uint32_t material, MeshDrawState::EnvPass &out);
+    bool readTextureSampler(const uint8_t *rdram, uint32_t texture, MeshDrawState::SamplerState &out);
 
     void readNativeFogState(const uint8_t *rdram, uint64_t renderFlags, FogState &fog)
     {
@@ -331,6 +333,7 @@ namespace
             !guestPointer(materialArray, static_cast<uint32_t>(materialCount) * sizeof(uint32_t)))
             return;
         state.materialColors.assign(static_cast<size_t>(materialCount), {255u, 255u, 255u, 255u});
+        state.materialSamplers.resize(static_cast<size_t>(materialCount));
         state.materialUvTransforms.resize(static_cast<size_t>(materialCount));
         state.materialDualPasses.resize(static_cast<size_t>(materialCount));
         state.materialEnvPasses.resize(static_cast<size_t>(materialCount));
@@ -342,6 +345,9 @@ namespace
                 continue;
             std::memcpy(state.materialColors[static_cast<size_t>(i)].data(),
                         rdram + material + kMaterialColorOffset, 4u);
+            uint32_t texture = 0u;
+            if (readGuest(rdram, material + kMaterialTextureOffset, texture) && texture)
+                readTextureSampler(rdram, texture, state.materialSamplers[static_cast<size_t>(i)]);
             readMaterialUvTransform(rdram, material, state.materialUvTransforms[static_cast<size_t>(i)]);
             readMaterialDualPass(rdram, material, state.materialDualPasses[static_cast<size_t>(i)]);
             readMaterialEnvPass(rdram, material, state.materialEnvPasses[static_cast<size_t>(i)]);
@@ -443,6 +449,40 @@ namespace
             out.diffuse = diffuse;
     }
 
+    bool readTextureSampler(const uint8_t *rdram, uint32_t texture, MeshDrawState::SamplerState &out)
+    {
+        uint32_t packed = 0u;
+        if (!guestPointer(texture, kTextureFilterAddressOffset + sizeof(uint32_t)) ||
+            !readGuest(rdram, texture + kTextureFilterAddressOffset, packed))
+            return false;
+
+        const uint32_t filter = packed & 0xFFu;
+        const uint32_t addressU = (packed >> 8u) & 0xFu;
+        const uint32_t addressV = (packed >> 12u) & 0xFu;
+        if (filter < 1u || filter > 6u)
+            return false;
+
+        const auto address = [](uint32_t value)
+        {
+            switch (value)
+            {
+            case 2u: return MeshDrawState::SamplerState::Address::Mirror;
+            case 3u:
+            case 4u: return MeshDrawState::SamplerState::Address::Clamp;
+            case 1u:
+            default: return MeshDrawState::SamplerState::Address::Wrap;
+            }
+        };
+        out.valid = true;
+        out.u = address(addressU);
+        out.v = address(addressV);
+        // P3FES' sky driver sets TEX1.MMAG for RW modes 2/4/6 and clears it
+        // for 1/3/5. Host native textures currently have one decoded level,
+        // so preserve the magnification choice and ignore the mip component.
+        out.linearFilter = (filter & 1u) == 0u;
+        return true;
+    }
+
     bool readMaterialMatFx(const uint8_t *rdram, uint32_t material, uint32_t &extension, uint32_t &effect)
     {
         uint32_t pluginOffset = 0u;
@@ -532,6 +572,7 @@ namespace
 
         out.enabled = true;
         out.textureName = std::move(textureName);
+        readTextureSampler(rdram, texture, out.sampler);
         out.srcBlend = static_cast<uint8_t>(srcBlend);
         out.dstBlend = static_cast<uint8_t>(dstBlend);
         if (effect == kMatFxDualUvTransform)
@@ -580,6 +621,7 @@ namespace
 
         out.enabled = true;
         out.textureName = std::move(textureName);
+        readTextureSampler(rdram, texture, out.sampler);
         out.coefficient = coefficient;
         out.frameBufferAlpha = fbAlpha != 0u;
         out.frameRight = {ltm[0], ltm[1], ltm[2]};
@@ -1076,6 +1118,7 @@ namespace
 
         mesh.materials.resize(localMaterialCount);
         drawState.materialColors.assign(localMaterialCount, {255u, 255u, 255u, 255u});
+        drawState.materialSamplers.resize(localMaterialCount);
         drawState.materialUvTransforms.resize(localMaterialCount);
         drawState.materialDualPasses.resize(localMaterialCount);
         drawState.materialEnvPasses.resize(localMaterialCount);
@@ -1104,6 +1147,7 @@ namespace
             if (!readGuest(rdram, material + kMaterialTextureOffset, texture) || !texture || !guestPointer(texture, 4u) ||
                 !readGuest(rdram, texture + kTextureRasterOffset, raster) || !raster)
                 continue;
+            readTextureSampler(rdram, texture, drawState.materialSamplers[localMaterial]);
             std::string textureName;
             if (!prepareNativeRasterTexture(rdram, raster, textureName))
                 continue;
@@ -1225,6 +1269,7 @@ namespace
                 const uint32_t available = static_cast<uint32_t>(worldMaterialCount) - materialBase;
                 const uint32_t materialCount = std::min(maxLocalMaterial + 1u, available);
                 drawState.materialColors.assign(materialCount, {255u, 255u, 255u, 255u});
+                drawState.materialSamplers.resize(materialCount);
                 drawState.materialUvTransforms.resize(materialCount);
                 drawState.materialDualPasses.resize(materialCount);
                 drawState.materialEnvPasses.resize(materialCount);
@@ -1236,6 +1281,9 @@ namespace
                     {
                         std::memcpy(drawState.materialColors[localMaterial].data(),
                                     rdram + material + kMaterialColorOffset, 4u);
+                        uint32_t texture = 0u;
+                        if (readGuest(rdram, material + kMaterialTextureOffset, texture) && texture)
+                            readTextureSampler(rdram, texture, drawState.materialSamplers[localMaterial]);
                         readMaterialUvTransform(rdram, material, drawState.materialUvTransforms[localMaterial]);
                         readMaterialDualPass(rdram, material, drawState.materialDualPasses[localMaterial]);
                         readMaterialEnvPass(rdram, material, drawState.materialEnvPasses[localMaterial]);

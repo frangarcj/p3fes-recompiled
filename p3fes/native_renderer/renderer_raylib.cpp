@@ -96,15 +96,31 @@ std::string textureKey(std::string_view name)
     return out;
 }
 
-void applyMeshSampler(unsigned int textureId, const MeshDrawState &state)
+int rwWrapMode(MeshDrawState::SamplerState::Address address)
+{
+    switch (address)
+    {
+    case MeshDrawState::SamplerState::Address::Mirror: return RL_TEXTURE_WRAP_MIRROR_REPEAT;
+    case MeshDrawState::SamplerState::Address::Clamp: return RL_TEXTURE_WRAP_CLAMP;
+    case MeshDrawState::SamplerState::Address::Wrap:
+    default: return RL_TEXTURE_WRAP_REPEAT;
+    }
+}
+
+void applyMeshSampler(unsigned int textureId, const MeshDrawState &state,
+                      const MeshDrawState::SamplerState *sampler = nullptr)
 {
     if (!textureId)
         return;
-    rlTextureParameters(textureId, RL_TEXTURE_WRAP_S,
-                        state.clampU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
-    rlTextureParameters(textureId, RL_TEXTURE_WRAP_T,
-                        state.clampV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
-    const int filter = state.linearFilter ? RL_TEXTURE_FILTER_LINEAR : RL_TEXTURE_FILTER_NEAREST;
+    const bool materialSampler = sampler && sampler->valid;
+    const int wrapS = materialSampler ? rwWrapMode(sampler->u)
+        : (state.clampU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+    const int wrapT = materialSampler ? rwWrapMode(sampler->v)
+        : (state.clampV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
+    const bool linear = materialSampler ? sampler->linearFilter : state.linearFilter;
+    rlTextureParameters(textureId, RL_TEXTURE_WRAP_S, wrapS);
+    rlTextureParameters(textureId, RL_TEXTURE_WRAP_T, wrapT);
+    const int filter = linear ? RL_TEXTURE_FILTER_LINEAR : RL_TEXTURE_FILTER_NEAREST;
     rlTextureParameters(textureId, RL_TEXTURE_MIN_FILTER, filter);
     rlTextureParameters(textureId, RL_TEXTURE_MAG_FILTER, filter);
 }
@@ -557,7 +573,9 @@ public:
                 auto texture = m_textures.find(textureKey(part.textureName));
                 if (texture != m_textures.end())
                 {
-                    applyMeshSampler(texture->second.id, state);
+                    const MeshDrawState::SamplerState *sampler = part.materialIndex < state.materialSamplers.size()
+                        ? &state.materialSamplers[part.materialIndex] : nullptr;
+                    applyMeshSampler(texture->second.id, state, sampler);
                     diffuse.texture = texture->second;
                 }
             }
@@ -575,7 +593,7 @@ public:
                 const auto dualTexture = m_textures.find(textureKey(dual->textureName));
                 if (dualTexture != m_textures.end())
                 {
-                    applyMeshSampler(dualTexture->second.id, state);
+                    applyMeshSampler(dualTexture->second.id, state, &dual->sampler);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
                         const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
@@ -600,7 +618,7 @@ public:
                 const auto envTexture = m_textures.find(textureKey(env->textureName));
                 if (envTexture != m_textures.end())
                 {
-                    applyMeshSampler(envTexture->second.id, state);
+                    applyMeshSampler(envTexture->second.id, state, &env->sampler);
                     const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
