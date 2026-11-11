@@ -24,6 +24,7 @@ namespace nr = p3fes::native_renderer;
 void setActive(bool active);
 bool active();
 void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
+void clear(nr::ClearColor clear, bool colorBuffer, bool depthBuffer);
 void defineMesh(nr::MeshId id, const nr::MeshData &mesh);
 void defineTexture(const nr::TextureData &texture, uint64_t revision);
 void drawMesh(nr::MeshId id, const nr::Matrix4 &model, nr::MeshDrawState state = {});

@@ -112,6 +112,7 @@ namespace
     constexpr uint32_t kCameraNearPlaneOffset = 0x80u;
     constexpr uint32_t kCameraFarPlaneOffset = 0x84u;
     constexpr uint32_t kCameraFogPlaneOffset = 0x88u;
+    constexpr uint32_t kRwCameraClear = 0x004C9E90u;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
     constexpr uint32_t kPtankAtomicRender = 0x00474160u;
     constexpr uint32_t kRwIm3DTransform = 0x004F1ED0u;
@@ -163,6 +164,7 @@ namespace
 
     std::atomic<PS2Runtime::RecompiledFunction> g_originalAtomicRender{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalSectorRender{nullptr};
+    std::atomic<PS2Runtime::RecompiledFunction> g_originalCameraClear{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalShowRaster{nullptr};
     std::atomic<bool> g_nativeEnabled{false};
     std::atomic<bool> g_diagEnabled{false};
@@ -172,6 +174,7 @@ namespace
     std::atomic<bool> g_sectorDiagPrinted{false};
     std::atomic<bool> g_ptankDiagPrinted{false};
     std::atomic<bool> g_im3dDiagPrinted{false};
+    std::atomic<bool> g_clearDiagPrinted{false};
 
     struct NativeIm3DState
     {
@@ -2228,6 +2231,33 @@ namespace
             original(rdram, ctx, runtime);
     }
 
+    void p3fesRwCameraClear(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+#if !defined(__ANDROID__)
+        if (ctx && g_nativeEnabled.load(std::memory_order_relaxed))
+        {
+            const uint32_t camera = reg32(ctx, 4u);
+            const uint32_t colorAddress = reg32(ctx, 5u);
+            const uint32_t flags = reg32(ctx, 6u);
+            if (ensureNativeFrame(rdram))
+            {
+                ClearColor clear{};
+                if ((flags & 1u) != 0u && guestPointer(colorAddress, 4u))
+                    std::memcpy(&clear, rdram + colorAddress, 4u);
+                if (g_diagEnabled.load(std::memory_order_relaxed) &&
+                    !g_clearDiagPrinted.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[p3fes-rw] first native camera clear: flags=0x%X rgba=%u,%u,%u,%u\n",
+                                 flags, clear.r, clear.g, clear.b, clear.a);
+                p3fes_native_present::clear(clear, (flags & 1u) != 0u, (flags & 2u) != 0u);
+                ctx->r[2] = _mm_cvtsi32_si128(static_cast<int32_t>(camera));
+                return;
+            }
+        }
+#endif
+        if (PS2Runtime::RecompiledFunction original = g_originalCameraClear.load(std::memory_order_acquire))
+            original(rdram, ctx, runtime);
+    }
+
     void applyP3fesRenderWare(PS2Runtime &runtime)
     {
         const char *native = std::getenv("P3FES_NATIVE_RW");
@@ -2249,6 +2279,7 @@ namespace
         g_sectorDiagPrinted.store(false, std::memory_order_relaxed);
         g_ptankDiagPrinted.store(false, std::memory_order_relaxed);
         g_im3dDiagPrinted.store(false, std::memory_order_relaxed);
+        g_clearDiagPrinted.store(false, std::memory_order_relaxed);
         g_nativeIm3D = {};
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
@@ -2270,6 +2301,11 @@ namespace
             const bool im3dIndexed = installNativeOnlyHook(runtime, kRwIm3DRenderIndexedPrimitive, &p3fesRwIm3DRenderIndexedPrimitive);
             const bool im3dPrim = installNativeOnlyHook(runtime, kRwIm3DRenderPrimitive, &p3fesRwIm3DRenderPrimitive);
             const bool im3dLine = installNativeOnlyHook(runtime, kRwIm3DRenderLine, &p3fesRwIm3DRenderLine);
+            PS2Runtime::RecompiledFunction clear = runtime.lookupFunction(kRwCameraClear);
+            const bool clearHook = clear && clear != &p3fesRwCameraClear &&
+                                   runtime.replaceFunction(kRwCameraClear, &p3fesRwCameraClear);
+            if (clearHook)
+                g_originalCameraClear.store(clear, std::memory_order_release);
             PS2Runtime::RecompiledFunction show = runtime.lookupFunction(kRwCameraShowRaster);
             if (show && show != &p3fesRwCameraShowRaster)
             {
@@ -2284,8 +2320,8 @@ namespace
             // interlaced fallback over the HLE framebuffer, even before the
             // first supported 3-D atomic appears.
             p3fes_native_present::setActive(true);
-            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u ptank=%u Im3D=%u%u%u%u%u Im2D=%u%u%u%u\n",
-                         sectorHook ? 1u : 0u, ptankHook ? 1u : 0u,
+            std::fprintf(stderr, "[p3fes-native] progressive native-only presentation enabled; sector=%u ptank=%u clear=%u Im3D=%u%u%u%u%u Im2D=%u%u%u%u\n",
+                         sectorHook ? 1u : 0u, ptankHook ? 1u : 0u, clearHook ? 1u : 0u,
                          im3dTransform ? 1u : 0u, im3dEnd ? 1u : 0u, im3dIndexed ? 1u : 0u,
                          im3dPrim ? 1u : 0u, im3dLine ? 1u : 0u,
                          im2dLine ? 1u : 0u, im2dTri ? 1u : 0u,

@@ -6,6 +6,7 @@
 #include <raylib.h>
 #include <raymath.h>
 #include <rlgl.h>
+#include <external/glad.h>
 
 #include <algorithm>
 #include <array>
@@ -465,6 +466,32 @@ public:
         else
             BeginMode3D(m_camera);
         m_in3D = true;
+    }
+
+    void clear(ClearColor clear, bool colorBuffer, bool depthBuffer) override
+    {
+        if (!colorBuffer && !depthBuffer)
+            return;
+        // Keep clears ordered with raylib's immediate batch and match
+        // RwCameraClear's independent colour/Z flags.
+        rlDrawRenderBatchActive();
+        GLboolean oldDepthMask = GL_TRUE;
+        glGetBooleanv(GL_DEPTH_WRITEMASK, &oldDepthMask);
+        GLbitfield mask = 0u;
+        if (colorBuffer)
+        {
+            glClearColor(clear.r / 255.0f, clear.g / 255.0f, clear.b / 255.0f, clear.a / 255.0f);
+            mask |= GL_COLOR_BUFFER_BIT;
+        }
+        if (depthBuffer)
+        {
+            glDepthMask(GL_TRUE);
+            glClearDepth(1.0);
+            mask |= GL_DEPTH_BUFFER_BIT;
+        }
+        glClear(mask);
+        if (depthBuffer && oldDepthMask == GL_FALSE)
+            glDepthMask(GL_FALSE);
     }
 
     void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state) override

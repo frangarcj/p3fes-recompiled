@@ -495,6 +495,25 @@ public:
         apply3D();
     }
 
+    void clear(ClearColor clear, bool colorBuffer, bool depthBuffer) override
+    {
+        if (!colorBuffer && !depthBuffer)
+            return;
+        GLbitfield mask = 0u;
+        if (colorBuffer)
+        {
+            glClearColor(clear.r / 255.0f, clear.g / 255.0f, clear.b / 255.0f, clear.a / 255.0f);
+            mask |= GL_COLOR_BUFFER_BIT;
+        }
+        if (depthBuffer)
+        {
+            glDepthMask(GL_TRUE);
+            glClearDepthf(1.0f);
+            mask |= GL_DEPTH_BUFFER_BIT;
+        }
+        glClear(mask);
+    }
+
     void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state) override
     {
         if (!m_in3D)

@@ -231,6 +231,7 @@ public:
     virtual void removeMesh(MeshId id) = 0;
 
     virtual void beginFrame(const Camera &camera, ClearColor clear) = 0;
+    virtual void clear(ClearColor clear, bool colorBuffer, bool depthBuffer) = 0;
     virtual void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state = {}) = 0;
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix, {}); }
     // Transient world-space lines (RenderWare Im3D/debug/effect paths). The

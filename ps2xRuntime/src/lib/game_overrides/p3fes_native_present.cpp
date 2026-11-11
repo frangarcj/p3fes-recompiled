@@ -51,13 +51,20 @@ struct ScreenDraw
     bool lines = false;
 };
 
+struct ClearDraw
+{
+    ClearColor color{};
+    bool colorBuffer = false;
+    bool depthBuffer = false;
+};
+
 struct TextureDefinition
 {
     TextureData texture;
     uint64_t revision = 0;
 };
 
-using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw>;
+using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw, ClearDraw>;
 
 struct Frame
 {
@@ -198,6 +205,15 @@ void beginFrame(const Camera &camera, ClearColor clear)
     g_building.clear = clear;
     g_building.sequence = ++g_sequence;
     g_buildingOpen = true;
+}
+
+void clear(ClearColor clear, bool colorBuffer, bool depthBuffer)
+{
+    if (!active() || (!colorBuffer && !depthBuffer))
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_buildingOpen)
+        g_building.draws.emplace_back(ClearDraw{clear, colorBuffer, depthBuffer});
 }
 
 void defineMesh(MeshId id, const MeshData &mesh)
@@ -349,6 +365,8 @@ bool renderHostFrame()
                                                     screen->textureName, screen->state);
             }
         }
+        else if (const auto *clear = std::get_if<ClearDraw>(&draw))
+            g_renderer->clear(clear->color, clear->colorBuffer, clear->depthBuffer);
     }
     g_renderer->endFrame();
     return true;
