@@ -67,6 +67,14 @@ struct ScreenDrawState
     bool linearFilter = true;
 };
 
+struct MeshDrawState
+{
+    // Optional per-draw RenderWare material colours. Persona 3 mutates these
+    // for model fades/tints immediately before AtomicDefaultRenderCallBack,
+    // so they cannot be baked permanently into the cached GPU mesh.
+    std::vector<std::array<std::uint8_t, 4>> materialColors;
+};
+
 class Renderer
 {
 public:
@@ -83,8 +91,8 @@ public:
     virtual void removeMesh(MeshId id) = 0;
 
     virtual void beginFrame(const Camera &camera, ClearColor clear) = 0;
-    virtual void drawMesh(MeshId id, const Matrix4 &model) = 0;
-    void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix); }
+    virtual void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state = {}) = 0;
+    void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix, {}); }
     virtual void drawScreenTriangles(const std::vector<ScreenVertex> &vertices,
                                      float sourceWidth, float sourceHeight,
                                      std::string_view textureName = {},

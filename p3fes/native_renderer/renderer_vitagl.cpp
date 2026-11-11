@@ -49,7 +49,9 @@ struct DrawPart
     GLuint vertexBuffer = 0;
     GLuint indexBuffer = 0;
     GLsizei indexCount = 0;
+    std::array<std::uint8_t, 4> color{255, 255, 255, 255};
     std::string textureName;
+    std::uint32_t materialIndex = 0;
 };
 
 using Vec3 = std::array<float, 3>;
@@ -150,11 +152,6 @@ std::vector<std::uint16_t> triangleList(const MeshData &mesh, const Submesh &sub
             return {};
     }
     return out;
-}
-
-std::uint8_t modulate(std::uint8_t vertex, std::uint8_t material)
-{
-    return static_cast<std::uint8_t>((static_cast<std::uint32_t>(vertex) * material + 127u) / 255u);
 }
 
 void deleteParts(std::vector<DrawPart> &parts)
@@ -299,11 +296,11 @@ public:
                 continue;
             }
 
-            std::array<std::uint8_t, 4> materialColor{255, 255, 255, 255};
             DrawPart part;
+            part.materialIndex = submesh.materialIndex;
             if (!source.materials.empty())
             {
-                materialColor = source.materials[submesh.materialIndex].color;
+                part.color = source.materials[submesh.materialIndex].color;
                 part.textureName = source.materials[submesh.materialIndex].textureName;
             }
             std::vector<GpuVertex> vertices(source.vertices.size());
@@ -314,8 +311,7 @@ public:
                 std::copy(in.position.begin(), in.position.end(), out.position);
                 std::copy(in.normal.begin(), in.normal.end(), out.normal);
                 std::copy(in.texCoord.begin(), in.texCoord.end(), out.uv);
-                for (std::size_t channel = 0; channel < 4; ++channel)
-                    out.color[channel] = modulate(in.color[channel], materialColor[channel]);
+                std::copy(in.color.begin(), in.color.end(), out.color);
             }
 
             glGenBuffers(1, &part.vertexBuffer);
@@ -374,7 +370,7 @@ public:
         apply3D();
     }
 
-    void drawMesh(MeshId id, const Matrix4 &model) override
+    void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state) override
     {
         if (!m_in3D)
             apply3D();
@@ -386,13 +382,28 @@ public:
         glPushMatrix();
         glMultMatrixf(model.data());
         glEnableClientState(GL_VERTEX_ARRAY);
-        glEnableClientState(GL_COLOR_ARRAY);
         for (const DrawPart &part : found->second)
         {
             glBindBuffer(GL_ARRAY_BUFFER, part.vertexBuffer);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, part.indexBuffer);
             glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
-            glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
+            const auto &color = part.materialIndex < state.materialColors.size()
+                ? state.materialColors[part.materialIndex]
+                : part.color;
+            const bool whiteTint = color[0] == 255u && color[1] == 255u && color[2] == 255u && color[3] == 255u;
+            if (whiteTint)
+            {
+                glEnableClientState(GL_COLOR_ARRAY);
+                glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
+            }
+            else
+            {
+                // Fixed-function VitaGL has no extra material-colour uniform.
+                // Prefer the game's live material tint/fade on tinted draws;
+                // white draws keep the per-vertex prelight array above.
+                glDisableClientState(GL_COLOR_ARRAY);
+                glColor4ub(color[0], color[1], color[2], color[3]);
+            }
 
             auto texture = part.textureName.empty() ? m_textures.end() : m_textures.find(textureKey(part.textureName));
             if (texture != m_textures.end())
@@ -411,6 +422,7 @@ public:
         }
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);
+        glColor4ub(255u, 255u, 255u, 255u);
         glDisableClientState(GL_VERTEX_ARRAY);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);

@@ -179,6 +179,7 @@ namespace
     using p3fes::native_renderer::ClearColor;
     using p3fes::native_renderer::Matrix4;
     using p3fes::native_renderer::MeshData;
+    using p3fes::native_renderer::MeshDrawState;
     using p3fes::native_renderer::MeshId;
     using p3fes::native_renderer::ScreenVertex;
     using p3fes::native_renderer::ScreenBlend;
@@ -193,6 +194,27 @@ namespace
     uint32_t g_nativeErrors = 0u;
 
     bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture, uint64_t &revision);
+
+    void readNativeMeshDrawState(const uint8_t *rdram, uint32_t geometry, MeshDrawState &state)
+    {
+        uint32_t materialArray = 0u;
+        int32_t materialCount = 0;
+        if (!readGuest(rdram, geometry + kGeometryMatListArrayOffset, materialArray) ||
+            !readGuest(rdram, geometry + kGeometryMatListCountOffset, materialCount) ||
+            materialCount <= 0 || materialCount > 4096 ||
+            !guestPointer(materialArray, static_cast<uint32_t>(materialCount) * sizeof(uint32_t)))
+            return;
+        state.materialColors.assign(static_cast<size_t>(materialCount), {255u, 255u, 255u, 255u});
+        for (int32_t i = 0; i < materialCount; ++i)
+        {
+            uint32_t material = 0u;
+            if (!readGuest(rdram, materialArray + static_cast<uint32_t>(i) * 4u, material) ||
+                !material || !guestPointer(material, 8u))
+                continue;
+            std::memcpy(state.materialColors[static_cast<size_t>(i)].data(),
+                        rdram + material + kMaterialColorOffset, 4u);
+        }
+    }
 
     bool readVec3(const uint8_t *rdram, uint32_t address, std::array<float, 3> &out)
     {
@@ -384,7 +406,9 @@ namespace
         Matrix4 model{};
         if (!readFrameMatrix(rdram, summary.frame, model))
             return false;
-        p3fes_native_present::drawMesh(meshId, model);
+        MeshDrawState drawState;
+        readNativeMeshDrawState(rdram, summary.geometry, drawState);
+        p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
         return true;
     }
 

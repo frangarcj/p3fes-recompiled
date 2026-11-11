@@ -22,6 +22,7 @@ struct MeshDraw
 {
     MeshId id = 0;
     Matrix4 model = kIdentityMatrix;
+    MeshDrawState state{};
 };
 
 struct ScreenDraw
@@ -193,13 +194,13 @@ void defineTexture(const TextureData &texture, uint64_t revision)
     definition.revision = revision;
 }
 
-void drawMesh(MeshId id, const Matrix4 &model)
+void drawMesh(MeshId id, const Matrix4 &model, MeshDrawState state)
 {
     if (!active())
         return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_buildingOpen)
-        g_building.draws.emplace_back(MeshDraw{id, model});
+        g_building.draws.emplace_back(MeshDraw{id, model, std::move(state)});
 }
 
 void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, float sourceHeight,
@@ -260,7 +261,7 @@ bool renderHostFrame()
         if (const auto *mesh = std::get_if<MeshDraw>(&draw))
         {
             if (ensureMesh(mesh->id))
-                g_renderer->drawMesh(mesh->id, mesh->model);
+                g_renderer->drawMesh(mesh->id, mesh->model, mesh->state);
         }
         else if (const auto *screen = std::get_if<ScreenDraw>(&draw))
         {

@@ -80,6 +80,7 @@ struct DrawPart
     Mesh mesh{};
     std::array<std::uint8_t, 4> color{255, 255, 255, 255};
     std::string textureName;
+    std::uint32_t materialIndex = 0;
 };
 
 class RaylibRenderer final : public Renderer
@@ -216,6 +217,7 @@ public:
             }
 
             DrawPart part;
+            part.materialIndex = submesh.materialIndex;
             if (!source.materials.empty())
             {
                 part.color = source.materials[submesh.materialIndex].color;
@@ -278,7 +280,7 @@ public:
         m_in3D = true;
     }
 
-    void drawMesh(MeshId id, const Matrix4 &model) override
+    void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state) override
     {
         if (!m_in3D)
         {
@@ -296,7 +298,10 @@ public:
             std::copy_n(m_material.maps, kMaterialMapCount, maps.data());
             drawMaterial.maps = maps.data();
             MaterialMap &diffuse = drawMaterial.maps[MATERIAL_MAP_DIFFUSE];
-            diffuse.color = {part.color[0], part.color[1], part.color[2], part.color[3]};
+            const auto &color = part.materialIndex < state.materialColors.size()
+                ? state.materialColors[part.materialIndex]
+                : part.color;
+            diffuse.color = {color[0], color[1], color[2], color[3]};
             if (!part.textureName.empty())
             {
                 auto texture = m_textures.find(textureKey(part.textureName));

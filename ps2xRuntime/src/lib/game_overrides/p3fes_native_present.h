@@ -26,7 +26,7 @@ bool active();
 void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
 void defineMesh(nr::MeshId id, const nr::MeshData &mesh);
 void defineTexture(const nr::TextureData &texture, uint64_t revision);
-void drawMesh(nr::MeshId id, const nr::Matrix4 &model);
+void drawMesh(nr::MeshId id, const nr::Matrix4 &model, nr::MeshDrawState state = {});
 void drawScreenTriangles(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight,
                          std::string textureName = {}, nr::ScreenDrawState state = {});
 void drawScreenLines(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight,
