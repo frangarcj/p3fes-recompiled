@@ -38,6 +38,31 @@ namespace
 {
     std::atomic<uint32_t> g_shownHist[8];
     std::atomic<uint32_t> g_swaps{0}, g_shown{0}; // pictures handed to vitaGL / to the display
+    std::vector<uint32_t> g_softwareDisplay[3];
+    unsigned g_softwareDisplayIndex = 0u;
+}
+
+extern "C" int ps2x_vita_present_software_frame_rgba(const uint8_t *rgba, unsigned width, unsigned height)
+{
+    if (!rgba || width == 0u || height == 0u)
+        return -1;
+
+    // Vita display buffers may be smaller than the panel resolution (the SDK
+    // accepts any surface >= 480x272). Let the display scaler handle Sofdec's
+    // native 640x448 image instead of spending the EE thread on a 960x544
+    // nearest-neighbour resample every movie frame.
+    std::vector<uint32_t> &buffer = g_softwareDisplay[g_softwareDisplayIndex++ % 3u];
+    buffer.resize(static_cast<size_t>(width) * height);
+    std::memcpy(buffer.data(), rgba, static_cast<size_t>(width) * height * 4u);
+
+    SceDisplayFrameBuf frame{};
+    frame.size = sizeof(frame);
+    frame.base = buffer.data();
+    frame.pitch = width;
+    frame.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
+    frame.width = width;
+    frame.height = height;
+    return sceDisplaySetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME);
 }
 
 // Round 110 (SOTC_PACE110): each picture shown on the refresh its game time

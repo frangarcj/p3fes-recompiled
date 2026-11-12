@@ -75,6 +75,7 @@ struct Frame
 };
 
 std::atomic<bool> g_active{false};
+std::atomic<bool> g_hostPresentationPaused{false};
 std::mutex g_mutex;
 Frame g_building;
 bool g_buildingOpen = false;
@@ -193,6 +194,20 @@ bool active()
     return g_active.load(std::memory_order_acquire);
 }
 
+void setHostPresentationPaused(bool paused)
+{
+    const bool wasPaused = g_hostPresentationPaused.exchange(paused, std::memory_order_acq_rel);
+    if (paused != wasPaused)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        // Drop a frame recorded on the other side of the presentation mode
+        // switch. During Sofdec the producer keeps ending frames so its command
+        // memory stays bounded, but those frames must never be replayed after
+        // the software-display path hands control back to vitaGL.
+        g_pending.reset();
+    }
+}
+
 void beginFrame(const Camera &camera, ClearColor clear)
 {
     if (!active())
@@ -302,17 +317,23 @@ void endFrame()
 
 bool renderHostFrame()
 {
-    if (!active())
+    if (!active() || g_hostPresentationPaused.load(std::memory_order_acquire))
         return false;
+    bool haveNewFrame = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_pending)
         {
             g_hostFrame = std::move(g_pending);
             g_pending.reset();
+            haveNewFrame = true;
         }
     }
-    if (!g_hostFrame || !ensureRenderer())
+    // The display keeps showing the last swapped buffer until another one is
+    // submitted. Replaying g_hostFrame here would swap the same picture at the
+    // host thread's rate even when the game produced no new frame, needlessly
+    // filling Vita's/Vita3K's GXM display queue.
+    if (!haveNewFrame || !g_hostFrame || !ensureRenderer())
         return false;
 
     const Frame &frame = *g_hostFrame;
@@ -391,6 +412,7 @@ void shutdownHost()
         g_buildingOpen = false;
     }
     g_active.store(false, std::memory_order_release);
+    g_hostPresentationPaused.store(false, std::memory_order_release);
     ps2x::gs::setPrimitiveRasterSuppressed(false);
 }
 } // namespace p3fes_native_present

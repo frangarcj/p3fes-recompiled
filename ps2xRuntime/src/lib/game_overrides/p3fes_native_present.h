@@ -23,6 +23,7 @@ namespace nr = p3fes::native_renderer;
 // Producer side (guest GameThread): CPU-only command recording.
 void setActive(bool active);
 bool active();
+void setHostPresentationPaused(bool paused);
 void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
 void clear(nr::ClearColor clear, bool colorBuffer, bool depthBuffer);
 void defineMesh(nr::MeshId id, const nr::MeshData &mesh);

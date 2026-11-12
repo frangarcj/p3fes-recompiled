@@ -16,11 +16,13 @@
 #include "runtime/ps2_memory.h"
 #if !defined(__ANDROID__)
 #include "native_renderer/renderer.h"
+#include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -30,6 +32,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(PLATFORM_VITA)
+extern "C" int ps2x_vita_present_software_frame_rgba(const uint8_t *rgba, unsigned width, unsigned height);
+#endif
 
 namespace
 {
@@ -114,6 +120,19 @@ namespace
     constexpr uint32_t kCameraFogPlaneOffset = 0x88u;
     constexpr uint32_t kRwCameraClear = 0x004C9E90u;
     constexpr uint32_t kRwCameraShowRaster = 0x004C9ED0u;
+    // K_SPipe_UpdateShadowNodeTask starts its pass by clearing the main camera
+    // and resumes here. Some field/shadow paths never call ShowRaster. Use this
+    // clear as a fallback boundary, but at most once per PS2 vblank: the task
+    // can spin through many shadow clears inside one field and flushing each
+    // one overwhelms Vita3K's GXM queue.
+    constexpr uint32_t kShadowNodeClearReturn = 0x00199774u;
+    constexpr auto kShadowFallbackPeriod = std::chrono::microseconds(16667);
+    // H_SfdPlay_UpdateTask drives Sofdec outside the normal root ShowRaster
+    // task.  Hook its entry as the movie-frame boundary: only the 0x10A860
+    // entry slot is replaced, so internal resumptions at later PCs continue to
+    // dispatch straight to the generated function instead of re-entering us.
+    constexpr uint32_t kSofdecUpdateTask = 0x0010A860u;
+    constexpr uint32_t kSofdecDestroyTask = 0x0010BB00u;
     constexpr uint32_t kPtankAtomicRender = 0x00474160u;
     constexpr uint32_t kRwIm3DTransform = 0x004F1ED0u;
     constexpr uint32_t kRwIm3DEnd = 0x004F1F80u;
@@ -166,6 +185,8 @@ namespace
     std::atomic<PS2Runtime::RecompiledFunction> g_originalSectorRender{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalCameraClear{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalShowRaster{nullptr};
+    std::atomic<PS2Runtime::RecompiledFunction> g_originalSofdecUpdateTask{nullptr};
+    std::atomic<PS2Runtime::RecompiledFunction> g_originalSofdecDestroyTask{nullptr};
     std::atomic<bool> g_nativeEnabled{false};
     std::atomic<bool> g_diagEnabled{false};
     std::atomic<bool> g_diagPrinted{false};
@@ -295,6 +316,8 @@ namespace
     std::unordered_map<uint32_t, uint64_t> g_rasterRevisions;
     std::unordered_map<uint32_t, std::string> g_frameRasterTextures;
     bool g_nativeFrameActive = false;
+    uint64_t g_shadowBoundaryVsync = ~uint64_t{0};
+    std::chrono::steady_clock::time_point g_shadowBoundaryTime{};
     uint32_t g_nativeErrors = 0u;
 
     bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture, uint64_t &revision);
@@ -1304,21 +1327,17 @@ namespace
     {
         float x, y, z, cameraZ;
         float u, v, recipZ, pad;
-        float r, g, b, a;
-        float extra[4];
+        // RenderWare's PS2 vertex keeps each RGBA channel as a 32-bit integer,
+        // not a float (matching librw's ps2::Im2DVertex). Persona 3's Sky
+        // driver uses a 64-byte stride, with one extra qword after RGBA.
+        uint32_t r, g, b, a;
+        uint32_t extra[4];
     };
     static_assert(sizeof(RwIm2DVertex) == 64u);
 
     uint32_t reg32(const R5900Context *ctx, uint32_t reg)
     {
         return static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[reg]));
-    }
-
-    uint8_t colorByte(float v)
-    {
-        if (!std::isfinite(v))
-            return 0u;
-        return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v)), 0, 255));
     }
 
     bool readIm2DVertex(const uint8_t *rdram, uint32_t base, uint32_t index, ScreenVertex &out)
@@ -1335,7 +1354,10 @@ namespace
         out.z = in.z;
         out.u = std::isfinite(in.u) ? in.u : 0.0f;
         out.v = std::isfinite(in.v) ? in.v : 0.0f;
-        out.color = {colorByte(in.r), colorByte(in.g), colorByte(in.b), colorByte(in.a)};
+        out.color = {static_cast<uint8_t>(std::min(in.r, 255u)),
+                     static_cast<uint8_t>(std::min(in.g, 255u)),
+                     static_cast<uint8_t>(std::min(in.b, 255u)),
+                     static_cast<uint8_t>(std::min(in.a, 255u))};
         return true;
     }
 
@@ -1452,6 +1474,167 @@ namespace
         }
     }
 
+    bool decodeGsResidentRaster(PS2Runtime *runtime, const uint8_t *rdram, uint32_t raster,
+                                TextureData &texture)
+    {
+        if (!runtime)
+            return false;
+
+        RasterSummary info;
+        if (!inspectRaster(rdram, raster, info) || info.width <= 0 || info.height <= 0 ||
+            info.width > 4096 || info.height > 4096)
+            return false;
+        const uint32_t type = info.type & 0x07u;
+        if ((type != 4u && type != 5u) || info.pixels != 0u)
+            return false;
+
+        uint32_t pluginOffset = 0u, tex0 = 0u;
+        if (!readGuest(rdram, kRwRasterPluginOffset, pluginOffset) || !pluginOffset ||
+            !guestPointer(raster + pluginOffset, 12u) ||
+            !readGuest(rdram, raster + pluginOffset + 8u, tex0))
+            return false;
+
+        const uint32_t tbp0 = tex0 & 0x3FFFu;
+        const uint32_t tbw = (tex0 >> 14u) & 0x3Fu;
+        const uint32_t psm = (tex0 >> 20u) & 0x3Fu;
+        if (tbw == 0u || (psm != GS_PSM_CT32 && psm != GS_PSM_CT24 &&
+                          psm != GS_PSM_CT16 && psm != GS_PSM_CT16S))
+            return false;
+
+        // Sofdec's RenderWare raster is GPU-resident: its public pixels/stride
+        // fields stay null while the sky raster plugin keeps the GS TEX0. Reuse
+        // the GS backend's synchronized snapshot and the runtime's existing GS
+        // swizzle readers instead of adding a second MPEG/video path.
+#if defined(PLATFORM_VITA)
+        // Vita uses the synchronous CPU GS backend by default, so its external
+        // 4 MiB store is already authoritative here on the EE thread. Reading
+        // it in place avoids copying all of VRAM for every movie frame.
+        const uint8_t *vram = runtime->memory().getGSVRAM();
+        if (!vram)
+            return false;
+#else
+        runtime->gs().refreshDisplaySnapshot();
+        uint32_t vramSize = 0u;
+        const uint8_t *vram = runtime->gs().lockDisplaySnapshot(vramSize);
+        if (!vram || vramSize < GSMem::MEMORY_SIZE)
+        {
+            runtime->gs().unlockDisplaySnapshot();
+            return false;
+        }
+#endif
+
+        texture.name = rasterTextureName(raster);
+        texture.width = static_cast<uint32_t>(info.width);
+        texture.height = static_cast<uint32_t>(info.height);
+        texture.rgba.resize(static_cast<size_t>(info.width) * static_cast<size_t>(info.height) * 4u);
+        uint8_t *mutableVram = const_cast<uint8_t *>(vram);
+        for (int32_t y = 0; y < info.height; ++y)
+        {
+            for (int32_t x = 0; x < info.width; ++x)
+            {
+                uint32_t packed = 0u;
+                switch (psm)
+                {
+                case GS_PSM_CT32:
+                    packed = GSMem::ReadCT32(mutableVram, tbp0, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                    break;
+                case GS_PSM_CT24:
+                    packed = GSMem::ReadCT24(mutableVram, tbp0, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                    break;
+                case GS_PSM_CT16:
+                    packed = GSMem::ReadCT16(mutableVram, tbp0, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                    break;
+                case GS_PSM_CT16S:
+                    packed = GSMem::ReadCT16S(mutableVram, tbp0, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                    break;
+                }
+
+                std::array<uint8_t, 4> color{};
+                if (psm == GS_PSM_CT32)
+                {
+                    color = {static_cast<uint8_t>(packed), static_cast<uint8_t>(packed >> 8u),
+                             static_cast<uint8_t>(packed >> 16u),
+                             static_cast<uint8_t>(std::min(255u, ((packed >> 24u) & 0xFFu) * 2u))};
+                }
+                else if (psm == GS_PSM_CT24)
+                    color = {static_cast<uint8_t>(packed), static_cast<uint8_t>(packed >> 8u),
+                             static_cast<uint8_t>(packed >> 16u), 255u};
+                else
+                    color = decodeRasterColor16(static_cast<uint16_t>(packed), info.format);
+                std::memcpy(texture.rgba.data() +
+                                (static_cast<size_t>(y) * static_cast<size_t>(info.width) + static_cast<size_t>(x)) * 4u,
+                            color.data(), 4u);
+            }
+        }
+#if !defined(PLATFORM_VITA)
+        runtime->gs().unlockDisplaySnapshot();
+#endif
+        return true;
+    }
+
+    bool queueSofdecRaster(uint8_t *rdram, PS2Runtime *runtime, uint32_t raster)
+    {
+        static TextureData texture;
+        static uint64_t revision = 0u;
+        if (!decodeGsResidentRaster(runtime, rdram, raster, texture))
+            return false;
+        ++revision;
+        if (revision == 0u)
+            revision = 1u;
+
+#if defined(PLATFORM_VITA)
+        return ps2x_vita_present_software_frame_rgba(texture.rgba.data(), texture.width, texture.height) >= 0;
+#else
+
+        if (!g_nativeFrameActive)
+        {
+            Camera camera;
+            if (!readCurrentCamera(rdram, camera))
+                camera = {};
+            p3fes_native_present::beginFrame(camera, ClearColor{});
+            g_nativeFrameActive = true;
+        }
+
+        const std::string textureName = texture.name;
+        p3fes_native_present::defineTexture(texture, revision);
+        g_rasterRevisions[raster] = revision;
+
+        std::vector<ScreenVertex> vertices(6u);
+        const float width = static_cast<float>(texture.width);
+        const float height = static_cast<float>(texture.height);
+        const std::array<uint8_t, 4> white{255u, 255u, 255u, 255u};
+        vertices[0] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, white};
+        vertices[1] = {width, 0.0f, 0.0f, 1.0f, 0.0f, white};
+        vertices[2] = {width, height, 0.0f, 1.0f, 1.0f, white};
+        vertices[3] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, white};
+        vertices[4] = {width, height, 0.0f, 1.0f, 1.0f, white};
+        vertices[5] = {0.0f, height, 0.0f, 0.0f, 1.0f, white};
+        ScreenDrawState state;
+        state.blend = ScreenBlend::Opaque;
+        state.clampU = true;
+        state.clampV = true;
+        state.linearFilter = true;
+        p3fes_native_present::drawScreenTriangles(std::move(vertices), width, height, textureName, state);
+        return true;
+#endif
+    }
+
+    // RenderWare's PS2 driver does not store PAL4/PAL8 CPU backing data in GS
+    // local-memory page order. Its SWIZZLED4/SWIZZLED8 representation uses this
+    // four-row permutation so the upload can be submitted as PSMCT16/PSMCT32
+    // at half dimensions. Adapted from aap/librw src/ps2/ps2raster.cpp
+    // (unswizzleRaster, commit 18532c2e13efbc1aa43f0b00b4459831f9414de0).
+    uint32_t rwPs2SwizzledIndex(uint32_t x, uint32_t y, uint32_t logWidth)
+    {
+        const uint32_t y1 = (y >> 1u) & 1u;
+        const uint32_t y2 = (y >> 2u) & 1u;
+        x ^= (y1 ^ y2) << 2u;
+        const uint32_t nx = (x & 7u) | ((x >> 1u) & ~7u);
+        const uint32_t ny = (y & 1u) | ((y >> 1u) & ~1u);
+        const uint32_t n = y1 | (((x >> 3u) & 1u) << 1u);
+        return n | (nx << 2u) | (ny << (logWidth + 1u));
+    }
+
     bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture, uint64_t &revision)
     {
         RasterSummary info;
@@ -1465,12 +1648,10 @@ namespace
 
         uint32_t pluginOffset = 0u;
         uint8_t cacheFlags = 0u;
-        uint32_t tex0 = 0u;
         if (readGuest(rdram, kRwRasterPluginOffset, pluginOffset) && pluginOffset &&
             guestPointer(raster + pluginOffset, 55u))
         {
             readGuest(rdram, raster + pluginOffset + 54u, cacheFlags);
-            readGuest(rdram, raster + pluginOffset + 8u, tex0);
         }
         const bool swizzled8 = (cacheFlags & 0x02u) != 0u;
         const bool swizzled4 = (cacheFlags & 0x04u) != 0u;
@@ -1509,8 +1690,15 @@ namespace
         texture.height = static_cast<uint32_t>(info.height);
         texture.rgba.resize(static_cast<size_t>(info.width) * static_cast<size_t>(info.height) * 4u);
 
-        const uint32_t tex0Tbw = (tex0 >> 14u) & 0x3Fu;
-        const uint32_t tbw = tex0Tbw != 0u ? tex0Tbw : std::max(1u, (static_cast<uint32_t>(info.width) + 63u) / 64u);
+        uint32_t swizzledWidth = static_cast<uint32_t>(info.width);
+        if (swizzled8)
+            swizzledWidth = std::max(swizzledWidth, 16u);
+        else if (swizzled4)
+            swizzledWidth = std::max(swizzledWidth, 32u);
+        uint32_t swizzledLogWidth = 0u;
+        for (uint32_t w = 1u; w < swizzledWidth; w <<= 1u)
+            ++swizzledLogWidth;
+        const uint32_t swizzledMask = (1u << (swizzledLogWidth + 2u)) - 1u;
         for (int32_t y = 0; y < info.height; ++y)
         {
             const uint64_t rowOffset = static_cast<uint64_t>(static_cast<uint32_t>(y)) *
@@ -1524,31 +1712,30 @@ namespace
                 if (info.depth == 4 || info.depth == 8)
                 {
                     uint32_t index = 0u;
-                    if (swizzled8)
+                    if (swizzled8 || swizzled4)
                     {
-                        const uint32_t byteOffset = GSPSMT8::addrPSMT8(0u, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
-                        const uint64_t address = static_cast<uint64_t>(info.pixels) + byteOffset;
-                        if (address >= PS2_RAM_SIZE)
-                            return false;
-                        index = rdram[static_cast<uint32_t>(address)];
-                    }
-                    else if (swizzled4)
-                    {
-                        const uint32_t nibbleOffset = GSPSMT4::addrPSMT4(0u, tbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
-                        const uint32_t byteOffset = nibbleOffset >> 1u;
-                        const uint64_t address = static_cast<uint64_t>(info.pixels) + byteOffset;
+                        const uint32_t groupY = static_cast<uint32_t>(y) & ~3u;
+                        const uint32_t swizzled = rwPs2SwizzledIndex(static_cast<uint32_t>(x),
+                                                                     static_cast<uint32_t>(y),
+                                                                     swizzledLogWidth) & swizzledMask;
+                        const uint64_t address = static_cast<uint64_t>(info.pixels) +
+                                                 (swizzled8
+                                                      ? static_cast<uint64_t>(groupY) * swizzledWidth + swizzled
+                                                      : (static_cast<uint64_t>(groupY) * swizzledWidth + swizzled) / 2u);
                         if (address >= PS2_RAM_SIZE)
                             return false;
                         const uint8_t packed = rdram[static_cast<uint32_t>(address)];
-                        index = (nibbleOffset & 1u) ? (packed >> 4u) : (packed & 0x0Fu);
+                        index = swizzled8 ? packed
+                                          : ((swizzled & 1u) ? (packed >> 4u) : (packed & 0x0Fu));
                     }
                     else
                         index = info.depth == 8 ? src[x]
                             : ((x & 1) ? (src[x >> 1] >> 4u) : (src[x >> 1] & 0x0Fu));
-                    // The sky driver keeps 256-entry CLUTs in GS CSM1 order
-                    // (middle index bits swapped); 16-entry CLUTs stay linear.
+                    // PAL8 palettes are stored in CSM1 order by the PS2 driver;
+                    // PAL4 palettes stay linear. This is the same 0x08/0x10
+                    // bit exchange used by RenderWare's convertPalette().
                     if (info.depth == 8)
-                        index = (index & 0xE7u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
+                        index = (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
                     if (paletteEntryBytes == 2u)
                     {
                         uint16_t packed = 0u;
@@ -2231,11 +2418,67 @@ namespace
             original(rdram, ctx, runtime);
     }
 
+    void p3fesSofdecUpdateTask(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+#if !defined(__ANDROID__)
+        if (ctx && g_nativeEnabled.load(std::memory_order_relaxed))
+        {
+            const uint32_t task = reg32(ctx, 4u);
+            uint32_t state = 0u, raster = 0u;
+            int16_t phase = -1;
+            if (guestPointer(task + 60u, sizeof(uint32_t)) && readGuest(rdram, task + 60u, state) && state)
+            {
+                readGuest(rdram, state + 208u, raster);
+                readGuest(rdram, state + 484u, phase);
+            }
+
+            const bool activeMovie = phase == 3 || phase == 4;
+            p3fes_native_present::setHostPresentationPaused(activeMovie);
+            if (activeMovie)
+            {
+                if (raster)
+                    queueSofdecRaster(rdram, runtime, raster);
+                // Close the producer frame on every Sofdec tick even when Vita
+                // presents the movie through sceDisplaySetFrameBuf. The host
+                // renderer is paused, so this cannot emit a GXM swap; endFrame
+                // merely replaces the single pending frame and prevents the
+                // command vector from growing for the duration of the movie.
+                finishNativeFrame(runtime);
+            }
+        }
+#endif
+        if (PS2Runtime::RecompiledFunction original = g_originalSofdecUpdateTask.load(std::memory_order_acquire))
+            original(rdram, ctx, runtime);
+    }
+
+    void p3fesSofdecDestroyTask(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+#if !defined(__ANDROID__)
+        p3fes_native_present::setHostPresentationPaused(false);
+#endif
+        if (PS2Runtime::RecompiledFunction original = g_originalSofdecDestroyTask.load(std::memory_order_acquire))
+            original(rdram, ctx, runtime);
+    }
+
     void p3fesRwCameraClear(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
 #if !defined(__ANDROID__)
         if (ctx && g_nativeEnabled.load(std::memory_order_relaxed))
         {
+            if (runtime && reg32(ctx, 31u) == kShadowNodeClearReturn)
+            {
+                const uint64_t vsync = runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed);
+                const auto now = std::chrono::steady_clock::now();
+                const bool tickAdvanced = vsync != g_shadowBoundaryVsync;
+                const bool hostDeadline = g_shadowBoundaryTime.time_since_epoch().count() != 0 &&
+                                          now - g_shadowBoundaryTime >= kShadowFallbackPeriod;
+                if (tickAdvanced || hostDeadline)
+                {
+                    finishNativeFrame(runtime);
+                    g_shadowBoundaryVsync = vsync;
+                    g_shadowBoundaryTime = now;
+                }
+            }
             const uint32_t camera = reg32(ctx, 4u);
             const uint32_t colorAddress = reg32(ctx, 5u);
             const uint32_t flags = reg32(ctx, 6u);
@@ -2289,6 +2532,8 @@ namespace
         g_ptankDiagPrinted.store(false, std::memory_order_relaxed);
         g_im3dDiagPrinted.store(false, std::memory_order_relaxed);
         g_clearDiagPrinted.store(false, std::memory_order_relaxed);
+        g_shadowBoundaryVsync = ~uint64_t{0};
+        g_shadowBoundaryTime = {};
         g_nativeIm3D = {};
         g_originalAtomicRender.store(original, std::memory_order_release);
         const bool replaced = runtime.replaceFunction(kAtomicDefaultRenderCallBack, &p3fesAtomicDefaultRender);
@@ -2315,6 +2560,18 @@ namespace
                                    runtime.replaceFunction(kRwCameraClear, &p3fesRwCameraClear);
             if (clearHook)
                 g_originalCameraClear.store(clear, std::memory_order_release);
+            PS2Runtime::RecompiledFunction sofdecUpdate = runtime.lookupFunction(kSofdecUpdateTask);
+            if (sofdecUpdate && sofdecUpdate != &p3fesSofdecUpdateTask)
+            {
+                g_originalSofdecUpdateTask.store(sofdecUpdate, std::memory_order_release);
+                runtime.replaceFunction(kSofdecUpdateTask, &p3fesSofdecUpdateTask);
+            }
+            PS2Runtime::RecompiledFunction sofdecDestroy = runtime.lookupFunction(kSofdecDestroyTask);
+            if (sofdecDestroy && sofdecDestroy != &p3fesSofdecDestroyTask)
+            {
+                g_originalSofdecDestroyTask.store(sofdecDestroy, std::memory_order_release);
+                runtime.replaceFunction(kSofdecDestroyTask, &p3fesSofdecDestroyTask);
+            }
             PS2Runtime::RecompiledFunction show = runtime.lookupFunction(kRwCameraShowRaster);
             if (show && show != &p3fesRwCameraShowRaster)
             {
