@@ -10,10 +10,12 @@
 // were live together. Keep enough headroom for the same workload here.
 extern "C" unsigned int _newlib_heap_size_user = 176u * 1024u * 1024u;
 extern "C" unsigned int sceLibcHeapSize = 8u * 1024u * 1024u;
-// Recompiled guest code can nest native C++ calls deeply. VitaSDK's default
-// main-thread stack is too small for that pattern; Celosia uses 8 MB.
-extern "C" unsigned int sceUserMainThreadStackSize = 8u * 1024u * 1024u;
-extern "C" unsigned int _pthread_stack_default_user = 32u * 1024u;
+// Recompiled guest code can nest native C++ calls deeply. Give both the main
+// thread and native pthreads substantially more headroom than VitaSDK's small
+// defaults; the runtime has several C++/renderer call chains that are unsafe on
+// a 32 KiB pthread stack.
+extern "C" unsigned int sceUserMainThreadStackSize = 16u * 1024u * 1024u;
+extern "C" unsigned int _pthread_stack_default_user = 256u * 1024u;
 
 // Celosia's host shim calls this optional runtime hook once every few seconds.
 // Persona 3 does not yet have Celosia's emergency-heap controller, so keep the
