@@ -12,6 +12,9 @@ if(CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi")
         PLATFORM_VITA
         PS2X_VITA_SDL2_SHIM=1)
     target_compile_features(p3fes_native_renderer_vita PUBLIC cxx_std_20)
+    if(PS2X_P3FES_FRAME_TRACE)
+        target_compile_definitions(p3fes_native_renderer_vita PRIVATE PS2X_P3FES_FRAME_TRACE=1)
+    endif()
     add_library(p3fes_native_renderer_platform ALIAS p3fes_native_renderer_vita)
 elseif(NOT ANDROID)
     add_library(p3fes_native_renderer_desktop STATIC

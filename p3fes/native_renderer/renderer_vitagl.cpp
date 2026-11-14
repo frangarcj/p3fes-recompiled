@@ -4,22 +4,37 @@
 #include "lighting.h"
 #include "skinning.h"
 #include "uv_transform.h"
+#include "mesh_compaction.h"
+#include "static_vertex_cache.h"
+#include "mesh_regen.h"
+#include "gpu_skin_batches.h"
+#include "screen_batch.h"
+#if defined(PS2X_P3FES_FRAME_TRACE)
+#include "../../ps2xRuntime/src/lib/game_overrides/p3fes_frame_trace.h"
+#endif
 
 #include <raylib.h>
 #include <vitaGL.h>
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,20 +47,109 @@ namespace p3fes::native_renderer
 {
 namespace
 {
-struct GpuVertex
+// Position, uv, colour: the CPU shading never needs the normal in the vertex buffer (see mesh_regen.h).
+using GpuVertex = detail::MeshGpuVertex;
+
+struct GpuSkinVertex
 {
     float position[3];
     float normal[3];
     float uv[2];
     std::uint8_t color[4];
+    std::uint8_t bones[4];
+    float weights[4];
 };
 
-struct ScreenGpuVertex
+struct GpuSkinPart
 {
-    float x, y, z;
-    float u, v;
-    std::uint8_t r, g, b, a;
+    GLuint vertexBuffer = 0;
+    GLuint indexBuffer = 0;
+    GLsizei indexCount = 0;
+    std::vector<std::uint8_t> paletteBones;
 };
+
+bool resourceDiagEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_RESOURCE_DIAG");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
+// P3FES_MESH_FAST=0: scalar reference regeneration (skinning.h / lighting.h) instead of the NEON kernel.
+// P3FES_MESH_REUSE=0: skinned parts regenerate every draw (the cache only serves unskinned parts).
+bool meshFastRegenEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_FAST");
+        return !(value && *value == '0');
+    }();
+    return enabled;
+}
+
+bool gpuSkinDbgRigidOnly()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_GPU_SKIN_DBG");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
+bool meshVerifyEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_VERIFY");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
+bool meshBenchEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_BENCH");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
+bool meshReuseEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_REUSE");
+        return !(value && *value == '0');
+    }();
+    return enabled;
+}
+
+// ScreenVertex already has the client-array layout required by vitaGL.
+// Keep frame-owned data intact and let glDrawArrays consume it directly.
+static_assert(std::is_standard_layout_v<ScreenVertex> && sizeof(ScreenVertex) == 24u &&
+              offsetof(ScreenVertex, x) == 0u && offsetof(ScreenVertex, u) == 12u &&
+              offsetof(ScreenVertex, color) == 20u);
+
+struct FitViewport
+{
+    int x = 0;
+    int y = 0;
+    int width = 1;
+    int height = 1;
+};
+
+FitViewport fitViewport(float sourceWidth, float sourceHeight)
+{
+    const int hostWidth = std::max(GetScreenWidth(), 1);
+    const int hostHeight = std::max(GetScreenHeight(), 1);
+    if (!(sourceWidth > 0.0f) || !(sourceHeight > 0.0f))
+        return {0, 0, hostWidth, hostHeight};
+
+    const float scale = std::min(hostWidth / sourceWidth, hostHeight / sourceHeight);
+    const int width = std::clamp(static_cast<int>(std::lround(sourceWidth * scale)), 1, hostWidth);
+    const int height = std::clamp(static_cast<int>(std::lround(sourceHeight * scale)), 1, hostHeight);
+    return {(hostWidth - width) / 2, (hostHeight - height) / 2, width, height};
+}
 
 struct DrawPart
 {
@@ -58,10 +162,25 @@ struct DrawPart
     Material material{};
     std::vector<Vertex> sourceVertices;
     std::vector<GpuVertex> gpuVertices;
+    std::vector<GpuSkinPart> gpuSkinParts;
+    detail::StaticVertexCacheKey staticVertexCache;
+    std::vector<std::uint8_t> usedBones; // skinned: bones with a usable weight in this part
+    detail::SkinLayout skinLayout;       // skinned: rigid runs per bone, then blended vertices (mesh_regen.h)
     bool lighting = false;
     bool hasPrelight = false;
     bool hasNormals = false;
     bool skinned = false;
+};
+
+struct SkinProgram
+{
+    GLuint program = 0;
+    GLint mvp = -1, modelRows = -1, skinRows = -1, skinCount = -1;
+    GLint uvRows = -1, materialColor = -1, materialTerms = -1, ambient = -1;
+    GLint directionalCount = -1, directionalDirections = -1, directionalColors = -1;
+    GLint localCount = -1, localPositions = -1, localDirections = -1, localCones = -1, localColors = -1;
+    GLint sampler = -1, useTexture = -1, alphaEnabled = -1, alphaFunction = -1, alphaReference = -1;
+    GLint fogEnabled = -1, fogRange = -1, fogColor = -1;
 };
 
 using Vec3 = std::array<float, 3>;
@@ -194,6 +313,290 @@ Vec3 normalized(const Vec3 &v)
     return {v[0] / length, v[1] / length, v[2] / length};
 }
 
+const char *kGpuSkinVertexCg = R"(
+float3 safeNormalize(float3 v, float3 fallback)
+{
+    float n2 = dot(v, v);
+    return n2 > 1.0e-16 ? v * rsqrt(n2) : fallback;
+}
+void main(float3 aPos, float3 aNormal, float2 aTex,
+          float4 aColor, float4 aBones, float4 aWeights,
+          uniform float4 uMVP[4], uniform float4 uModelRows[3],
+          uniform float4 uSkinRows[72], uniform int uSkinCount,
+          uniform float4 uUvRows[2], uniform float4 uMaterialColor,
+          uniform float4 uMaterialTerms, uniform float4 uAmbient,
+          uniform int uDirectionalCount, uniform float4 uDirectionalDirections[4],
+          uniform float4 uDirectionalColors[4], uniform int uLocalCount,
+          uniform float4 uLocalPositions[4], uniform float4 uLocalDirections[4],
+          uniform float4 uLocalCones[4], uniform float4 uLocalColors[4],
+          float4 out oPosition : POSITION, float2 out vTex : TEXCOORD0,
+          float4 out vColor : COLOR)
+{
+    float3 p = aPos;
+    float3 n = aNormal;
+    float weightSum = 0.0;
+    float3 skinnedPosition = float3(0.0, 0.0, 0.0);
+    float3 skinnedNormal = float3(0.0, 0.0, 0.0);
+@@SKIN_LOOP@@
+    if (weightSum > 1.0e-8)
+    {
+        p = skinnedPosition / weightSum;
+        if (dot(skinnedNormal, skinnedNormal) > 1.0e-16)
+            n = safeNormalize(skinnedNormal, n);
+    }
+
+    float4 p4 = float4(p, 1.0);
+    float4 clip;
+    clip.x = dot(uMVP[0], p4);
+    clip.y = dot(uMVP[1], p4);
+    clip.z = dot(uMVP[2], p4);
+    clip.w = dot(uMVP[3], p4);
+    oPosition = clip;
+
+    float2 uv;
+    uv.x = dot(uUvRows[0].xy, aTex) + uUvRows[0].z;
+    uv.y = dot(uUvRows[1].xy, aTex) + uUvRows[1].z;
+    vTex = uv;
+
+    float3 transformedNormal = float3(dot(uModelRows[0].xyz, n),
+                                     dot(uModelRows[1].xyz, n),
+                                     dot(uModelRows[2].xyz, n));
+    float3 worldNormal = dot(transformedNormal, transformedNormal) > 1.0e-16
+        ? safeNormalize(transformedNormal, transformedNormal) : transformedNormal;
+    float3 worldPos = float3(dot(uModelRows[0], p4),
+                             dot(uModelRows[1], p4),
+                             dot(uModelRows[2], p4));
+    float3 rgb = float3(0.0, 0.0, 0.0);
+    if (uDirectionalCount >= 0)
+    {
+        rgb += aColor.rgb * uAmbient.w;
+        rgb += uAmbient.rgb;
+        for (int light = 0; light < 4; ++light)
+        {
+            if (light < uDirectionalCount)
+            {
+                float diffuse = max(0.0, -dot(worldNormal, uDirectionalDirections[light].xyz));
+                rgb += diffuse * uDirectionalColors[light].rgb * uMaterialTerms.y;
+            }
+        }
+        for (int light = 0; light < 4; ++light)
+        {
+            if (light < uLocalCount)
+            {
+                float3 delta = worldPos - uLocalPositions[light].xyz;
+                float distance = length(delta);
+                float radius = uLocalPositions[light].w;
+                if (distance > 1.0e-8 && radius > 1.0e-8)
+                {
+                    float3 direction = delta / distance;
+                    float attenuation = max(0.0, 1.0 - distance / radius);
+                    float diffuse = max(0.0, -dot(worldNormal, direction));
+                    float kind = uLocalDirections[light].w;
+                    if (kind > 0.5)
+                    {
+                        float coneCos = -uLocalCones[light].x;
+                        float denom = 1.0 - coneCos;
+                        float pointCos = dot(direction, uLocalDirections[light].xyz);
+                        float falloff = abs(denom) > 1.0e-6 ? (pointCos - coneCos) / denom : 0.0;
+                        if (falloff < 0.0)
+                            diffuse = 0.0;
+                        float hardSpot = kind < 1.5 ? 1.0 : 0.0;
+                        diffuse *= max(falloff, hardSpot);
+                    }
+                    rgb += diffuse * uLocalColors[light].rgb * attenuation * uMaterialTerms.y;
+                }
+            }
+        }
+    }
+    else
+        rgb = aColor.rgb;
+
+    float3 materialRgb = floor(saturate(rgb) * uMaterialColor.rgb * 255.0 + 0.5) / 255.0;
+    float materialAlpha = floor(aColor.a * uMaterialColor.a * 255.0 + 0.5) / 255.0;
+    vColor = float4(materialRgb, materialAlpha);
+}
+)";
+
+const char *kGpuSkinFragmentCg = R"(
+float4 main(float2 vTex : TEXCOORD0, float4 vColor : COLOR, float4 coords : WPOS,
+            uniform sampler2D uTexture, uniform int uUseTexture,
+            uniform int uAlphaEnabled, uniform int uAlphaFunction, uniform float uAlphaReference,
+            uniform int uFogEnabled, uniform float2 uFogRange, uniform float4 uFogColor) : COLOR
+{
+    float4 color = vColor;
+    if (uUseTexture != 0)
+        color *= tex2D(uTexture, vTex);
+    if (uAlphaEnabled != 0)
+    {
+        float alpha = color.a;
+        float reference = uAlphaReference;
+        bool passes = uAlphaFunction == 0 ? false :
+                    uAlphaFunction == 1 ? true :
+                    uAlphaFunction == 2 ? alpha < reference :
+                    uAlphaFunction == 3 ? alpha <= reference :
+                    uAlphaFunction == 4 ? alpha == reference :
+                    uAlphaFunction == 5 ? alpha >= reference :
+                    uAlphaFunction == 6 ? alpha > reference : alpha != reference;
+        if (!passes)
+            discard;
+    }
+    if (uFogEnabled != 0)
+    {
+        float range = uFogRange.y - uFogRange.x;
+        float fogDistance = coords.z / coords.w;
+        float amount = abs(range) > 1.0e-8 ? saturate((uFogRange.y - fogDistance) / range) : 0.0;
+        color.rgb = lerp(uFogColor.rgb, color.rgb, amount);
+    }
+    return color;
+}
+)";
+
+// P3FES_GPU_SKIN_DBG=2 unrolls the four influences with constant component selectors instead of indexing the
+// attribute vectors with the loop counter (bisecting the garbled GPU skinning).
+std::string gpuSkinVertexSource()
+{
+    std::string source = kGpuSkinVertexCg;
+    const char *loop = R"(    for (int influence = 0; influence < 4; ++influence)
+    {
+        float weight = aWeights[influence];
+        int bone = (int)aBones[influence];
+        if (weight > 0.0 && bone >= 0 && bone < uSkinCount)
+        {
+            int base = bone * 3;
+            float4 p4 = float4(p, 1.0);
+            skinnedPosition.x += dot(uSkinRows[base], p4) * weight;
+            skinnedPosition.y += dot(uSkinRows[base + 1], p4) * weight;
+            skinnedPosition.z += dot(uSkinRows[base + 2], p4) * weight;
+            float4 n4 = float4(n, 0.0);
+            skinnedNormal.x += dot(uSkinRows[base], n4) * weight;
+            skinnedNormal.y += dot(uSkinRows[base + 1], n4) * weight;
+            skinnedNormal.z += dot(uSkinRows[base + 2], n4) * weight;
+            weightSum += weight;
+        }
+    }
+)";
+    std::string body = loop;
+    const char *dbg = std::getenv("P3FES_GPU_SKIN_DBG");
+    if (dbg && *dbg == '2')
+    {
+        body.clear();
+        for (const char *c : {"x", "y", "z", "w"})
+        {
+            body += std::string("    {\n        float weight = aWeights.") + c + ";\n        int bone = (int)(aBones." + c +
+                    ");\n        if (weight > 0.0 && bone >= 0 && bone < uSkinCount)\n        {\n"
+                    "            int base = bone * 3;\n            float4 p4 = float4(p, 1.0);\n"
+                    "            skinnedPosition.x += dot(uSkinRows[base], p4) * weight;\n"
+                    "            skinnedPosition.y += dot(uSkinRows[base + 1], p4) * weight;\n"
+                    "            skinnedPosition.z += dot(uSkinRows[base + 2], p4) * weight;\n"
+                    "            float4 n4 = float4(n, 0.0);\n"
+                    "            skinnedNormal.x += dot(uSkinRows[base], n4) * weight;\n"
+                    "            skinnedNormal.y += dot(uSkinRows[base + 1], n4) * weight;\n"
+                    "            skinnedNormal.z += dot(uSkinRows[base + 2], n4) * weight;\n"
+                    "            weightSum += weight;\n        }\n    }\n";
+        }
+    }
+    const std::string marker = "@@SKIN_LOOP@@\n";
+    source.replace(source.find(marker), marker.size(), body);
+    return source;
+}
+
+GLuint compileCg(GLenum type, const char *source)
+{
+    GLuint shader = glCreateShader(type);
+    if (!shader)
+        return 0;
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok)
+    {
+        char log[2048]{};
+        GLsizei length = 0;
+        glGetShaderInfoLog(shader, sizeof(log), &length, log);
+        std::fprintf(stderr, "[native-skin] shader compile failed: %.*s\n", static_cast<int>(length), log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool initializeSkinProgram(SkinProgram &skin)
+{
+    const std::string vertexSource = gpuSkinVertexSource();
+    const GLuint vertex = compileCg(GL_CG_VERTEX_SHADER_EXT, vertexSource.c_str());
+    const GLuint fragment = compileCg(GL_CG_FRAGMENT_SHADER_EXT, kGpuSkinFragmentCg);
+    if (!vertex || !fragment)
+    {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
+        return false;
+    }
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glBindAttribLocation(program, 0, "aPos");
+    glBindAttribLocation(program, 1, "aTex");
+    glBindAttribLocation(program, 2, "aColor");
+    glBindAttribLocation(program, 3, "aBones");
+    glBindAttribLocation(program, 4, "aWeights");
+    glBindAttribLocation(program, 5, "aNormal");
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked)
+    {
+        char log[2048]{};
+        GLsizei length = 0;
+        glGetProgramInfoLog(program, sizeof(log), &length, log);
+        std::fprintf(stderr, "[native-skin] program link failed: %.*s\n", static_cast<int>(length), log);
+        glDeleteProgram(program);
+        return false;
+    }
+    skin.program = program;
+    const auto uniformLocation = [program](const char *name) {
+        GLint location = glGetUniformLocation(program, name);
+        if (location < 0)
+        {
+            std::string base(name);
+            const std::size_t suffix = base.find("[0]");
+            if (suffix != std::string::npos)
+                location = glGetUniformLocation(program, base.substr(0, suffix).c_str());
+        }
+        return location;
+    };
+#define SKIN_LOC(field, name) skin.field = uniformLocation(name)
+    SKIN_LOC(mvp, "uMVP[0]"); SKIN_LOC(modelRows, "uModelRows[0]"); SKIN_LOC(skinRows, "uSkinRows[0]");
+    SKIN_LOC(skinCount, "uSkinCount"); SKIN_LOC(uvRows, "uUvRows[0]");
+    SKIN_LOC(materialColor, "uMaterialColor"); SKIN_LOC(materialTerms, "uMaterialTerms"); SKIN_LOC(ambient, "uAmbient");
+    SKIN_LOC(directionalCount, "uDirectionalCount"); SKIN_LOC(directionalDirections, "uDirectionalDirections[0]");
+    SKIN_LOC(directionalColors, "uDirectionalColors[0]"); SKIN_LOC(localCount, "uLocalCount");
+    SKIN_LOC(localPositions, "uLocalPositions[0]"); SKIN_LOC(localDirections, "uLocalDirections[0]");
+    SKIN_LOC(localCones, "uLocalCones[0]");
+    SKIN_LOC(localColors, "uLocalColors[0]"); SKIN_LOC(sampler, "uTexture"); SKIN_LOC(useTexture, "uUseTexture");
+    SKIN_LOC(alphaEnabled, "uAlphaEnabled"); SKIN_LOC(alphaFunction, "uAlphaFunction");
+    SKIN_LOC(alphaReference, "uAlphaReference"); SKIN_LOC(fogEnabled, "uFogEnabled");
+    SKIN_LOC(fogRange, "uFogRange"); SKIN_LOC(fogColor, "uFogColor");
+#undef SKIN_LOC
+    const GLint required[] = {skin.mvp, skin.modelRows, skin.skinRows, skin.skinCount, skin.uvRows,
+                              skin.materialColor, skin.materialTerms, skin.ambient,
+                              skin.directionalCount, skin.directionalDirections, skin.directionalColors,
+                              skin.localCount, skin.localPositions, skin.localDirections, skin.localCones,
+                              skin.localColors, skin.sampler, skin.useTexture, skin.alphaEnabled,
+                              skin.alphaFunction, skin.alphaReference, skin.fogEnabled, skin.fogRange, skin.fogColor};
+    for (GLint location : required)
+        if (location < 0)
+        {
+            std::fprintf(stderr, "[native-skin] required shader uniform was optimized out\n");
+            glDeleteProgram(program);
+            skin = {};
+            return false;
+        }
+    return true;
+}
+
 std::array<float, 16> lookAt(const Camera &camera)
 {
     const Vec3 eye = camera.position;
@@ -261,6 +664,13 @@ void deleteParts(std::vector<DrawPart> &parts)
 {
     for (DrawPart &part : parts)
     {
+        for (GpuSkinPart &skin : part.gpuSkinParts)
+        {
+            if (skin.vertexBuffer)
+                glDeleteBuffers(1, &skin.vertexBuffer);
+            if (skin.indexBuffer)
+                glDeleteBuffers(1, &skin.indexBuffer);
+        }
         if (part.vertexBuffer)
             glDeleteBuffers(1, &part.vertexBuffer);
         if (part.indexBuffer)
@@ -292,6 +702,27 @@ public:
             error = "vitaGL host window did not initialize";
             return false;
         }
+        // GPU skinning + lighting (default on; P3FES_GPU_SKIN=0 keeps the CPU path). It was garbled until the
+        // bone index was read as (int)(aBones + 0.5): the runtime shader compiler runs with fast integer math, whose
+        // float->int conversion rounds to nearest, so the +0.5 moved every bone index to a neighbour.
+        const char *gpuSkin = std::getenv("P3FES_GPU_SKIN");
+        if (!(gpuSkin && *gpuSkin == '0'))
+        {
+            std::lock_guard<std::recursive_mutex> lock(ps2xVitaGlMutex());
+            GLint uniformVectors = 0, vertexAttributes = 0;
+            glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &uniformVectors);
+            glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &vertexAttributes);
+            std::fprintf(stderr, "[native-skin] limits vertex-uniform-vec4=%d attributes=%d batch-bones=24\n",
+                         uniformVectors, vertexAttributes);
+            // Budget includes 72 palette rows and the remaining camera,
+            // material and four directional/four local light parameters.
+            if (uniformVectors >= 111 && vertexAttributes >= 6)
+                m_gpuSkinEnabled = initializeSkinProgram(m_skinProgram);
+            else
+                std::fprintf(stderr, "[native-skin] insufficient shader limits; keeping CPU skinning\n");
+            if (!m_gpuSkinEnabled)
+                std::fprintf(stderr, "[native-skin] GPU route unavailable; keeping CPU skinning\n");
+        }
         m_open = true;
         return true;
     }
@@ -300,16 +731,36 @@ public:
     {
         if (!m_open)
             return;
+        reportSkinStats();
         {
             std::lock_guard<std::recursive_mutex> lock(ps2xVitaGlMutex());
             for (auto &[id, parts] : m_meshes)
                 deleteParts(parts);
             m_meshes.clear();
+            for (auto &[name, target] : m_targets)
+                if (target.framebuffer)
+                    glDeleteFramebuffers(1, &target.framebuffer);
+            m_targets.clear();
+            m_target = nullptr;
+            flushScreenBatch();
+            for (const GLuint page : m_atlasPages)
+                glDeleteTextures(1, &page);
+            m_atlasPages.clear();
+            m_atlas.clear();
+            m_smallTextures.clear();
             for (auto &[name, texture] : m_textures)
                 if (texture)
                     glDeleteTextures(1, &texture);
             m_textures.clear();
             m_textureSizes.clear();
+            if (m_skinProgram.program)
+                glDeleteProgram(m_skinProgram.program);
+            m_skinProgram = {};
+            m_gpuSkinEnabled = false;
+            m_gpuSkinReportFrames = 0;
+            m_gpuSkinDraws = 0;
+            m_gpuSkinCpuFallbacks = 0;
+            m_gpuSkinFallbackReasons.fill(0u);
         }
         if (m_ownsWindow)
             CloseWindow();
@@ -335,7 +786,10 @@ public:
         }
 
         std::lock_guard<std::recursive_mutex> lock(ps2xVitaGlMutex());
+        flushScreenBatch(); // pending quads sample the old pixels
         const std::string key = textureKey(source.name);
+        if (m_targets.find(key) != m_targets.end())
+            return true; // the name is a render target: its pixels come from beginTextureTarget passes
         const auto existing = m_textures.find(key);
         const auto size = m_textureSizes.find(key);
         if (existing != m_textures.end() && size != m_textureSizes.end() &&
@@ -344,6 +798,7 @@ public:
             glBindTexture(GL_TEXTURE_2D, existing->second);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(source.width),
                             static_cast<GLsizei>(source.height), GL_RGBA, GL_UNSIGNED_BYTE, source.rgba.data());
+            storeSmallTexture(key, source);
             return true;
         }
         removeTextureLocked(source.name);
@@ -363,6 +818,7 @@ public:
         }
         m_textures.emplace(key, texture);
         m_textureSizes.emplace(key, std::array<std::uint32_t, 2>{source.width, source.height});
+        storeSmallTexture(key, source);
         return true;
     }
 
@@ -414,7 +870,21 @@ public:
 
             DrawPart part;
             part.materialIndex = submesh.materialIndex;
-            part.sourceVertices = source.vertices;
+            std::vector<std::uint16_t> compactIndices;
+            const auto compactResult = detail::compactIndexedVertices(
+                std::span<const Vertex>(source.vertices.data(), source.vertices.size()),
+                std::span<const std::uint16_t>(indices.data(), indices.size()),
+                part.sourceVertices,
+                compactIndices);
+            if (compactResult != detail::MeshCompactionResult::Success)
+            {
+                error = compactResult == detail::MeshCompactionResult::IndexOutOfRange
+                            ? "submesh index is outside the source vertex list"
+                            : "Vita backend currently supports at most 65,536 unique mesh vertices per submesh";
+                deleteParts(parts);
+                return false;
+            }
+            indices.swap(compactIndices);
             part.lighting = source.lighting && source.hasNormals;
             part.hasPrelight = source.hasPrelight;
             part.hasNormals = source.hasNormals;
@@ -427,17 +897,79 @@ public:
             }
             else
                 part.material.color = part.color;
-            std::vector<GpuVertex> vertices(source.vertices.size());
-            for (std::size_t i = 0; i < source.vertices.size(); ++i)
+            if (part.skinned && meshFastRegenEnabled())
+                detail::orderSkinnedVertices(part.sourceVertices, indices, part.skinLayout);
+            std::vector<GpuVertex> vertices(part.sourceVertices.size());
+            for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
             {
-                const Vertex &in = source.vertices[i];
+                const Vertex &in = part.sourceVertices[i];
                 GpuVertex &out = vertices[i];
                 std::copy(in.position.begin(), in.position.end(), out.position);
-                std::copy(in.normal.begin(), in.normal.end(), out.normal);
                 std::copy(in.texCoord.begin(), in.texCoord.end(), out.uv);
                 std::copy(in.color.begin(), in.color.end(), out.color);
             }
             part.gpuVertices = vertices;
+            if (part.skinned)
+            {
+                std::array<bool, 256> used{};
+                for (const Vertex &in : part.sourceVertices)
+                    for (std::size_t k = 0; k < in.weights.size(); ++k)
+                        if (in.weights[k] > 0.0f)
+                            used[in.bones[k]] = true;
+                for (std::size_t b = 0; b < used.size(); ++b)
+                    if (used[b])
+                        part.usedBones.push_back(static_cast<std::uint8_t>(b));
+            }
+
+            if (m_gpuSkinEnabled && part.skinned)
+            {
+                std::vector<detail::GpuSkinBatch> batches;
+                const auto batchResult = detail::buildGpuSkinBatches(
+                    part.sourceVertices, indices, source.boneCount, 24u, batches);
+                if (batchResult == detail::SkinBatchResult::Success)
+                {
+                    for (detail::GpuSkinBatch &batch : batches)
+                    {
+                        GpuSkinPart skinPart;
+                        skinPart.paletteBones = std::move(batch.paletteBones);
+                        std::vector<GpuSkinVertex> skinVertices(batch.vertices.size());
+                        for (std::size_t i = 0; i < batch.vertices.size(); ++i)
+                        {
+                            const Vertex &in = batch.vertices[i];
+                            GpuSkinVertex &out = skinVertices[i];
+                            std::copy(in.position.begin(), in.position.end(), out.position);
+                            std::copy(in.normal.begin(), in.normal.end(), out.normal);
+                            std::copy(in.texCoord.begin(), in.texCoord.end(), out.uv);
+                            std::copy(in.color.begin(), in.color.end(), out.color);
+                            std::copy(in.bones.begin(), in.bones.end(), out.bones);
+                            std::copy(in.weights.begin(), in.weights.end(), out.weights);
+                        }
+                        glGenBuffers(1, &skinPart.vertexBuffer);
+                        glBindBuffer(GL_ARRAY_BUFFER, skinPart.vertexBuffer);
+                        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizei>(skinVertices.size() * sizeof(GpuSkinVertex)),
+                                     skinVertices.data(), GL_STATIC_DRAW);
+                        glGenBuffers(1, &skinPart.indexBuffer);
+                        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, skinPart.indexBuffer);
+                        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                                     static_cast<GLsizei>(batch.indices.size() * sizeof(std::uint16_t)),
+                                     batch.indices.data(), GL_STATIC_DRAW);
+                        skinPart.indexCount = static_cast<GLsizei>(batch.indices.size());
+                        if (!skinPart.vertexBuffer || !skinPart.indexBuffer)
+                        {
+                            if (skinPart.vertexBuffer) glDeleteBuffers(1, &skinPart.vertexBuffer);
+                            if (skinPart.indexBuffer) glDeleteBuffers(1, &skinPart.indexBuffer);
+                            for (GpuSkinPart &made : part.gpuSkinParts)
+                            {
+                                if (made.vertexBuffer) glDeleteBuffers(1, &made.vertexBuffer);
+                                if (made.indexBuffer) glDeleteBuffers(1, &made.indexBuffer);
+                            }
+                            part.gpuSkinParts.clear();
+                            break;
+                        }
+                        part.gpuSkinParts.push_back(std::move(skinPart));
+                    }
+                }
+            }
 
             glGenBuffers(1, &part.vertexBuffer);
             glBindBuffer(GL_ARRAY_BUFFER, part.vertexBuffer);
@@ -451,6 +983,11 @@ public:
             if (!part.vertexBuffer || !part.indexBuffer)
             {
                 error = "vitaGL failed to allocate mesh buffers";
+                for (GpuSkinPart &skinPart : part.gpuSkinParts)
+                {
+                    if (skinPart.vertexBuffer) glDeleteBuffers(1, &skinPart.vertexBuffer);
+                    if (skinPart.indexBuffer) glDeleteBuffers(1, &skinPart.indexBuffer);
+                }
                 if (part.vertexBuffer)
                     glDeleteBuffers(1, &part.vertexBuffer);
                 if (part.indexBuffer)
@@ -469,6 +1006,38 @@ public:
             return false;
         }
         m_meshes.emplace(id, std::move(parts));
+        if (source.skinned && resourceDiagEnabled())
+        {
+            std::array<std::uint32_t, 5> influenceCounts{};
+            std::uint32_t singleUnitWeight0 = 0;
+            for (const Vertex &vertex : source.vertices)
+            {
+                std::uint32_t active = 0;
+                for (std::size_t i = 0; i < vertex.weights.size(); ++i)
+                {
+                    const float weight = vertex.weights[i];
+                    if (weight > 0.0f && std::isfinite(weight) && vertex.bones[i] < source.boneCount)
+                        ++active;
+                }
+                if (active <= 4)
+                    ++influenceCounts[active];
+
+                bool unitSingle = vertex.weights[0] == 1.0f && vertex.bones[0] < source.boneCount;
+                for (std::size_t i = 1; unitSingle && i < vertex.weights.size(); ++i)
+                {
+                    const float weight = vertex.weights[i];
+                    if (weight > 0.0f && std::isfinite(weight) && vertex.bones[i] < source.boneCount)
+                        unitSingle = false;
+                }
+                if (unitSingle)
+                    ++singleUnitWeight0;
+            }
+            std::fprintf(stderr,
+                         "[native-skin] mesh=%llu vertices=%u influences0=%u 1=%u 2=%u 3=%u 4=%u fast-w0-unit=%u\n",
+                         static_cast<unsigned long long>(id), static_cast<unsigned>(source.vertices.size()),
+                         influenceCounts[0], influenceCounts[1], influenceCounts[2], influenceCounts[3],
+                         influenceCounts[4], singleUnitWeight0);
+        }
         return true;
     }
 
@@ -478,13 +1047,94 @@ public:
         removeMeshLocked(id);
     }
 
+    void beginTextureTarget(std::string_view name, int width, int height) override
+    {
+        if (!m_open || width <= 0 || height <= 0)
+            return;
+        flushScreenBatch();
+        if (m_target)
+            endTextureTarget();
+        // Held until endTextureTarget, like BeginDrawing/EndDrawing hold it for the display frame.
+        ps2xVitaGlMutex().lock();
+        const std::string key = textureKey(name);
+        auto target = m_targets.find(key);
+        if (target == m_targets.end() || target->second.width != width || target->second.height != height)
+        {
+            removeTextureLocked(name); // a placeholder upload or a target of another size
+            Target created;
+            created.width = width;
+            created.height = height;
+            GLuint texture = 0;
+            glGenTextures(1, &texture);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glGenFramebuffers(1, &created.framebuffer);
+            glBindFramebuffer(GL_FRAMEBUFFER, created.framebuffer);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            target = m_targets.emplace(key, created).first;
+            m_textures[key] = texture;
+            m_textureSizes[key] = {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
+            std::fprintf(stderr, "[p3fes-native] render target %s %dx%d fbo=%u texture=%u\n", key.c_str(), width, height,
+                         created.framebuffer, texture);
+        }
+        m_target = &target->second;
+        glBindFramebuffer(GL_FRAMEBUFFER, m_target->framebuffer);
+        // The pass is rendered upside down (see setCamera), which mirrors the winding.
+        glFrontFace(targetFlipEnabled() ? GL_CW : GL_CCW);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, width, height);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_BLEND);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
+        m_in3D = false;
+    }
+
+    void endTextureTarget() override
+    {
+        flushScreenBatch();
+        if (!m_target)
+            return;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFrontFace(GL_CCW);
+        m_target = nullptr;
+        m_in3D = false;
+        ps2xVitaGlMutex().unlock();
+    }
+
+    void setWidescreen(int mode) override
+    {
+        flushScreenBatch();
+        m_widescreen = mode;
+    }
+    void setScreenPlacement(ScreenPlacement placement) override { m_screenPlacement = placement; }
+
     void beginFrame(const Camera &camera, ClearColor clear) override
     {
+        m_screenZLayers.clear();
         m_camera = camera;
         BeginDrawing(); // holds ps2xVitaGlMutex until EndDrawing
-        glClearColor(clear.r / 255.0f, clear.g / 255.0f, clear.b / 255.0f, clear.a / 255.0f);
+        const int hostWidth = std::max(GetScreenWidth(), 1);
+        const int hostHeight = std::max(GetScreenHeight(), 1);
+        const FitViewport viewport = worldViewport();
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, hostWidth, hostHeight);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClearDepthf(1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(viewport.x, viewport.y, viewport.width, viewport.height);
+        glClearColor(clear.r / 255.0f, clear.g / 255.0f, clear.b / 255.0f, clear.a / 255.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_TRUE);
@@ -499,6 +1149,10 @@ public:
     {
         if (!colorBuffer && !depthBuffer)
             return;
+        flushScreenBatch();
+        const FitViewport viewport = worldViewport();
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(viewport.x, viewport.y, viewport.width, viewport.height);
         GLbitfield mask = 0u;
         if (colorBuffer)
         {
@@ -512,10 +1166,41 @@ public:
             mask |= GL_DEPTH_BUFFER_BIT;
         }
         glClear(mask);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    }
+
+    void setCamera(const Camera &camera) override
+    {
+        m_camera = camera;
+        // A colour attachment stores its bottom row first, while the game samples its camera
+        // textures like any other raster (v = 0 is the top row): render target passes upside down.
+        if (m_target && targetFlipEnabled())
+            for (const int element : {1, 5, 9, 13})
+                m_camera.projection[element] = -m_camera.projection[element];
+        // A camera transition invalidates the loaded world matrices, but has
+        // no framebuffer effect. apply3D() reloads them on the next mesh.
+        m_in3D = false;
     }
 
     void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state) override
     {
+        if (!resourceDiagEnabled())
+        {
+            drawMeshImpl(id, model, state);
+            return;
+        }
+        const std::uint64_t t0 = diagNowUs();
+        drawMeshImpl(id, model, state);
+        const std::uint64_t dt = diagNowUs() - t0;
+        MeshTiming &t = m_target ? m_meshTimingTarget : m_meshTiming;
+        t.us += dt;
+        ++t.calls;
+    }
+
+    void drawMeshImpl(MeshId id, const Matrix4 &model, const MeshDrawState &state)
+    {
+        flushScreenBatch();
         if (!m_in3D)
             apply3D();
         auto found = m_meshes.find(id);
@@ -565,42 +1250,181 @@ public:
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             }
+
+            if (m_gpuSkinEnabled && part.skinned)
+            {
+                const auto &gpuTextureName = part.materialIndex < state.materialTextures.size()
+                    ? state.materialTextures[part.materialIndex] : part.textureName;
+                const auto gpuTexture = gpuTextureName.empty() ? m_textures.end() : m_textures.find(textureKey(gpuTextureName));
+                const MeshDrawState::DualPass *gpuDual = part.materialIndex < state.materialDualPasses.size()
+                    ? &state.materialDualPasses[part.materialIndex] : nullptr;
+                const MeshDrawState::EnvPass *gpuEnv = part.materialIndex < state.materialEnvPasses.size()
+                    ? &state.materialEnvPasses[part.materialIndex] : nullptr;
+                bool paletteAvailable = true;
+                for (const GpuSkinPart &skinPart : part.gpuSkinParts)
+                    for (std::uint8_t bone : skinPart.paletteBones)
+                        paletteAvailable = paletteAvailable && bone < state.skinPalette.size();
+                const bool rigidOnlyGate = !gpuSkinDbgRigidOnly() ||
+                    (part.skinLayout.genericFirst == part.sourceVertices.size() && !part.skinLayout.runs.empty());
+                const bool gpuCanDraw = m_gpuSkinEnabled && part.skinned && !part.gpuSkinParts.empty() && rigidOnlyGate &&
+                    paletteAvailable && state.gouraudShading && (!part.lighting || !state.lightingEnabled ||
+                        (state.directionalLights.size() <= 4u && state.localLights.size() <= 4u)) &&
+                    !(gpuDual && gpuDual->enabled) && !(gpuEnv && gpuEnv->enabled);
+                if (part.skinned && m_gpuSkinEnabled)
+                {
+                    if (!gpuCanDraw)
+                    {
+                        ++m_gpuSkinCpuFallbacks;
+                        const std::size_t reason = part.gpuSkinParts.empty() ? 0u :
+                            !paletteAvailable ? 1u : !state.gouraudShading ? 2u :
+                            (part.lighting && state.lightingEnabled &&
+                             (state.directionalLights.size() > 4u || state.localLights.size() > 4u)) ? 3u : 4u;
+                        ++m_gpuSkinFallbackReasons[reason];
+                    }
+                }
+                if (gpuCanDraw)
+                {
+                    const MeshDrawState::SamplerState *sampler = part.materialIndex < state.materialSamplers.size()
+                        ? &state.materialSamplers[part.materialIndex] : nullptr;
+                    drawGpuSkinPart(part, model, state, color,
+                                    gpuTexture == m_textures.end() ? 0u : gpuTexture->second,
+                                    sampler);
+                    continue;
+                }
+            }
             if (part.gpuVertices.size() == part.sourceVertices.size())
             {
                 const MeshDrawState::UvTransform *uvTransform =
                     part.materialIndex < state.materialUvTransforms.size()
                         ? &state.materialUvTransforms[part.materialIndex]
                         : nullptr;
-                for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                const MeshDrawState::UvTransform defaultUvTransform{};
+                const MeshDrawState::UvTransform &currentUvTransform =
+                    uvTransform ? *uvTransform : defaultUvTransform;
+                const std::vector<std::uint8_t> *skinBones = part.skinned ? &part.usedBones : nullptr;
+                const std::vector<Matrix4> *skinPalette = part.skinned ? &state.skinPalette : nullptr;
+                const bool diag = resourceDiagEnabled();
+                const unsigned mismatchReasons = part.staticVertexCache.mismatch(
+                    model, part.material, color, part.lighting, part.hasPrelight, state, currentUvTransform,
+                    skinBones, skinPalette);
+                const bool regenerateVertices = meshReuseEnabled()
+                    ? !detail::canReuseVertexData(mismatchReasons == 0u)
+                    : !detail::canReuseStaticVertexData(part.skinned, mismatchReasons == 0u);
+                if (diag)
                 {
-                    const Vertex posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette)
-                                                      : part.sourceVertices[i];
-                    std::copy(posed.position.begin(), posed.position.end(), part.gpuVertices[i].position);
-                    std::copy(posed.normal.begin(), posed.normal.end(), part.gpuVertices[i].normal);
-                    if (uvTransform && uvTransform->enabled)
+                    MeshTiming &mt = m_target ? m_meshTimingTarget : m_meshTiming;
+                    ++mt.reasons[part.skinned ? 1 : 0][mismatchReasons & 0x1ffu];
+                    if (!regenerateVertices)
+                        ++mt.reusedParts[part.skinned ? 1 : 0];
+                }
+                if (regenerateVertices)
+                {
+                    const std::uint64_t regenStart = diag ? diagNowUs() : 0u;
+                    std::uint64_t computeEnd = 0u;
+                    struct RegenTimer
                     {
-                        const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, *uvTransform);
-                        part.gpuVertices[i].uv[0] = uv[0];
-                        part.gpuVertices[i].uv[1] = uv[1];
+                        VitaGlRenderer *self; bool skinned; std::size_t verts; std::uint64_t start; bool target;
+                        std::uint64_t *computeEnd;
+                        ~RegenTimer()
+                        {
+                            if (!start) return;
+                            const std::uint64_t now = diagNowUs();
+                            MeshTiming &t = target ? self->m_meshTimingTarget : self->m_meshTiming;
+                            t.regenUs += now - start;
+                            t.computeUs += (*computeEnd ? *computeEnd : now) - start;
+                            t.regenVerts += static_cast<std::uint32_t>(verts);
+                            (skinned ? t.regenSkinnedParts : t.regenStaticParts)++;
+                            (skinned ? t.regenSkinnedVerts : t.regenStaticVerts) += static_cast<std::uint32_t>(verts);
+                        }
+                    } regenTimer{this, part.skinned, part.sourceVertices.size(), regenStart, m_target != nullptr,
+                                 &computeEnd};
+                    detail::RegenContext fastContext;
+                    const bool fast = meshFastRegenEnabled() &&
+                        detail::prepareRegenContext(fastContext, model, state.skinPalette, part.material, color,
+                                                    part.lighting, part.hasPrelight, state, currentUvTransform);
+                    if (fast)
+                    {
+                        detail::regenerateVertices(fastContext, part.skinned, part.skinned ? &part.skinLayout : nullptr,
+                                                   part.sourceVertices.data(),
+                                                   part.gpuVertices.data(), part.sourceVertices.size());
+                        if (diag && meshVerifyEnabled())
+                        {
+                            MeshTiming &mt = m_target ? m_meshTimingTarget : m_meshTiming;
+                            for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                            {
+                                const Vertex posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette)
+                                                                  : part.sourceVertices[i];
+                                const auto shaded = shadeVertexColor(posed, part.material, color, part.lighting,
+                                                                     part.hasPrelight, state, model);
+                                const auto uvRef = transformTexCoord(part.sourceVertices[i].texCoord, currentUvTransform);
+                                const GpuVertex &got = part.gpuVertices[i];
+                                ++mt.verifyVerts;
+                                int worst = 0;
+                                for (int c = 0; c < 4; ++c)
+                                    worst = std::max(worst, std::abs(static_cast<int>(shaded[c]) - static_cast<int>(got.color[c])));
+                                mt.verifyColorOff1 += worst == 1 ? 1u : 0u;
+                                mt.verifyColorBad += worst > 1 ? 1u : 0u;
+                                float pd = 0.0f;
+                                for (int c = 0; c < 3; ++c)
+                                    pd = std::max(pd, std::fabs(posed.position[c] - got.position[c]));
+                                mt.verifyPosMax = std::max(mt.verifyPosMax, pd);
+                                mt.verifyPosBad += pd > 1.0e-3f ? 1u : 0u;
+                                mt.verifyUvBad += (std::fabs(uvRef[0] - got.uv[0]) > 1.0e-6f ||
+                                                   std::fabs(uvRef[1] - got.uv[1]) > 1.0e-6f) ? 1u : 0u;
+                            }
+                        }
+                        if (diag && meshBenchEnabled())
+                        {
+                            // Same work again with warm caches: tells memory stalls from arithmetic.
+                            const std::uint64_t hotStart = diagNowUs();
+                            detail::regenerateVertices(fastContext, part.skinned, part.skinned ? &part.skinLayout : nullptr,
+                                                       part.sourceVertices.data(),
+                                                       part.gpuVertices.data(), part.sourceVertices.size());
+                            MeshTiming &mt = m_target ? m_meshTimingTarget : m_meshTiming;
+                            mt.hotUs += diagNowUs() - hotStart;
+                            mt.hotVerts += static_cast<std::uint32_t>(part.sourceVertices.size());
+                        }
                     }
                     else
                     {
-                        part.gpuVertices[i].uv[0] = part.sourceVertices[i].texCoord[0];
-                        part.gpuVertices[i].uv[1] = part.sourceVertices[i].texCoord[1];
+                        for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
+                        {
+                            const Vertex posed = part.skinned ? poseSkinVertex(part.sourceVertices[i], state.skinPalette)
+                                                              : part.sourceVertices[i];
+                            std::copy(posed.position.begin(), posed.position.end(), part.gpuVertices[i].position);
+                            if (currentUvTransform.enabled)
+                            {
+                                const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, currentUvTransform);
+                                part.gpuVertices[i].uv[0] = uv[0];
+                                part.gpuVertices[i].uv[1] = uv[1];
+                            }
+                            else
+                            {
+                                part.gpuVertices[i].uv[0] = part.sourceVertices[i].texCoord[0];
+                                part.gpuVertices[i].uv[1] = part.sourceVertices[i].texCoord[1];
+                            }
+                            const auto shaded = shadeVertexColor(posed, part.material, color,
+                                                                 part.lighting, part.hasPrelight, state, model);
+                            std::copy(shaded.begin(), shaded.end(), part.gpuVertices[i].color);
+                        }
                     }
-                    const auto shaded = shadeVertexColor(posed, part.material, color,
-                                                         part.lighting, part.hasPrelight, state, model);
-                    std::copy(shaded.begin(), shaded.end(), part.gpuVertices[i].color);
+                    if (diag)
+                        computeEnd = diagNowUs();
+                    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                    static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
+                                    part.gpuVertices.data());
+                    part.staticVertexCache.capture(model, part.material, color, part.lighting,
+                                                   part.hasPrelight, state, currentUvTransform,
+                                                   skinBones, skinPalette);
                 }
-                glBufferSubData(GL_ARRAY_BUFFER, 0,
-                                static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
-                                part.gpuVertices.data());
             }
             glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
             glEnableClientState(GL_COLOR_ARRAY);
             glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
 
-            auto texture = part.textureName.empty() ? m_textures.end() : m_textures.find(textureKey(part.textureName));
+            const auto &textureName = part.materialIndex < state.materialTextures.size()
+                ? state.materialTextures[part.materialIndex] : part.textureName;
+            auto texture = textureName.empty() ? m_textures.end() : m_textures.find(textureKey(textureName));
             if (texture != m_textures.end())
             {
                 glEnable(GL_TEXTURE_2D);
@@ -616,7 +1440,21 @@ public:
                 glDisableClientState(GL_TEXTURE_COORD_ARRAY);
                 glDisable(GL_TEXTURE_2D);
             }
+            // FB_ONLY alpha test (see lighting.h): unskinned parts are drawn twice, skinned ones once.
+            const bool alphaTwoPass = alphaTestFbOnly(state.alphaTest) && !part.skinned &&
+                                      alphaTestFailPass(state.alphaTest).function != 0u;
+            if (alphaTestFbOnly(state.alphaTest))
+                applyAlphaTest(alphaTwoPass ? alphaTestPassOne(state.alphaTest) : alphaTestSinglePass(state.alphaTest));
             glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
+            if (alphaTwoPass)
+            {
+                // The pixels that failed the test: still drawn, Z not written.
+                applyAlphaTest(alphaTestFailPass(state.alphaTest));
+                glDepthMask(GL_FALSE);
+                glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
+                glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
+                applyAlphaTest(alphaTestPassOne(state.alphaTest));
+            }
 
             const MeshDrawState::DualPass *dual = part.materialIndex < state.materialDualPasses.size()
                 ? &state.materialDualPasses[part.materialIndex]
@@ -629,13 +1467,19 @@ public:
                     applyMeshSampler(dualTexture->second, state, &dual->sampler);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
-                        const auto uv = transformTexCoord(part.sourceVertices[i].texCoord, dual->uvTransform);
+                        // Second texture coordinate set, carried in weights (see decodeNativeMesh).
+                        const Vertex &dualSource = part.sourceVertices[i];
+                        const bool hasUv1 = !part.skinned && dualSource.weights[2] == 1.0f;
+                        const std::array<float, 2> dualBase = hasUv1
+                            ? std::array<float, 2>{dualSource.weights[0], dualSource.weights[1]} : dualSource.texCoord;
+                        const auto uv = transformTexCoord(dualBase, dual->uvTransform);
                         part.gpuVertices[i].uv[0] = uv[0];
                         part.gpuVertices[i].uv[1] = uv[1];
                     }
                     glBufferSubData(GL_ARRAY_BUFFER, 0,
                                     static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
                                     part.gpuVertices.data());
+                    part.staticVertexCache.invalidate();
                     glEnable(GL_TEXTURE_2D);
                     glBindTexture(GL_TEXTURE_2D, dualTexture->second);
                     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -677,6 +1521,7 @@ public:
                     glBufferSubData(GL_ARRAY_BUFFER, 0,
                                     static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
                                     part.gpuVertices.data());
+                    part.staticVertexCache.invalidate();
                     glEnable(GL_TEXTURE_2D);
                     glBindTexture(GL_TEXTURE_2D, envTexture->second);
                     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -699,6 +1544,9 @@ public:
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glDisable(GL_TEXTURE_2D);
+        glUseProgram(0);
+        for (GLuint attribute = 0; attribute < 6u; ++attribute)
+            glDisableVertexAttribArray(attribute);
         glPopMatrix();
         glDisable(GL_ALPHA_TEST);
         glDisable(GL_FOG);
@@ -713,6 +1561,7 @@ public:
     {
         if (vertices.size() < 2u)
             return;
+        flushScreenBatch();
         if (!m_in3D)
             apply3D();
 
@@ -726,7 +1575,6 @@ public:
             const Vertex &in = vertices[i];
             GpuVertex &out = gpu[i];
             std::copy(in.position.begin(), in.position.end(), out.position);
-            std::copy(in.normal.begin(), in.normal.end(), out.normal);
             std::copy(in.texCoord.begin(), in.texCoord.end(), out.uv);
             std::copy(in.color.begin(), in.color.end(), out.color);
         }
@@ -804,7 +1652,13 @@ public:
                              std::string_view textureName,
                              const ScreenDrawState &state) override
     {
-        drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_TRIANGLES);
+        if (!detail::screenBatchEnabled() || m_target || vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
+        {
+            flushScreenBatch();
+            drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_TRIANGLES);
+            return;
+        }
+        submitScreenTriangles(vertices, sourceWidth, sourceHeight, textureName, state);
     }
 
     void drawScreenLines(const std::vector<ScreenVertex> &vertices,
@@ -812,36 +1666,537 @@ public:
                          std::string_view textureName,
                          const ScreenDrawState &state) override
     {
+        flushScreenBatch();
         drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_LINES);
+    }
+
+    std::string drainDiagReport() override
+    {
+        if (!resourceDiagEnabled() || (m_screenTiming.draws == 0u && m_screenTiming.submits == 0u))
+            return {};
+        char meshLine[400];
+        {
+            const MeshTiming &a = m_meshTiming, &b = m_meshTimingTarget;
+            std::snprintf(meshLine, sizeof meshLine,
+                          "[native-mesh] display: calls=%u us=%llu regen-us=%llu (skinned parts=%u static parts=%u verts=%u) | target passes: calls=%u us=%llu regen-us=%llu (skinned parts=%u static parts=%u verts=%u)\n",
+                          a.calls, static_cast<unsigned long long>(a.us), static_cast<unsigned long long>(a.regenUs),
+                          a.regenSkinnedParts, a.regenStaticParts, a.regenVerts,
+                          b.calls, static_cast<unsigned long long>(b.us), static_cast<unsigned long long>(b.regenUs),
+                          b.regenSkinnedParts, b.regenStaticParts, b.regenVerts);
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                const MeshTiming &m = pass ? b : a;
+                char reasonLine[600];
+                int len = std::snprintf(reasonLine, sizeof reasonLine,
+                                        "[native-regen] %s: hot-us=%llu hot-verts=%u compute-us=%llu upload-us=%llu verts skinned=%u static=%u reused skinned=%u static=%u | why static:",
+                                        pass ? "target" : "display",
+                                        static_cast<unsigned long long>(m.hotUs), m.hotVerts,
+                                        static_cast<unsigned long long>(m.computeUs),
+                                        static_cast<unsigned long long>(m.regenUs - m.computeUs),
+                                        m.regenSkinnedVerts, m.regenStaticVerts, m.reusedParts[1], m.reusedParts[0]);
+                for (int kind = 0; kind < 2 && len > 0 && len < static_cast<int>(sizeof reasonLine) - 40; ++kind)
+                {
+                    if (kind == 1)
+                        len += std::snprintf(reasonLine + len, sizeof reasonLine - len, " | skinned:");
+                    for (unsigned r = 0; r < 512 && len < static_cast<int>(sizeof reasonLine) - 40; ++r)
+                        if (m.reasons[kind][r])
+                            len += std::snprintf(reasonLine + len, sizeof reasonLine - len, " 0x%x=%u", r, m.reasons[kind][r]);
+                }
+                std::fprintf(stderr, "%s\n", reasonLine);
+                if (m.verifyVerts)
+                    std::fprintf(stderr, "[native-verify] %s: verts=%llu color-off-by-1=%llu color-bad=%llu pos-bad=%llu (max %.2e) uv-bad=%llu\n",
+                                 pass ? "target" : "display", static_cast<unsigned long long>(m.verifyVerts),
+                                 static_cast<unsigned long long>(m.verifyColorOff1),
+                                 static_cast<unsigned long long>(m.verifyColorBad),
+                                 static_cast<unsigned long long>(m.verifyPosBad), m.verifyPosMax,
+                                 static_cast<unsigned long long>(m.verifyUvBad));
+            }
+            m_meshTiming = {};
+            m_meshTimingTarget = {};
+        }
+        const ScreenTiming &t = m_screenTiming;
+        const double n = std::max<double>(t.draws, 1.0);
+        const double sn = std::max<double>(t.submits, 1.0);
+        char line[500];
+        std::snprintf(line, sizeof line,
+                      "[native-screen] batch=%d atlas=%d gl-calls: submits=%u draws=%u gl-draws=%u verts/draw=%.1f | per gl call us: total=%.1f state=%.1f texture=%.1f blend=%.1f matrix=%.1f arrays=%.1f gldraw=%.1f restore=%.1f | submit=%.2f us each\n",
+                      detail::screenBatchEnabled() ? 1 : 0, detail::screenAtlasEnabled() ? 1 : 0,
+                      t.submits, t.draws, t.glDraws, t.vertices / n,
+                      (t.us[0] + t.us[1] + t.us[2] + t.us[3] + t.us[4] + t.us[5] + t.us[6]) / n,
+                      t.us[0] / n, t.us[1] / n, t.us[2] / n, t.us[3] / n, t.us[4] / n, t.us[5] / n, t.us[6] / n,
+                      t.submitUs / sn);
+        m_screenTiming = {};
+        return std::string(meshLine) + line;
     }
 
     void endFrame() override
     {
+        flushScreenBatch();
         glDisable(GL_DEPTH_TEST);
         EndDrawing();
         m_in3D = false;
+        if (m_gpuSkinEnabled && resourceDiagEnabled() && ++m_gpuSkinReportFrames % 120u == 0u)
+            reportSkinStats();
     }
 
 private:
+    void reportSkinStats() const
+    {
+        if (resourceDiagEnabled() && m_gpuSkinEnabled)
+            std::fprintf(stderr, "[native-skin] draws=%llu cpu-fallbacks=%llu reason(no-batch=%llu,palette=%llu,flat=%llu,lights=%llu,dual-env=%llu)\n",
+                         static_cast<unsigned long long>(m_gpuSkinDraws),
+                         static_cast<unsigned long long>(m_gpuSkinCpuFallbacks),
+                         static_cast<unsigned long long>(m_gpuSkinFallbackReasons[0]),
+                         static_cast<unsigned long long>(m_gpuSkinFallbackReasons[1]),
+                         static_cast<unsigned long long>(m_gpuSkinFallbackReasons[2]),
+                         static_cast<unsigned long long>(m_gpuSkinFallbackReasons[3]),
+                         static_cast<unsigned long long>(m_gpuSkinFallbackReasons[4]));
+    }
+
+    static Matrix4 multiplyMatrix(const Matrix4 &a, const Matrix4 &b)
+    {
+        Matrix4 out{};
+        for (int column = 0; column < 4; ++column)
+            for (int row = 0; row < 4; ++row)
+                for (int k = 0; k < 4; ++k)
+                    out[column * 4 + row] += a[k * 4 + row] * b[column * 4 + k];
+        return out;
+    }
+
+    Matrix4 currentProjection() const
+    {
+        if (m_camera.useMatrices)
+            return m_camera.projection;
+        const float aspect = 640.0f / 448.0f;
+        constexpr float nearPlane = 0.1f;
+        constexpr float farPlane = 10000.0f;
+        const float radians = m_camera.fovy * 0.008726646259971648f;
+        const float top = nearPlane * std::tan(std::max(radians, 0.01f));
+        const float right = top * aspect;
+        Matrix4 projection{};
+        projection[0] = nearPlane / right;
+        projection[5] = nearPlane / top;
+        projection[10] = -(farPlane + nearPlane) / (farPlane - nearPlane);
+        projection[11] = -1.0f;
+        projection[14] = -(2.0f * farPlane * nearPlane) / (farPlane - nearPlane);
+        return projection;
+    }
+
+    Matrix4 currentView() const
+    {
+        return m_camera.useMatrices ? m_camera.view : lookAt(m_camera);
+    }
+
+    static void matrixRows(const Matrix4 &matrix, float *rows, int rowCount = 4)
+    {
+        for (int row = 0; row < rowCount; ++row)
+        {
+            rows[row * 4 + 0] = matrix[row];
+            rows[row * 4 + 1] = matrix[row + 4];
+            rows[row * 4 + 2] = matrix[row + 8];
+            rows[row * 4 + 3] = matrix[row + 12];
+        }
+    }
+
+    void drawGpuSkinPart(DrawPart &part, const Matrix4 &model, const MeshDrawState &state,
+                         const std::array<std::uint8_t, 4> &materialColor, GLuint texture,
+                         const MeshDrawState::SamplerState *sampler)
+    {
+        const MeshDrawState::UvTransform *uvTransform = part.materialIndex < state.materialUvTransforms.size()
+            ? &state.materialUvTransforms[part.materialIndex] : nullptr;
+        const MeshDrawState::UvTransform defaultUv{};
+        const MeshDrawState::UvTransform &uv = uvTransform ? *uvTransform : defaultUv;
+        const Matrix4 view = currentView();
+        const Matrix4 viewModel = multiplyMatrix(view, model);
+        const Matrix4 mvp = multiplyMatrix(currentProjection(), viewModel);
+        std::array<float, 16> mvpRows{};
+        std::array<float, 12> modelRows{};
+        matrixRows(mvp, mvpRows.data());
+        matrixRows(model, modelRows.data(), 3);
+
+        const auto norm = [](std::uint8_t c) { return static_cast<float>(c) / 255.0f; };
+        const GLfloat material[4]{norm(materialColor[0]), norm(materialColor[1]), norm(materialColor[2]), norm(materialColor[3])};
+        const GLfloat terms[4]{part.material.ambient, part.material.diffuse, part.material.specular, 0.0f};
+        GLfloat ambient[4]{0.0f, 0.0f, 0.0f, part.hasPrelight ? 1.0f : 0.0f};
+        const bool useLighting = part.lighting && state.lightingEnabled;
+        if (useLighting)
+            for (int c = 0; c < 3; ++c)
+                ambient[c] = state.ambientLight[c] * part.material.ambient;
+
+        GLfloat dirDirections[16]{}, dirColors[16]{};
+        GLfloat localPositions[16]{}, localDirections[16]{}, localCones[16]{}, localColors[16]{};
+        if (useLighting)
+        {
+            for (std::size_t i = 0; i < state.directionalLights.size(); ++i)
+                for (int c = 0; c < 3; ++c)
+                {
+                    dirDirections[i * 4u + c] = state.directionalLights[i].direction[c];
+                    dirColors[i * 4u + c] = state.directionalLights[i].color[c];
+                }
+            for (std::size_t i = 0; i < state.localLights.size(); ++i)
+            {
+                const auto &light = state.localLights[i];
+                for (int c = 0; c < 3; ++c)
+                {
+                    localPositions[i * 4u + c] = light.position[c];
+                    localDirections[i * 4u + c] = light.direction[c];
+                    localColors[i * 4u + c] = light.color[c];
+                }
+                localPositions[i * 4u + 3u] = light.radius;
+                localCones[i * 4u] = light.minusCosAngle;
+                localDirections[i * 4u + 3u] =
+                    light.type == MeshDrawState::LocalLight::Type::Point ? 0.0f :
+                    light.type == MeshDrawState::LocalLight::Type::Spot ? 1.0f : 2.0f;
+            }
+        }
+
+        const GLfloat uvRows[8]{uv.rightX, uv.upX, uv.posX, 0.0f,
+                                uv.rightY, uv.upY, uv.posY, 0.0f};
+        const GLfloat fogColor[4]{state.fog.color[0] / 255.0f, state.fog.color[1] / 255.0f,
+                                  state.fog.color[2] / 255.0f, 1.0f};
+        glDisableClientState(GL_VERTEX_ARRAY);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glDisable(GL_ALPHA_TEST);
+        glDisable(GL_FOG);
+        glUseProgram(m_skinProgram.program);
+        glUniform4fv(m_skinProgram.mvp, 4, mvpRows.data());
+        glUniform4fv(m_skinProgram.modelRows, 3, modelRows.data());
+        glUniform4fv(m_skinProgram.uvRows, 2, uvRows);
+        glUniform4fv(m_skinProgram.materialColor, 1, material);
+        glUniform4fv(m_skinProgram.materialTerms, 1, terms);
+        glUniform4fv(m_skinProgram.ambient, 1, ambient);
+        glUniform1i(m_skinProgram.directionalCount,
+                    useLighting ? static_cast<GLint>(state.directionalLights.size()) : -1);
+        glUniform4fv(m_skinProgram.directionalDirections, 4, dirDirections);
+        glUniform4fv(m_skinProgram.directionalColors, 4, dirColors);
+        glUniform1i(m_skinProgram.localCount,
+                    useLighting ? static_cast<GLint>(state.localLights.size()) : 0);
+        glUniform4fv(m_skinProgram.localPositions, 4, localPositions);
+        glUniform4fv(m_skinProgram.localDirections, 4, localDirections);
+        glUniform4fv(m_skinProgram.localCones, 4, localCones);
+        glUniform4fv(m_skinProgram.localColors, 4, localColors);
+        glUniform1i(m_skinProgram.sampler, 0);
+        glUniform1i(m_skinProgram.useTexture, texture ? 1 : 0);
+        glUniform1i(m_skinProgram.alphaEnabled, state.alphaTest.enabled ? 1 : 0);
+        glUniform1i(m_skinProgram.alphaFunction, state.alphaTest.function & 7u);
+        glUniform1f(m_skinProgram.alphaReference, state.alphaTest.reference / 255.0f);
+        glUniform1i(m_skinProgram.fogEnabled, state.fog.enabled ? 1 : 0);
+        glUniform2f(m_skinProgram.fogRange, state.fog.start, state.fog.end);
+        glUniform4fv(m_skinProgram.fogColor, 1, fogColor);
+        if (texture)
+        {
+            glEnable(GL_TEXTURE_2D);
+            applyMeshSampler(texture, state, sampler);
+        }
+        else
+            glDisable(GL_TEXTURE_2D);
+
+        for (GpuSkinPart &skinPart : part.gpuSkinParts)
+        {
+            if (skinPart.paletteBones.size() > 24u)
+                continue;
+            std::array<GLfloat, 72u * 4u> paletteRows{};
+            bool valid = true;
+            for (std::size_t bone = 0; bone < skinPart.paletteBones.size(); ++bone)
+            {
+                const std::uint8_t sourceBone = skinPart.paletteBones[bone];
+                if (sourceBone >= state.skinPalette.size())
+                {
+                    valid = false;
+                    break;
+                }
+                const Matrix4 &matrix = state.skinPalette[sourceBone];
+                const std::size_t base = bone * 12u;
+                paletteRows[base + 0] = matrix[0]; paletteRows[base + 1] = matrix[4];
+                paletteRows[base + 2] = matrix[8]; paletteRows[base + 3] = matrix[12];
+                paletteRows[base + 4] = matrix[1]; paletteRows[base + 5] = matrix[5];
+                paletteRows[base + 6] = matrix[9]; paletteRows[base + 7] = matrix[13];
+                paletteRows[base + 8] = matrix[2]; paletteRows[base + 9] = matrix[6];
+                paletteRows[base + 10] = matrix[10]; paletteRows[base + 11] = matrix[14];
+            }
+            if (!valid)
+                return;
+            glUniform1i(m_skinProgram.skinCount, static_cast<GLint>(skinPart.paletteBones.size()));
+            glUniform4fv(m_skinProgram.skinRows, static_cast<GLsizei>(skinPart.paletteBones.size() * 3u), paletteRows.data());
+            glBindBuffer(GL_ARRAY_BUFFER, skinPart.vertexBuffer);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, skinPart.indexBuffer);
+            for (GLuint attribute = 0; attribute < 6u; ++attribute)
+                glEnableVertexAttribArray(attribute);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GpuSkinVertex), reinterpret_cast<const void *>(offsetof(GpuSkinVertex, position)));
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GpuSkinVertex), reinterpret_cast<const void *>(offsetof(GpuSkinVertex, uv)));
+            glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GpuSkinVertex), reinterpret_cast<const void *>(offsetof(GpuSkinVertex, color)));
+            glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GpuSkinVertex), reinterpret_cast<const void *>(offsetof(GpuSkinVertex, bones)));
+            glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(GpuSkinVertex), reinterpret_cast<const void *>(offsetof(GpuSkinVertex, weights)));
+            glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, sizeof(GpuSkinVertex), reinterpret_cast<const void *>(offsetof(GpuSkinVertex, normal)));
+            glDrawElements(GL_TRIANGLES, skinPart.indexCount, GL_UNSIGNED_SHORT, nullptr);
+            ++m_gpuSkinDraws;
+        }
+        glUseProgram(0);
+        for (GLuint attribute = 0; attribute < 6u; ++attribute)
+            glDisableVertexAttribArray(attribute);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        applyAlphaTest(state.alphaTest);
+        applyFog(state.fog);
+        glBlendEquation(GL_FUNC_ADD);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+
+    // The draw shows a whole texture (UV 0..1, so no neighbouring atlas cell can bleed in): filtered even when the
+    // game asked for point sampling.
+    bool wholeTextureLinear(const std::vector<ScreenVertex> &vertices, const ScreenDrawState &state) const
+    {
+        if (state.linearFilter)
+            return true;
+        if (m_target)
+            return false;
+        float u0 = 1.0f, u1 = 0.0f, v0 = 1.0f, v1 = 0.0f;
+        for (const ScreenVertex &v : vertices)
+        {
+            u0 = std::min(u0, v.u); u1 = std::max(u1, v.u);
+            v0 = std::min(v0, v.v); v1 = std::max(v1, v.v);
+        }
+        return u0 <= 0.01f && u1 >= 0.99f && v0 <= 0.01f && v1 >= 0.99f;
+    }
+
+    // Z bias of the next GEQUAL draw at the Z layer of `vertices` (see the comment in drawScreenPrimitive); counts it.
+    float screenZBias(const ScreenVertex *vertices, std::size_t count, const ScreenDrawState &state)
+    {
+        if (m_target || !state.depthTest || state.depthFunction != ScreenDepthFunction::GreaterEqual ||
+            !screenZBiasEnabled())
+            return 0.0f;
+        float zMax = vertices[0].z;
+        for (std::size_t i = 1; i < count; ++i)
+            zMax = std::max(zMax, vertices[i].z);
+        std::uint32_t *counter = nullptr;
+        for (auto &layer : m_screenZLayers)
+            if (layer.first == vertices[0].z)
+            {
+                counter = &layer.second;
+                break;
+            }
+        if (!counter)
+        {
+            m_screenZLayers.emplace_back(vertices[0].z, 0u);
+            counter = &m_screenZLayers.back().second;
+        }
+        // Never past the near plane (Z = 1), and never more than a fraction of a layer.
+        const float bias = std::min({static_cast<float>(*counter) * 2.5e-7f, 1.5e-4f, std::max(1.0f - zMax, 0.0f)});
+        ++*counter;
+        return bias;
+    }
+
+    // ---- screen draw batching (screen_batch.h)
+    struct SmallTexture
+    {
+        std::uint32_t width = 0, height = 0;
+        std::vector<std::uint8_t> rgba;
+        detail::AtlasSlot slot;
+    };
+    std::unordered_map<std::string, SmallTexture> m_smallTextures;
+    detail::AtlasAllocator m_atlas;
+    std::vector<GLuint> m_atlasPages;
+    detail::ScreenBatch m_batch;
+    std::vector<std::uint8_t> m_atlasScratch;
+
+    void storeSmallTexture(const std::string &key, const TextureData &source)
+    {
+        if (!detail::screenAtlasEnabled() || !detail::AtlasAllocator::eligible(source.width, source.height))
+            return;
+        SmallTexture &small = m_smallTextures[key];
+        small.width = source.width;
+        small.height = source.height;
+        small.rgba = source.rgba;
+        if (small.slot.valid())
+            writeAtlasSlot(small); // already placed: refresh its pixels
+    }
+
+    void dropSmallTexture(const std::string &key)
+    {
+        const auto found = m_smallTextures.find(key);
+        if (found == m_smallTextures.end())
+            return;
+        m_atlas.release(found->second.slot);
+        m_smallTextures.erase(found);
+    }
+
+    GLuint atlasPage(int page)
+    {
+        while (static_cast<int>(m_atlasPages.size()) <= page)
+        {
+            const std::vector<std::uint8_t> blank(static_cast<std::size_t>(detail::AtlasAllocator::kPageSize) *
+                                                      detail::AtlasAllocator::kPageSize * 4u, 0u);
+            GLuint texture = 0;
+            glGenTextures(1, &texture);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, detail::AtlasAllocator::kPageSize, detail::AtlasAllocator::kPageSize,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, blank.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            m_atlasPages.push_back(texture);
+        }
+        return m_atlasPages[static_cast<std::size_t>(page)];
+    }
+
+    void writeAtlasSlot(const SmallTexture &small)
+    {
+        detail::padAtlasPixels(small.rgba.data(), small.slot.w, small.slot.h, m_atlasScratch);
+        glBindTexture(GL_TEXTURE_2D, atlasPage(small.slot.page));
+        glTexSubImage2D(GL_TEXTURE_2D, 0, small.slot.x - 1, small.slot.y - 1, small.slot.w + 2, small.slot.h + 2,
+                        GL_RGBA, GL_UNSIGNED_BYTE, m_atlasScratch.data());
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    // The atlas slot of a named texture, placed on first use; null when it has none (too big, atlas full, off).
+    SmallTexture *atlasSlotFor(const std::string &key)
+    {
+        const auto found = m_smallTextures.find(key);
+        if (found == m_smallTextures.end())
+            return nullptr;
+        SmallTexture &small = found->second;
+        if (!small.slot.valid())
+        {
+            small.slot = m_atlas.allocate(static_cast<int>(small.width), static_cast<int>(small.height));
+            if (!small.slot.valid())
+                return nullptr;
+            writeAtlasSlot(small);
+        }
+        return &small;
+    }
+
+    void submitScreenTriangles(const std::vector<ScreenVertex> &vertices, float sourceWidth, float sourceHeight,
+                               std::string_view textureName, const ScreenDrawState &state)
+    {
+        const bool timing = resourceDiagEnabled();
+        const std::uint64_t t0 = timing ? diagNowUs() : 0u;
+        GLuint texture = 0u;
+        SmallTexture *small = nullptr;
+        if (!textureName.empty())
+        {
+            const std::string key = textureKey(textureName);
+            // Whole-texture UVs only: a repeat or wrap the game asked for stays on the texture's own object.
+            bool inside = true;
+            for (const ScreenVertex &v : vertices)
+                if (!(v.u >= -1e-4f && v.u <= 1.0001f && v.v >= -1e-4f && v.v <= 1.0001f))
+                {
+                    inside = false;
+                    break;
+                }
+            if (inside)
+                small = atlasSlotFor(key);
+            if (!small)
+            {
+                const auto found = m_textures.find(key);
+                if (found != m_textures.end())
+                    texture = found->second;
+            }
+        }
+        const bool linear = (small != nullptr || texture != 0u) && wholeTextureLinear(vertices, state);
+        const GLuint page = small ? atlasPage(small->slot.page) : texture;
+        const std::uintptr_t id = static_cast<std::uintptr_t>(page);
+        if (!m_batch.accepts(sourceWidth, sourceHeight, id, linear, m_screenPlacement, state, vertices.data(),
+                             vertices.size()))
+        {
+            flushScreenBatch();
+            m_batch.begin(sourceWidth, sourceHeight, id, linear, m_screenPlacement, state);
+        }
+        m_batch.added(vertices.data(), vertices.size());
+        const std::size_t first = m_batch.vertices.size();
+        m_batch.vertices.insert(m_batch.vertices.end(), vertices.begin(), vertices.end());
+        ScreenVertex *added = m_batch.vertices.data() + first;
+        if (small)
+        {
+            const float scaleU = static_cast<float>(small->slot.w) / detail::AtlasAllocator::kPageSize;
+            const float scaleV = static_cast<float>(small->slot.h) / detail::AtlasAllocator::kPageSize;
+            const float baseU = static_cast<float>(small->slot.x) / detail::AtlasAllocator::kPageSize;
+            const float baseV = static_cast<float>(small->slot.y) / detail::AtlasAllocator::kPageSize;
+            for (std::size_t i = 0; i < vertices.size(); ++i)
+            {
+                added[i].u = baseU + added[i].u * scaleU;
+                added[i].v = baseV + added[i].v * scaleV;
+            }
+        }
+        const float bias = screenZBias(added, vertices.size(), state);
+        if (bias > 0.0f)
+            for (std::size_t i = 0; i < vertices.size(); ++i)
+                added[i].z += bias;
+        if (timing)
+        {
+            m_screenTiming.submitUs += diagNowUs() - t0;
+            ++m_screenTiming.submits;
+        }
+    }
+
+    void flushScreenBatch()
+    {
+        if (!m_batch.active)
+            return;
+        m_batch.active = false;
+        if (m_batch.vertices.empty())
+            return;
+        const ScreenPlacement saved = m_screenPlacement;
+        m_screenPlacement = m_batch.placement;
+        drawScreenPrimitive(m_batch.vertices, m_batch.sourceWidth, m_batch.sourceHeight, std::string_view{}, m_batch.state,
+                            GL_TRIANGLES, static_cast<long>(m_batch.texture), m_batch.linear ? 1 : 0, true);
+        m_screenPlacement = saved;
+        m_batch.vertices.clear();
+    }
+
+    // forcedTexture >= 0: the GL texture to sample (0: none) instead of the one named; forcedLinear >= 0 its
+    // filter; zBiased: the vertices already carry their GEQUAL Z bias (batched draws).
     void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
                              float sourceWidth, float sourceHeight,
                              std::string_view textureName,
-                             const ScreenDrawState &state, GLenum primitive)
+                             const ScreenDrawState &state, GLenum primitive,
+                             long forcedTexture = -1, int forcedLinear = -1, bool zBiased = false)
     {
         if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
             return;
-        std::vector<ScreenGpuVertex> gpu;
-        gpu.reserve(vertices.size());
-        for (const ScreenVertex &v : vertices)
-            gpu.push_back({v.x, v.y, v.z, v.u, v.v, v.color[0], v.color[1], v.color[2], v.color[3]});
+        const bool timing = resourceDiagEnabled() && !m_target;
+        std::uint64_t timingMark = timing ? diagNowUs() : 0u;
+        const auto lap = [&](int phase) {
+            if (!timing) return;
+            const std::uint64_t now = diagNowUs();
+            m_screenTiming.us[phase] += now - timingMark;
+            timingMark = now;
+        };
+        // Inside a render-target pass the source space is the target itself, drawn upside down like
+        // the world draws of the pass.
+        const FitViewport viewport = m_target ? worldViewport()
+            : screenViewport(sourceWidth, sourceHeight,
+                             FitViewport{0, 0, std::max(GetScreenWidth(), 1), std::max(GetScreenHeight(), 1)}, fitViewport);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
 
         applyAlphaTest(state.alphaTest);
         applyFog(state.fog);
         applyShadeMode(state.gouraudShading);
-        glDisable(GL_DEPTH_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        if (state.depthTest)
+            glEnable(GL_DEPTH_TEST);
+        else
+            glDisable(GL_DEPTH_TEST);
+        glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
+        switch (state.depthFunction)
+        {
+        case ScreenDepthFunction::Never: glDepthFunc(GL_NEVER); break;
+        case ScreenDepthFunction::GreaterEqual: glDepthFunc(GL_LEQUAL); break;
+        case ScreenDepthFunction::Greater: glDepthFunc(GL_LESS); break;
+        case ScreenDepthFunction::Always:
+        default: glDepthFunc(GL_ALWAYS); break;
+        }
         glDisable(GL_CULL_FACE);
+        lap(0);
         GLuint texture = 0u;
-        if (!textureName.empty())
+        if (forcedTexture >= 0)
+            texture = static_cast<GLuint>(forcedTexture);
+        else if (!textureName.empty())
         {
             const auto found = m_textures.find(textureKey(textureName));
             if (found != m_textures.end())
@@ -853,11 +2208,17 @@ private:
             glBindTexture(GL_TEXTURE_2D, texture);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, state.linearFilter ? GL_LINEAR : GL_NEAREST);
+            // The game draws its 512x512 dialogue portraits texel-for-pixel with point sampling.
+            // The host scales the 448-line picture to 544 lines (x1.214), where point sampling
+            // repeats every fifth texel or so and the portrait looks stepped. A draw that shows a
+            // whole texture (UV 0..1, so no neighbouring atlas cell can bleed in) is filtered.
+            bool linear = forcedLinear >= 0 ? forcedLinear != 0 : wholeTextureLinear(vertices, state);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
         }
         else
             glDisable(GL_TEXTURE_2D);
+        lap(1);
         switch (state.blend)
         {
         case ScreenBlend::Opaque:
@@ -865,25 +2226,53 @@ private:
             break;
         case ScreenBlend::Additive:
             glEnable(GL_BLEND);
-            glBlendEquation(GL_FUNC_ADD);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ONE, GL_ZERO);
             break;
         case ScreenBlend::Subtractive:
             glEnable(GL_BLEND);
-            glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ONE, GL_ZERO);
+            break;
+        case ScreenBlend::DestinationOnly:
+            glEnable(GL_BLEND);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ZERO);
+            break;
+        case ScreenBlend::DestinationAlphaAdditive:
+            glEnable(GL_BLEND);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ONE, GL_ZERO);
             break;
         default:
             glEnable(GL_BLEND);
-            glBlendEquation(GL_FUNC_ADD);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                state.destinationAlphaTest ? GL_DST_ALPHA : GL_ONE, GL_ZERO);
             break;
         }
+        lap(2);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glOrthof(0.0f, sourceWidth, sourceHeight, 0.0f, -1.0f, 1.0f);
+        if (m_target && targetFlipEnabled())
+            glOrthof(0.0f, sourceWidth, 0.0f, sourceHeight, -1.0f, 0.0f);
+        else
+            glOrthof(0.0f, sourceWidth, sourceHeight, 0.0f, -1.0f, 0.0f);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
+        // The GS passes a GEQUAL depth test on exactly equal Z, and the game relies on it: HUD text
+        // is drawn at the same Z as the panel under it. The Vita's GPU does not give two different
+        // triangles bit-identical depth for the same Z (desktop GPUs and Vita3K do), which cut
+        // glyphs out. So the n-th GEQUAL draw of a frame at a given Z is moved n steps nearer: a
+        // step is a few float ulps of Z, and the game's Z layers are thousands of steps apart.
+        // P3FES_SCREEN_Z_BIAS=0 disables it.
+        if (!zBiased)
+        {
+            const float bias = screenZBias(vertices.data(), vertices.size(), state);
+            if (bias > 0.0f)
+                glTranslatef(0.0f, 0.0f, bias);
+        }
+        lap(3);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glEnableClientState(GL_VERTEX_ARRAY);
@@ -891,13 +2280,63 @@ private:
         if (texture)
         {
             glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(ScreenGpuVertex), &gpu[0].u);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(ScreenVertex), &vertices[0].u);
         }
         else
             glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        glVertexPointer(3, GL_FLOAT, sizeof(ScreenGpuVertex), &gpu[0].x);
-        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenGpuVertex), &gpu[0].r);
-        glDrawArrays(primitive, 0, static_cast<GLsizei>(gpu.size()));
+        glVertexPointer(3, GL_FLOAT, sizeof(ScreenVertex), &vertices[0].x);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenVertex), vertices[0].color.data());
+        lap(4);
+        const auto drawVertices = [&] {
+            glDrawArrays(primitive, 0, static_cast<GLsizei>(vertices.size()));
+            if (timing) ++m_screenTiming.glDraws;
+#if defined(PS2X_P3FES_FRAME_TRACE)
+            p3fes_frame_trace::gpuPass(static_cast<uint32_t>(primitive),
+                static_cast<uint32_t>(vertices.size()),
+                static_cast<uint32_t>(vertices.size() * sizeof(ScreenVertex)));
+#endif
+        };
+        const bool alphaFailPass = state.alphaTest.enabled &&
+                                   state.alphaFailAction != ScreenAlphaFailAction::Keep;
+        if (state.alphaFailAction == ScreenAlphaFailAction::FramebufferOnly &&
+            (!state.depthWrite || !state.depthTest))
+        {
+            // With no observable depth side effect, both alpha outcomes write
+            // the same framebuffer result; one draw without alpha test is exact.
+            glDisable(GL_ALPHA_TEST);
+            drawVertices();
+        }
+        else
+        {
+            drawVertices();
+            if (alphaFailPass && complementGsAlphaFunction(state.alphaTest.function) != 0u &&
+                (state.alphaFailAction != ScreenAlphaFailAction::DepthOnly || state.depthWrite))
+            {
+                AlphaTestState failedAlpha = state.alphaTest;
+                failedAlpha.function = complementGsAlphaFunction(state.alphaTest.function);
+                applyAlphaTest(failedAlpha);
+                switch (state.alphaFailAction)
+                {
+                case ScreenAlphaFailAction::FramebufferOnly:
+                    glDepthMask(GL_FALSE);
+                    break;
+                case ScreenAlphaFailAction::DepthOnly:
+                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                    glDepthMask(GL_TRUE);
+                    break;
+                case ScreenAlphaFailAction::RgbOnly:
+                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+                    glDepthMask(GL_FALSE);
+                    break;
+                case ScreenAlphaFailAction::Keep:
+                default:
+                    break;
+                }
+                drawVertices();
+            }
+        }
+        lap(5);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);
         glDisableClientState(GL_VERTEX_ARRAY);
@@ -906,19 +2345,54 @@ private:
         glDisable(GL_ALPHA_TEST);
         glDisable(GL_FOG);
         glShadeModel(GL_SMOOTH);
+        // Leave the shared context in the renderer's normal 3D state. Each
+        // subsequent screen primitive applies its own depth state above.
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+        glDepthFunc(GL_LEQUAL);
         glEnable(GL_BLEND);
-        glBlendEquation(GL_FUNC_ADD);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
         m_in3D = false;
+        lap(6);
+        if (timing)
+        {
+            ++m_screenTiming.draws;
+            m_screenTiming.vertices += static_cast<std::uint32_t>(vertices.size());
+        }
     }
     void removeTextureLocked(std::string_view name)
     {
+        flushScreenBatch();
         const std::string key = textureKey(name);
+        dropSmallTexture(key);
         auto found = m_textures.find(key);
         if (found == m_textures.end())
             return;
+        const auto target = m_targets.find(key);
+        if (target != m_targets.end())
+        {
+            if (m_target == &target->second)
+            {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glFrontFace(GL_CCW);
+                m_target = nullptr;
+                ps2xVitaGlMutex().unlock();
+            }
+            glFinish();
+            if (target->second.framebuffer)
+                glDeleteFramebuffers(1, &target->second.framebuffer);
+            m_targets.erase(target);
+        }
         if (found->second)
+        {
+            // Texture retirement can happen after its last CPU-side reference
+            // is dropped while an earlier draw still references the GL object.
+            // Wait for submitted work before deleting it; this path is used
+            // for unload/replacement, not for per-frame draws.
+            glFinish();
             glDeleteTextures(1, &found->second);
+        }
         m_textures.erase(found);
         m_textureSizes.erase(key);
     }
@@ -935,13 +2409,103 @@ private:
     bool m_open = false;
     bool m_ownsWindow = false;
     bool m_in3D = false;
+    bool m_gpuSkinEnabled = false;
+    SkinProgram m_skinProgram{};
+    std::uint64_t m_gpuSkinReportFrames = 0;
+    // Time inside drawScreenPrimitive by phase (P3FES_RESOURCE_DIAG), microseconds since the last report.
+    struct ScreenTiming
+    {
+        std::uint64_t us[7] = {};
+        std::uint32_t draws = 0, glDraws = 0, vertices = 0;
+        std::uint64_t submitUs = 0;
+        std::uint32_t submits = 0;
+    };
+    ScreenTiming m_screenTiming;
+    struct MeshTiming
+    {
+        std::uint64_t us = 0, regenUs = 0, computeUs = 0;
+        std::uint32_t calls = 0, regenVerts = 0, regenSkinnedParts = 0, regenStaticParts = 0;
+        std::uint32_t regenSkinnedVerts = 0, regenStaticVerts = 0;
+        std::uint32_t reusedParts[2] = {0, 0};
+        std::uint64_t hotUs = 0;
+        std::uint32_t hotVerts = 0;
+        // P3FES_MESH_VERIFY: fast kernel against the scalar reference, per vertex.
+        std::uint64_t verifyVerts = 0, verifyColorOff1 = 0, verifyColorBad = 0, verifyUvBad = 0, verifyPosBad = 0;
+        float verifyPosMax = 0.0f;
+        std::uint32_t reasons[2][512] = {};   // [skinned][mismatch bits]: how often each reason set came up
+    };
+    MeshTiming m_meshTiming, m_meshTimingTarget; // display frame / render-target passes
+    static std::uint64_t diagNowUs()
+    {
+#if defined(__vita__)
+        return sceKernelGetProcessTimeWide();
+#else
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+    }
+    std::uint64_t m_gpuSkinDraws = 0;
+    std::uint64_t m_gpuSkinCpuFallbacks = 0;
+    std::array<std::uint64_t, 5> m_gpuSkinFallbackReasons{};
     Camera m_camera{};
+    struct Target
+    {
+        GLuint framebuffer = 0;
+        int width = 0;
+        int height = 0;
+    };
+    std::unordered_map<std::string, Target> m_targets; // colour textures live in m_textures
+    Target *m_target = nullptr;
+    int m_widescreen = 0;
+    ScreenPlacement m_screenPlacement = ScreenPlacement::Centre;
+
+template <typename Viewport, typename Fit>
+    Viewport screenViewport(float sourceWidth, float sourceHeight, Viewport full, Fit fit) const
+    {
+        if (m_widescreen == 1 || (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Stretch))
+            return full;
+        Viewport viewport = fit(sourceWidth, sourceHeight);
+        if (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Left)
+            viewport.x = full.x;
+        else if (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Right)
+            viewport.x = full.x + full.width - viewport.width;
+        return viewport;
+    }
+    std::vector<std::pair<float, std::uint32_t>> m_screenZLayers; // Z -> GEQUAL draws so far this frame
+
+    static bool screenZBiasEnabled()
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("P3FES_SCREEN_Z_BIAS");
+            return !value || *value != '0';
+        }();
+        return enabled;
+    }
+    static bool targetFlipEnabled()
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("P3FES_TARGET_FLIP");
+            return !value || *value != '0';
+        }();
+        return enabled;
+    }
+
+    FitViewport worldViewport() const
+    {
+        if (m_target)
+            return {0, 0, m_target->width, m_target->height};
+        if (m_widescreen != 0)
+            return {0, 0, std::max(GetScreenWidth(), 1), std::max(GetScreenHeight(), 1)};
+        return fitViewport(640.0f, 448.0f);
+    }
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
     std::unordered_map<std::string, GLuint> m_textures;
     std::unordered_map<std::string, std::array<std::uint32_t, 2>> m_textureSizes;
 
     void apply3D()
     {
+        const FitViewport viewport = worldViewport();
+        glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
         glMatrixMode(GL_PROJECTION);
         if (m_camera.useMatrices)
         {
@@ -951,8 +2515,7 @@ private:
         }
         else
         {
-            const float aspect = static_cast<float>(std::max(GetScreenWidth(), 1)) /
-                                 static_cast<float>(std::max(GetScreenHeight(), 1));
+            const float aspect = 640.0f / 448.0f;
             constexpr float nearPlane = 0.1f;
             constexpr float farPlane = 10000.0f;
             const float radians = m_camera.fovy * 0.008726646259971648f;

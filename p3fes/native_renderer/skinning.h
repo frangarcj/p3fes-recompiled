@@ -34,20 +34,46 @@ inline Vertex poseSkinVertex(const Vertex &source, const std::vector<Matrix4> &p
     std::array<float, 3> position{};
     std::array<float, 3> normal{};
     float weightSum = 0.0f;
-    for (std::size_t i = 0; i < source.weights.size(); ++i)
+    // Common rigidly weighted vertices need only one transform. Restrict this
+    // path to an exact unit weight so position normalization and the normal
+    // length threshold retain the same floating-point behavior as the loop.
+    bool singleUnitInfluence = source.weights[0] == 1.0f && source.bones[0] < palette.size();
+    for (std::size_t i = 1; singleUnitInfluence && i < source.weights.size(); ++i)
     {
         const float weight = source.weights[i];
         const std::uint32_t bone = source.bones[i];
-        if (!(weight > 0.0f) || !std::isfinite(weight) || bone >= palette.size())
-            continue;
-        const auto p = skinTransformPoint(palette[bone], source.position);
-        const auto n = skinTransformVector(palette[bone], source.normal);
+        if (weight > 0.0f && std::isfinite(weight) && bone < palette.size())
+            singleUnitInfluence = false;
+    }
+
+    if (singleUnitInfluence)
+    {
+        const auto p = skinTransformPoint(palette[source.bones[0]], source.position);
+        const auto n = skinTransformVector(palette[source.bones[0]], source.normal);
         for (int c = 0; c < 3; ++c)
         {
-            position[c] += p[c] * weight;
-            normal[c] += n[c] * weight;
+            position[c] += p[c];
+            normal[c] += n[c];
         }
-        weightSum += weight;
+        weightSum += 1.0f;
+    }
+    else
+    {
+        for (std::size_t i = 0; i < source.weights.size(); ++i)
+        {
+            const float weight = source.weights[i];
+            const std::uint32_t bone = source.bones[i];
+            if (!(weight > 0.0f) || !std::isfinite(weight) || bone >= palette.size())
+                continue;
+            const auto p = skinTransformPoint(palette[bone], source.position);
+            const auto n = skinTransformVector(palette[bone], source.normal);
+            for (int c = 0; c < 3; ++c)
+            {
+                position[c] += p[c] * weight;
+                normal[c] += n[c] * weight;
+            }
+            weightSum += weight;
+        }
     }
     if (!(weightSum > 1.0e-8f))
         return source;

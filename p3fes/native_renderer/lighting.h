@@ -8,6 +8,49 @@
 
 namespace p3fes::native_renderer
 {
+// Mesh alpha test with the GS alpha-fail action FB_ONLY: a pixel that fails is still drawn (blended), it
+// only does not write Z. The runtime marks such a test by setting this bit in AlphaTestState::function
+// (the backends and the shaders only ever look at the low three bits, the raw GS ATST). A backend that
+// honours it draws the part twice: alphaTestPassOne() with the normal depth state, then
+// alphaTestFailPass() with depth writes masked. Skinned parts draw once with the plain test.
+constexpr std::uint8_t kAlphaTestFbOnlyFlag = 0x08u;
+
+inline bool alphaTestFbOnly(const AlphaTestState &test)
+{
+    return test.enabled && (test.function & kAlphaTestFbOnlyFlag) != 0u;
+}
+
+// The GS compares alpha in its own units (opaque = 0x80); decoded textures and the shaders use 0..255
+// with opaque = 255, so the register's reference is doubled for the two-pass split.
+inline std::uint8_t alphaTestScaledReference(std::uint8_t reference)
+{
+    return static_cast<std::uint8_t>(std::min<unsigned>(255u, static_cast<unsigned>(reference) * 2u));
+}
+
+inline AlphaTestState alphaTestPassOne(const AlphaTestState &test)
+{
+    AlphaTestState out = test;
+    out.function = static_cast<std::uint8_t>(test.function & 0x7u);
+    out.reference = alphaTestScaledReference(test.reference);
+    return out;
+}
+
+inline AlphaTestState alphaTestFailPass(const AlphaTestState &test)
+{
+    AlphaTestState out = test;
+    out.function = complementGsAlphaFunction(static_cast<std::uint8_t>(test.function & 0x7u));
+    out.reference = alphaTestScaledReference(test.reference);
+    return out;
+}
+
+// What a part that is not drawn twice uses: the register's own test.
+inline AlphaTestState alphaTestSinglePass(const AlphaTestState &test)
+{
+    AlphaTestState out = test;
+    out.function = static_cast<std::uint8_t>(test.function & 0x7u);
+    return out;
+}
+
 inline std::array<float, 3> transformNormal(const Matrix4 &model, const std::array<float, 3> &normal)
 {
     std::array<float, 3> out{

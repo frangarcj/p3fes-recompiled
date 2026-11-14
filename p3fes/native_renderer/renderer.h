@@ -36,6 +36,8 @@ struct Camera
     bool useMatrices = false;
     Matrix4 view = kIdentityMatrix;
     Matrix4 projection = kIdentityMatrix;
+
+    bool operator==(const Camera &) const = default;
 };
 
 struct ClearColor
@@ -52,6 +54,9 @@ struct ClearColor
 // and colour-only UI can move off the GS before live RwRaster upload support.
 struct ScreenVertex
 {
+    // Normalized GS depth: 0 is far and 1 is near. Backends map this to
+    // window depth 1-z so the GS greater/greater-equal tests match GL's
+    // less/less-equal depth comparisons.
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float u = 0.0f, v = 0.0f;
     std::array<std::uint8_t, 4> color{255u, 255u, 255u, 255u};
@@ -62,8 +67,32 @@ enum class ScreenBlend : std::uint8_t
     Alpha,
     Additive,
     Subtractive,
+    DestinationOnly,
+    DestinationAlphaAdditive,
     Opaque,
 };
+
+enum class ScreenDepthFunction : std::uint8_t
+{
+    Never,
+    Always,
+    GreaterEqual,
+    Greater,
+};
+
+enum class ScreenAlphaFailAction : std::uint8_t
+{
+    Keep,
+    FramebufferOnly,
+    DepthOnly,
+    RgbOnly,
+};
+
+constexpr std::uint8_t complementGsAlphaFunction(std::uint8_t function)
+{
+    constexpr std::uint8_t kComplement[8]{1u, 0u, 5u, 6u, 7u, 2u, 3u, 4u};
+    return kComplement[function & 0x7u];
+}
 
 struct AlphaTestState
 {
@@ -85,12 +114,20 @@ struct FogState
 struct ScreenDrawState
 {
     ScreenBlend blend = ScreenBlend::Alpha;
+    bool depthTest = false;
+    bool depthWrite = false;
+    ScreenDepthFunction depthFunction = ScreenDepthFunction::Always;
+    ScreenAlphaFailAction alphaFailAction = ScreenAlphaFailAction::Keep;
     bool gouraudShading = true;
     bool clampU = false;
     bool clampV = false;
     bool linearFilter = true;
     AlphaTestState alphaTest{};
     FogState fog{};
+    // GS TEST.DATE with DATM = 1: only pixels whose destination alpha is set (>= 0x80) are
+    // written. Used on render targets whose alpha is a mask (the shadow map's silhouette);
+    // backends approximate it by multiplying the written alpha by the destination alpha.
+    bool destinationAlphaTest = false;
 };
 
 struct MeshDrawState
@@ -127,6 +164,9 @@ struct MeshDrawState
         bool linearFilter = true;
     };
     std::vector<SamplerState> materialSamplers;
+    // Live resource handles, independent of the lifetime of cached geometry.
+    // An entry (including an empty one) overrides its mesh material's binding.
+    std::vector<std::string> materialTextures;
 
     // Optional per-draw RenderWare material colours. Persona 3 mutates these
     // for model fades/tints immediately before AtomicDefaultRenderCallBack,
@@ -230,7 +270,31 @@ public:
     virtual bool uploadMesh(MeshId id, const MeshData &mesh, std::string &error) = 0;
     virtual void removeMesh(MeshId id) = 0;
 
+    // Render-to-texture pass (RenderWare camera-texture rasters, e.g. the character shadow map).
+    // Called outside beginFrame/endFrame, before the frame that samples the result. World draws,
+    // setCamera and clear between the two calls go to a width x height colour+depth target whose
+    // colour buffer is then sampled under `name` like an uploaded texture (same orientation: v = 0
+    // is the top row). uploadTexture for that name is ignored while the target exists; removeTexture
+    // destroys it.
+    virtual void beginTextureTarget(std::string_view name, int width, int height) = 0;
+    virtual void endTextureTarget() = 0;
+    // Widescreen. 0: everything in the centred 4:3 area. 1: world and screen-space draws both use
+    // the whole host framebuffer (2-D is stretched horizontally, as on a 16:9 TV). 2: world draws
+    // use the whole framebuffer and screen-space draws keep square pixels (uniform scale), placed
+    // by setScreenPlacement.
+    virtual void setWidescreen(int mode) = 0;
+    enum class ScreenPlacement : std::uint8_t { Centre, Left, Right, Stretch };
+    // Widescreen mode 2 only: where the following screen-space draws put their 4:3 source area on
+    // the wider framebuffer (against the left or right edge, centred, or stretched over all of it).
+    virtual void setScreenPlacement(ScreenPlacement placement) = 0;
+    // Diagnostic: write the finished frame as a raw file ("P3FB" + u32 width + u32 height + RGBA8
+    // rows, top row first) during the next endFrame. Returns false when unsupported.
+    virtual bool captureNextFrame(const std::string &path) { (void)path; return false; }
+
     virtual void beginFrame(const Camera &camera, ClearColor clear) = 0;
+    // Change view/projection state inside the current frame without clearing
+    // or presenting. The next world-space draw uses this camera.
+    virtual void setCamera(const Camera &camera) = 0;
     virtual void clear(ClearColor clear, bool colorBuffer, bool depthBuffer) = 0;
     virtual void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state = {}) = 0;
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix, {}); }
@@ -248,6 +312,9 @@ public:
                                  std::string_view textureName = {},
                                  const ScreenDrawState &state = {}) = 0;
     virtual void endFrame() = 0;
+    // P3FES_RESOURCE_DIAG: the backend's own timing counters since the last call, as printable lines
+    // (empty when it keeps none). Host thread only.
+    virtual std::string drainDiagReport() { return {}; }
 };
 
 // One platform backend behind the same asset/draw contract: raylib/OpenGL on
