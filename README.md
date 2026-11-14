@@ -152,8 +152,105 @@ Fresh Vita builds use the title id `P3FES0001` and expect the user's game files 
 `SYSTEM.CNF` and `LIB31/` there as well. These files are not packaged into the VPK and must not
 be committed or redistributed.
 
-The Vita build uses the built-in GS as the correctness fallback. The native RenderWare path is
-being brought up separately through the portable `.p3n` asset/renderer interface.
+The Vita target is a native engine backend: recompiled game logic feeds native
+RenderWare resources and Vita graphics/audio/video services. Assets should be
+prepared at load time, updated through explicit resource lifecycle operations,
+and reused while drawing. Per-frame raster hashes, memory scans and emulated
+GS texture uploads are transitional work to remove from that path.
+
+The immediate validation target is memory-card screen, logos, opening movie and
+interactive menu at full speed in the local `../vita3k` build. Hardware validation
+comes after this gate. Local Vita3K runs on 2026-11-12 and 2026-11-13 completed the
+FES opening (about 89.5 seconds, 2,671 video frames) and interactive menu. The newer
+build also completed the original P3 opening (93.79 seconds, 2,801 frames).
+Earlier short title/menu windows reached approximately 30 native presents/s, but
+this does not establish the full menu speed gate. A later repeatable Load Game
+probe (88 textures, 72 draws, no uploads or 3D meshes) measured 20.38 presents/s
+for the validated build, 21.60 for the subsequent build and 21.80 after moving
+branch diagnostics out of the dispatch hot path (12 five-second windows each).
+Host thread priorities differed between sequential runs, so these numbers do not
+establish an isolated optimization gain. The latest run completed the opening and
+reached the same interactive menu; full speed remains unverified.
+The opening uses SceAvPlayer and the title/menu
+music uses streaming PCM through SceAudioOut. Ordinary textures use native resources
+with explicit creation, mutation and destruction events, without per-frame content
+fingerprints; the measured boot/menu path has no GS image uploads. Memory-card
+background colour matches the GS reference, and consecutive static Atlus captures
+are identical. Physical Vita, later story scenes and battles remain unverified for this
+native backend. Keep the GS path as a separate visual reference when replacing
+interfaces. See [native asset preparation](p3fes/scripts/native_assets/README.md).
+The latest IOP idle-path build completed both openings again, preserved the
+memory-card reference colours and produced six pixel-identical static Atlus
+captures. Its earlier Load Game trial measured 28.55 native presents/s across
+11 windows; later repeats above were slower. These historical measurements were
+not controlled for the subsequently discovered host-priority changes.
+
+A follow-up New Game probe on 2026-11-13 reached name entry and the first story
+scene. The lobby environment and dialogue portraits are visible after preserving
+camera transitions in draw order; the original frame camera was captured before
+CameraBeginUpdate and remained null. The three textured, animated characters also
+render after honoring the geometry prelight flag and rejecting null optional
+attribute buffers: reading absent vertex colours from RAM address zero had made
+their alpha zero. This scene runs at about 18 native presents/s, so it does not
+pass the story speed gate. Further scene accuracy still needs comparison.
+The probe also exposed native RenderWare entries that returned a value without
+returning the guest PC to `$ra`: a scheduler checkpoint could repeatedly dispatch
+the same draw until its command list exhausted memory. Those native returns are
+now explicit; `ps2xRuntime/tests/native_renderware_return_test.cpp` covers both
+direct entry and nested dispatch. Matrix/skin helper calls use an isolated guest
+context and resume interior checkpoints to completion before consuming their results;
+a regression test covers repeated checkpoints and preservation of caller state.
+Native compressed-key interpolation and matrix multiplication have 129 and 3,072
+differential cases against the recompiled routines, respectively; multiplication
+also covers safe normal values beyond its fast-path range and exceptional fallbacks.
+The general affine inverse has 512 comparisons against its actual recompiled callee.
+A follow-up lobby probe measured about 19 native presents/s with animated characters;
+this still fails the story speed gate. In that probe, interpolation and 35,046 skin
+palettes used native math with zero guest fallbacks. All 32 palette comparisons,
+spread across animation and scene placement, matched the original affine components
+with zero error. Other scenes and inverse/hierarchy modes still require validation.
+`P3FES_NATIVE_RW_MATH=0` selects the original animation/matrix/palette math for comparison.
+`P3FES_GPU_SKIN=1` enables an experimental VitaGL Cg skinning path (default off).
+It uploads bind-pose vertices, weights and bone indices once, and sends compact
+palettes of up to 24 bones per draw batch. Shader limits, compilation, linking
+and required uniforms are checked before enabling it. Unsupported dual/environment
+passes, flat shading, oversized light sets and missing palettes retain CPU rendering.
+With `P3FES_RESOURCE_DIAG=1`, `[native-skin]` reports GPU draws and CPU fallback reasons.
+Host tests validate palette remapping, triangle order, weight handling and the
+65,536-vertex boundary; they do not validate the Cg program or GPU rendering.
+Vita3K compiled and linked the Cg program and drew the first lobby's characters
+with zero skinning fallbacks. Visual inspection is not a pixel-level parity test.
+One sequential same-SELF trial measured 16.85 GPU vs 17.40 CPU presents/s (12 windows
+per arm, overlapping ranges); it demonstrates no speed gain. The option stays off.
+Other materials, fog/alpha cases and physical Vita still require validation.
+An IOP cached-idle fast path improved one matched Vita3K lobby A/B from 19.32 to
+20.29 native presents/s (12 five-second windows per run, same executable and camera).
+The 32 palette comparisons still matched with zero error. This scene remains below
+30 fps; host priorities were not controlled in this historical comparison, and
+it does not establish a portable speed gain or performance in other scenes.
+A bounded graphics-frame diagnostic is available with
+`-DPS2X_P3FES_FRAME_TRACE=ON` and `P3FES_FRAME_TRACE=1` in `runtime.cfg`.
+It records one native frame after `P3FES_FRAME_TRACE_AFTER_SEC` (default 145),
+matching `P3FES_FRAME_TRACE_DRAWS` commands (default 72, menu capture with no meshes).
+The JSON at `ux0:data/p3fes/frame-trace.json` includes guest graphics routes,
+command origins, textures, vertices, alpha/depth state and actual 2D GL pass counts.
+The local Vita3K screenshot marker captures that frame. Timings are intrusive wall
+measurements of the selected construction/presentation window, not GPU time or the
+whole game update. `p3fes/scripts/frame_trace_report.py` resolves guest PCs using
+the symbol map. The diagnostic is compiled out by default; reuse one JSON and PNG.
+
+Projection tests check the near/far clip planes
+for perspective and orthographic cameras. Mesh uploads compact vertices by material,
+and unchanged static vertex data is reused without content hashes. Rendering and
+speed still need validation beyond the boot/menu gate.
+
+The physical-Vita package expects a taiHEN-enabled homebrew environment: the linked
+vitaGL build imports taiHEN APIs. For a hardware measurement, set
+`PS2X_LOG_FILE=ux0:data/p3fes/hardware-boot.log` and `P3FES_RESOURCE_DIAG=1` in
+`runtime.cfg`, with no movie-test skip or controller script. Transfer the original
+game data and prepared movies/music separately from the VPK, preserving existing
+memory cards and saves. Memory diagnostics explicitly label invalid pool statistics
+and unavailable vitaGL extensions rather than treating them as measurements.
 
 <details>
 <summary><b>Runtime options</b></summary>
@@ -179,11 +276,14 @@ being brought up separately through the portable `.p3n` asset/renderer interface
 | `PS2X_HIDE_DEBUG_UI=1` | Hide the developer overlay |
 | `PS2X_AUDIO=0` | Disable host audio |
 | `PS2X_AUDIO_DUMP=<file>` | Dump the SPU2 output (s16le stereo 48 kHz) |
+| `PS2X_IOP_IDLE_FAST=0` | Disable the default cached-idle fast path for A/B checks; it advances only when the kernel cache and event/SPU clocks show no work through the target |
 | `PS2X_PROFILE=<file>` | Linux sampling profiler; summarise with `p3fes/scripts/prof_report.py` |
 
 Debug traces: `PS2X_SPU2_DIAG`, `PS2X_GS_DIAG`, `PS2X_IPU_TRACE`, `PS2X_DMA_LOG`, `PS2X_CD_LOG`, `PS2X_IOP_CD_LOG`,
 `PS2X_RPC_LOG`, `PS2X_IOP_RPC_COUNTS`, `PS2X_SIFDMA_LOG`, `PS2X_IOP_MEMLOG`, `PS2X_IOP_TRACE`, `PS2X_EE_CYCLE_STATS`, `PS2X_GIF_TRACE`, `PS2X_PCSX2_SHOTS`,
 `PS2X_PAD_SCRIPT` (with `PS2X_PAD_SCRIPT_CLOCK=fields`), `PS2X_EE_TRACE_CALLS`, `PS2X_LOG_SUSPEND`.
+`PS2X_BRANCH_RING=1` enables the last-256-branches diagnostic history; recording
+is off by default to avoid an atomic increment on every guest control transfer.
 
 </details>
 
