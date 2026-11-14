@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -44,10 +45,64 @@ namespace ps2x::iop::detail
     void IopImportRegistry::reset()
     {
         m_libraries.clear();
+        ++m_generation;
     }
 
     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
     {
+        // The same algorithm reading RAM directly (every word it touches is below the stub, hence in RAM) instead of
+        // through IopMemory::read32/read8 for each word of the backwards scan.
+        const uint32_t pcPhysical = IopMemory::physicalAddress(pc);
+        if ((pc & 3u) == 0u && pcPhysical + 8u <= IopMemory::RamSize)
+        {
+            const uint8_t *const ram = m_memory.ram().data();
+            const auto word = [ram](uint32_t address)
+            {
+                uint32_t value;
+                std::memcpy(&value, ram + address, sizeof(value));
+                return value;
+            };
+            if (word(pcPhysical) != 0x03E00008u)
+                return std::nullopt;
+            const uint32_t delay = word(pcPhysical + 4u);
+            if ((delay & 0xFFFF0000u) != 0x24000000u)
+                return std::nullopt;
+            const uint32_t searchBegin = pcPhysical > 0x10000u ? pcPhysical - 0x10000u : 0u;
+            for (uint32_t candidate = pcPhysical; candidate >= searchBegin + 20u; candidate -= 4u)
+            {
+                const uint32_t table = candidate - 20u;
+                if (word(table) != kImportMagic)
+                {
+                    if (candidate == searchBegin + 20u)
+                        break;
+                    continue;
+                }
+                const uint32_t stubs = table + 20u;
+                if (pcPhysical < stubs || ((pcPhysical - stubs) & 7u) != 0u)
+                    continue;
+                bool valid = false;
+                for (uint32_t stub = stubs; stub + 7u < IopMemory::RamSize && stub <= pcPhysical; stub += 8u)
+                {
+                    if (word(stub) == 0u && word(stub + 4u) == 0u)
+                        break;
+                    if (stub == pcPhysical)
+                    {
+                        valid = true;
+                        break;
+                    }
+                }
+                if (valid)
+                {
+                    char name[9]{};
+                    std::memcpy(name, ram + table + 12u, 8u);
+                    uint16_t version;
+                    std::memcpy(&version, ram + table + 8u, sizeof(version));
+                    return IopImportCall{trimLibraryName(name), static_cast<uint16_t>(delay & 0xFFFFu), version};
+                }
+            }
+            return std::nullopt;
+        }
+
         if (m_memory.read32(pc) != 0x03E00008u)
             return std::nullopt;
         const uint32_t delay = m_memory.read32(pc + 4u);
@@ -133,11 +188,13 @@ namespace ps2x::iop::detail
             if (!allowDuplicates && address != physical && existing.version == library.version && equalsIgnoreCase(existing.name, library.name))
                 return false;
         m_libraries[physical] = std::move(library);
+        ++m_generation;
         return true;
     }
 
     bool IopImportRegistry::releaseExportTable(uint32_t address)
     {
+        ++m_generation;
         return m_libraries.erase(IopMemory::physicalAddress(address)) != 0u;
     }
 
@@ -164,6 +221,36 @@ namespace ps2x::iop::detail
     }
 
     uint32_t IopImportRegistry::resolve(std::string_view library, uint16_t ordinal, std::optional<uint16_t> version) const
+    {
+        if (!m_resolveCacheEnabled || library.size() > 8u)
+            return resolveUncached(library, ordinal, version);
+        // case-insensitive key (findLibrary compares names ignoring case), valid for the current library set
+        char lowered[8]{};
+        uint32_t hash = 2166136261u;
+        for (size_t i = 0; i < library.size(); ++i)
+        {
+            const char c = library[i];
+            lowered[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+            hash = (hash ^ static_cast<uint8_t>(lowered[i])) * 16777619u;
+        }
+        const int32_t versionKey = version ? static_cast<int32_t>(*version) : -1;
+        hash = (hash ^ ordinal) * 16777619u;
+        hash = (hash ^ static_cast<uint32_t>(versionKey)) * 16777619u;
+        ResolveCacheEntry &slot = m_resolveCache[(hash ^ (hash >> 15u)) & 255u];
+        if (slot.generation == m_generation && slot.length == library.size() && slot.ordinal == ordinal &&
+            slot.version == versionKey && std::memcmp(slot.name, lowered, sizeof(lowered)) == 0)
+            return slot.target;
+        const uint32_t target = resolveUncached(library, ordinal, version);
+        std::memcpy(slot.name, lowered, sizeof(lowered));
+        slot.length = static_cast<uint8_t>(library.size());
+        slot.ordinal = ordinal;
+        slot.version = versionKey;
+        slot.target = target;
+        slot.generation = m_generation;
+        return target;
+    }
+
+    uint32_t IopImportRegistry::resolveUncached(std::string_view library, uint16_t ordinal, std::optional<uint16_t> version) const
     {
         const ExportLibrary *found = findLibrary(library, version);
         if (!found || ordinal >= found->functions.size())
@@ -193,6 +280,7 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
     {
+        ++m_generation;
         for (auto library = m_libraries.begin(); library != m_libraries.end();)
         {
             if (library->first >= base && library->first < base + size)

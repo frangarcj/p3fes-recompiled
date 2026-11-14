@@ -1,5 +1,7 @@
 #include "iop_timrman.h"
 
+#include <ostream>
+
 #include "../core/iop_cpu.h"
 #include "../services/iop_rpc.h"
 
@@ -490,5 +492,18 @@ namespace ps2x::iop::detail
     uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
     {
         return std::min(fallback, earliestEventCycle());
+    }
+
+    void IopTimrman::describe(std::ostream &out) const
+    {
+        for (size_t i = 0; i < m_timers.size(); ++i)
+        {
+            const Timer &t = m_timers[i];
+            if (!t.configured && !t.running)
+                continue;
+            out << "timer " << i << " running " << t.running << " source " << t.source << " prescale " << t.prescale << " compare " << t.compare
+                << " liveMode 0x" << std::hex << t.liveMode << " compareFn 0x" << t.compareCallback.function << " overflowFn 0x" << t.overflowCallback.function
+                << std::dec << " width " << int(t.width) << "\n";
+        }
     }
 }

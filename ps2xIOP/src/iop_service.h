@@ -3,6 +3,8 @@
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -10,6 +12,17 @@
 
 namespace ps2x::iop::detail
 {
+    // Where HLE services that replace an audio driver deliver decoded audio: 16-bit stereo PCM streams that the SPU2
+    // mixes into the host output (implemented by IopSubsystem on top of Spu2::streamPush).
+    class PcmSink
+    {
+    public:
+        virtual ~PcmSink() = default;
+        virtual void push(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames) = 0;
+        [[nodiscard]] virtual uint64_t consumed(uint32_t stream) const = 0;
+        virtual void reset(uint32_t stream) = 0;
+    };
+
     class IopService
     {
     public:
@@ -24,6 +37,12 @@ namespace ps2x::iop::detail
             return {};
         }
         virtual void reset() = 0;
+
+        // Called once after construction, only services that produce audio use it.
+        virtual void attachPcmSink(PcmSink *sink)
+        {
+            (void)sink;
+        }
 
         [[nodiscard]] virtual RpcAbi selectRpcAbi(const RpcAbiRequest &request) const
         {

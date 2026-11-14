@@ -6,6 +6,7 @@
 #include "ps2x/iop/iop_host.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 #include <array>
@@ -119,7 +120,9 @@ namespace ps2x::iop::detail
                     std::ostringstream out;
                     out << "[IOP:sifdma] src=0x" << std::hex << transfer.source << " dst=0x" << transfer.destination
                         << " size=0x" << transfer.size << " read=" << readOk << " write=" << writeOk << " bytes=";
-                    for (uint32_t b = 0u; b < std::min<uint32_t>(16u, transfer.size); ++b)
+                    // PS2X_IOP_TRACE_DMA=full dumps the whole transfer (default: the first 16 bytes).
+                    static const bool traceFull = std::getenv("PS2X_IOP_TRACE_DMA")[0] == 'f';
+                    for (uint32_t b = 0u; b < std::min<uint32_t>(traceFull ? 0x1000u : 16u, transfer.size); ++b)
                         out << ' ' << static_cast<uint32_t>(scratch[b]);
                     m_host.log(LogLevel::Info, out.str());
                 }
@@ -254,6 +257,11 @@ namespace ps2x::iop::detail
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
             server.priority = m_kernel.currentThreadPriority();
+            // Debug aid: PS2X_IOP_LOG_SERVERS=1 lists every RPC server an IRX registers (module load order shows which one).
+            static const bool logServers = std::getenv("PS2X_IOP_LOG_SERVERS") != nullptr;
+            if (logServers)
+                std::fprintf(stderr, "[iop-rpc-server] sid=0x%08x function=0x%08x buffer=0x%08x\n", server.sid,
+                             server.function, server.buffer);
             m_servers[server.sid] = server;
             if (server.serverData != 0u)
             {

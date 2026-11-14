@@ -9,7 +9,7 @@ namespace ps2x::iop::detail
     namespace
     {
         constexpr int32_t kAdpcmFilters[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
-        constexpr size_t kMaxBufferedFrames = 48000u * 2u; // 2 s; with no consumer the oldest samples are dropped
+        constexpr size_t kAdmaBlockBytes = 1024u; // one ADMA block: 256 L + 256 R samples
 
         int16_t clamp16(int32_t value) noexcept
         {
@@ -35,9 +35,18 @@ namespace ps2x::iop::detail
         uint32_t g_diagUnmixedSamples[2] = {};
         uint32_t g_diagWrites[2] = {};      // register writes
         uint32_t g_diagVoiceWrites[2] = {}; // writes to the per-voice parameter / address blocks
+        uint64_t g_diagSamples = 0u;        // samples stepped, across all instances (the once-per-second dump)
+        uint32_t g_diagUnderrunsReported = 0u;
+
+        // PS2X_SPU2_DIAG is read once; hot paths take the answer as a template parameter or a local copy.
+        bool diagEnabled() noexcept
+        {
+            static const bool enabled = std::getenv("PS2X_SPU2_DIAG") != nullptr;
+            return enabled;
+        }
     }
 
-    Spu2::Spu2() : m_ram(RamHalfwords)
+    Spu2::Spu2() : m_ram(RamHalfwords), m_outRing(OutputRingFrames * 2u)
     {
         reset();
     }
@@ -50,12 +59,21 @@ namespace ps2x::iop::detail
             for (auto &voice : core)
                 voice = VoiceState{};
         m_endx.fill(0);
+        m_activeVoices.fill(0u);
         {
             std::lock_guard<std::mutex> lock(m_outputMutex);
-            m_output.clear();
+            m_silentPending.store(0u, std::memory_order_relaxed);
+            m_outRead = 0u;
+            m_outCount = 0u;
         }
         for (auto &input : m_input)
             input = InputState{};
+        {
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            for (auto &stream : m_streams)
+                stream = PcmStream{};
+            m_streamsActive.store(false, std::memory_order_relaxed);
+        }
         m_lastCycle = 0;
         m_interrupt = false;
         reg(RegStatx) = StatxDmaReady;
@@ -142,7 +160,7 @@ namespace ps2x::iop::detail
     {
         const uint32_t offset = (physical - RegBase) & 0x7FEu;
         reg(offset) = value;
-        if (offset < 0x760u)
+        if (offset < 0x760u && diagEnabled())
         {
             const uint32_t c = offset >= 0x400u ? 1u : 0u;
             ++g_diagWrites[c];
@@ -266,7 +284,7 @@ namespace ps2x::iop::detail
 
     void Spu2::keyOn(uint32_t core, uint32_t mask, uint32_t firstVoice)
     {
-        if (core < 2u)
+        if (core < 2u && diagEnabled())
             g_diagKeyOns[core] += static_cast<uint32_t>(__builtin_popcount(mask));
         for (uint32_t bit = 0; bit < 16u; ++bit)
         {
@@ -280,6 +298,7 @@ namespace ps2x::iop::detail
             v.nax = ssa;
             v.lsa = ssa;
             v.phase = VoiceState::Phase::Attack;
+            m_activeVoices[core] |= 1u << index;
             m_endx[core] &= ~(1u << index);
         }
     }
@@ -329,10 +348,13 @@ namespace ps2x::iop::detail
         if ((v.blockFlags & 4u) != 0u && !v.lsaFromRegister)
             v.lsa = block;
 
+        // ATTR cannot change while a block is decoded, so look at the IRQ enable bits once instead of once per word.
+        const bool irqArmed = ((reg(RegAttr) | reg(0x400u + RegAttr)) & 0x40u) != 0u;
         for (uint32_t word = 1; word < 8u; ++word)
         {
             const uint16_t packed = ram(block + word);
-            checkIrqAddress((block + word) & (RamHalfwords - 1u));
+            if (irqArmed)
+                checkIrqAddress((block + word) & (RamHalfwords - 1u));
             for (uint32_t nibble = 0; nibble < 4u; ++nibble)
             {
                 const int32_t raw = static_cast<int16_t>(((packed >> (nibble * 4u)) & 0xFu) << 12u) >> shift;
@@ -343,7 +365,8 @@ namespace ps2x::iop::detail
                 v.decoded[(word - 1u) * 4u + nibble] = sample;
             }
         }
-        checkIrqAddress(block);
+        if (irqArmed)
+            checkIrqAddress(block);
         v.decodedIndex = 0;
         v.nax = (block + 8u) & (RamHalfwords - 1u);
     }
@@ -460,7 +483,7 @@ namespace ps2x::iop::detail
     void Spu2::feedInput(uint32_t core)
     {
         InputState &input = m_input[core];
-        constexpr size_t kBlockBytes = 1024u;
+        constexpr size_t kBlockBytes = kAdmaBlockBytes;
         while (input.queue.size() - input.queueRead >= kBlockBytes && input.ringCount + 256u <= InputFrames)
         {
             const uint8_t *block = input.queue.data() + input.queueRead;
@@ -493,129 +516,358 @@ namespace ps2x::iop::detail
         }
     }
 
-    void Spu2::step()
+    bool Spu2::inputIdle(uint32_t core) const noexcept
     {
-        {
-            // Debug aid: PS2X_SPU2_DIAG=1 prints the mixer-relevant registers once per emulated second.
-            static const bool diag = std::getenv("PS2X_SPU2_DIAG") != nullptr;
-            static uint64_t samples = 0u;
-            if (diag && (++samples % 48000u) == 0u)
-            {
-                for (uint32_t core = 0; core < 2u; ++core)
-                {
-                    const uint32_t base = core * 0x400u;
-                    const uint32_t m = RegMvolBase + core * RegMvolStride;
-                    std::fprintf(stderr,
-                                 "[spu2-diag] t=%llus core%u admas=%04X attr=%04X mmix=%04X mvol=%04X/%04X bvol=%04X/%04X "
-                                 "avol=%04X/%04X ring=%u queue=%zu kon=%u voiceSamples=%u unmixed=%u writes=%u voiceWrites=%u endx=%06X active=%06X\n",
-                                 static_cast<unsigned long long>(samples / 48000u), core, reg(base + RegAdmas),
-                                 reg(base + RegAttr), reg(base + RegMmix), reg(m), reg(m + 2u), reg(m + 0x0Cu), reg(m + 0x0Eu),
-                                 reg(m + 0x08u), reg(m + 0x0Au), m_input[core].ringCount,
-                                 m_input[core].queue.size() - m_input[core].queueRead, g_diagKeyOns[core],
-                                 g_diagVoiceSamples[core], g_diagUnmixedSamples[core], g_diagWrites[core], g_diagVoiceWrites[core],
-                                 m_endx[core], [&] { uint32_t a = 0; for (uint32_t i = 0; i < VoicesPerCore; ++i) a |= m_voices[core][i].active ? 1u << i : 0u; return a; }());
-                    g_diagKeyOns[core] = g_diagVoiceSamples[core] = g_diagUnmixedSamples[core] = 0u;
-                    g_diagWrites[core] = g_diagVoiceWrites[core] = 0u;
-                }
-            }
-        }
-        int32_t coreOut[2][2] = {};
+        const InputState &input = m_input[core];
+        // Exactly the states in which feedInput() changes nothing and no ring frame is consumed: an empty ring, no
+        // pending transfer completions, less than a block queued and no fully-read queue left to clear.
+        return input.ringCount == 0u && input.transferEnds.empty() &&
+               input.queue.size() - input.queueRead < kAdmaBlockBytes &&
+               !(input.queueRead != 0u && input.queueRead == input.queue.size());
+    }
+
+    // Debug aid: PS2X_SPU2_DIAG=1 prints the mixer-relevant registers once per emulated second.
+    void Spu2::diagTick()
+    {
+        if ((++g_diagSamples % 48000u) != 0u)
+            return;
         for (uint32_t core = 0; core < 2u; ++core)
         {
             const uint32_t base = core * 0x400u;
-            const uint32_t mixLeft = reg(base + RegVmixL) | (static_cast<uint32_t>(reg(base + RegVmixL + 2u)) << 16u);
-            const uint32_t mixRight = reg(base + RegVmixR) | (static_cast<uint32_t>(reg(base + RegVmixR + 2u)) << 16u);
-            int32_t left = 0;
-            int32_t right = 0;
-            for (uint32_t index = 0; index < VoicesPerCore; ++index)
-            {
-                const int32_t sample = stepVoice(core, index);
-                if (sample == 0)
-                    continue;
-                ++g_diagVoiceSamples[core];
-                if ((mixLeft & (1u << index)) == 0u && (mixRight & (1u << index)) == 0u)
-                    ++g_diagUnmixedSamples[core];
-                const int32_t volLeft = volumeFromRegister(reg(voiceReg(core, index, 0u)));
-                const int32_t volRight = volumeFromRegister(reg(voiceReg(core, index, 2u)));
-                if ((mixLeft & (1u << index)) != 0u)
-                    left += (sample * volLeft) >> 14;
-                if ((mixRight & (1u << index)) != 0u)
-                    right += (sample * volRight) >> 14;
-            }
-            // ADMA sound-data input, scaled by the core's BVOL (master block +0x0C/+0x0E).
-            InputState &input = m_input[core];
-            if (input.ringCount == 0u)
-                feedInput(core);
-            {
-                static const bool diag = std::getenv("PS2X_SPU2_DIAG") != nullptr;
-                static uint32_t reported = 0u;
-                if (diag && input.ringCount == 0u && admaActive(core) && input.bytesQueued != 0u && reported < 40u)
-                {
-                    ++reported;
-                    std::fprintf(stderr, "[spu2-diag] core%u ADMA underrun at cycle %llu: queued=%llu consumed=%llu pending=%zu done=%u\n",
-                                 core, static_cast<unsigned long long>(m_lastCycle), static_cast<unsigned long long>(input.bytesQueued),
-                                 static_cast<unsigned long long>(input.bytesConsumed), input.transferEnds.size(), input.doneCount);
-                }
-            }
-            if (input.ringCount != 0u)
-            {
-                const auto &frame = input.ring[input.ringRead];
-                const uint32_t bvol = RegMvolBase + core * RegMvolStride + 0x0Cu;
-                // BVOL is a plain signed 16-bit volume (0x7FFF = unity), unlike the sweep-format MVOL.
-                left += (frame[0] * static_cast<int16_t>(reg(bvol))) >> 15;
-                right += (frame[1] * static_cast<int16_t>(reg(bvol + 2u))) >> 15;
-                input.ringRead = (input.ringRead + 1u) % InputFrames;
-                --input.ringCount;
-            }
-            coreOut[core][0] = left;
-            coreOut[core][1] = right;
+            const uint32_t m = RegMvolBase + core * RegMvolStride;
+            std::fprintf(stderr,
+                         "[spu2-diag] t=%llus core%u admas=%04X attr=%04X mmix=%04X mvol=%04X/%04X bvol=%04X/%04X "
+                         "avol=%04X/%04X ring=%u queue=%zu kon=%u voiceSamples=%u unmixed=%u writes=%u voiceWrites=%u endx=%06X active=%06X\n",
+                         static_cast<unsigned long long>(g_diagSamples / 48000u), core, reg(base + RegAdmas),
+                         reg(base + RegAttr), reg(base + RegMmix), reg(m), reg(m + 2u), reg(m + 0x0Cu), reg(m + 0x0Eu),
+                         reg(m + 0x08u), reg(m + 0x0Au), m_input[core].ringCount,
+                         m_input[core].queue.size() - m_input[core].queueRead, g_diagKeyOns[core],
+                         g_diagVoiceSamples[core], g_diagUnmixedSamples[core], g_diagWrites[core], g_diagVoiceWrites[core],
+                         m_endx[core], [&] { uint32_t a = 0; for (uint32_t i = 0; i < VoicesPerCore; ++i) a |= m_voices[core][i].active ? 1u << i : 0u; return a; }());
+            g_diagKeyOns[core] = g_diagVoiceSamples[core] = g_diagUnmixedSamples[core] = 0u;
+            g_diagWrites[core] = g_diagVoiceWrites[core] = 0u;
+        }
+    }
+
+    void Spu2::diagUnderrun(uint32_t core)
+    {
+        const InputState &input = m_input[core];
+        if (input.ringCount == 0u && admaActive(core) && input.bytesQueued != 0u && g_diagUnderrunsReported < 40u)
+        {
+            ++g_diagUnderrunsReported;
+            std::fprintf(stderr, "[spu2-diag] core%u ADMA underrun at cycle %llu: queued=%llu consumed=%llu pending=%zu done=%u\n",
+                         core, static_cast<unsigned long long>(m_lastCycle), static_cast<unsigned long long>(input.bytesQueued),
+                         static_cast<unsigned long long>(input.bytesConsumed), input.transferEnds.size(), input.doneCount);
+        }
+    }
+
+    template <bool Diag>
+    void Spu2::renderFrames(size_t count, int16_t *out, bool streamsLive)
+    {
+        // Registers cannot change while samples are rendered (the only register the mixer writes is SPDIF_IRQINFO),
+        // so everything read from them every sample in the original loop is read once per call here.
+        struct CoreSetup
+        {
+            uint32_t mixLeft, mixRight;
+            int32_t bvolLeft, bvolRight; // BVOL is a plain signed 16-bit volume (0x7FFF = unity), unlike the sweep-format MVOL
+            int32_t masterLeft, masterRight;
+            bool inputLive;              // ADMA input has frames or work; otherwise the section below is a no-op
+        } setup[2];
+        for (uint32_t core = 0; core < 2u; ++core)
+        {
+            const uint32_t base = core * 0x400u;
+            const uint32_t mvol = RegMvolBase + core * RegMvolStride;
+            CoreSetup &c = setup[core];
+            c.mixLeft = reg(base + RegVmixL) | (static_cast<uint32_t>(reg(base + RegVmixL + 2u)) << 16u);
+            c.mixRight = reg(base + RegVmixR) | (static_cast<uint32_t>(reg(base + RegVmixR + 2u)) << 16u);
+            c.bvolLeft = static_cast<int16_t>(reg(mvol + 0x0Cu));
+            c.bvolRight = static_cast<int16_t>(reg(mvol + 0x0Eu));
+            c.masterLeft = volumeFromRegister(reg(mvol));
+            c.masterRight = volumeFromRegister(reg(mvol + 2u));
+            // Idle input stays idle for the whole call: only dmaWrite()/write16() queue data. The diag underrun
+            // report looks at idle input too, so diagnostics always run the section.
+            c.inputLive = Diag || m_input[core].ringCount != 0u || !inputIdle(core);
         }
 
-        // Core 0 output through its master volume, added to core 1's dry mix, all through core 1's master volume
-        // (a simplification of the MMIX routing).
-        const auto master = [this](uint32_t core, uint32_t side)
+        for (size_t frame = 0; frame < count; ++frame)
         {
-            return volumeFromRegister(reg(RegMvolBase + core * RegMvolStride + side * 2u));
-        };
-        std::lock_guard<std::mutex> lock(m_outputMutex);
-        for (uint32_t side = 0; side < 2u; ++side)
-        {
-            const int32_t core0 = (coreOut[0][side] * master(0u, side)) >> 14;
-            const int32_t mixed = ((core0 + coreOut[1][side]) * master(1u, side)) >> 14;
-            m_output.push_back(clamp16(mixed));
+            if constexpr (Diag)
+                diagTick();
+            int32_t coreOut[2][2] = {};
+            for (uint32_t core = 0; core < 2u; ++core)
+            {
+                const CoreSetup &c = setup[core];
+                int32_t left = 0;
+                int32_t right = 0;
+                uint32_t pending = m_activeVoices[core];
+                while (pending != 0u)
+                {
+                    const uint32_t index = static_cast<uint32_t>(__builtin_ctz(pending));
+                    pending &= pending - 1u;
+                    const int32_t sample = stepVoice(core, index);
+                    if (!m_voices[core][index].active)
+                        m_activeVoices[core] &= ~(1u << index); // stepVoice() is the only thing that ends a voice
+                    if (sample == 0)
+                        continue;
+                    if constexpr (Diag)
+                    {
+                        ++g_diagVoiceSamples[core];
+                        if ((c.mixLeft & (1u << index)) == 0u && (c.mixRight & (1u << index)) == 0u)
+                            ++g_diagUnmixedSamples[core];
+                    }
+                    const int32_t volLeft = volumeFromRegister(reg(voiceReg(core, index, 0u)));
+                    const int32_t volRight = volumeFromRegister(reg(voiceReg(core, index, 2u)));
+                    if ((c.mixLeft & (1u << index)) != 0u)
+                        left += (sample * volLeft) >> 14;
+                    if ((c.mixRight & (1u << index)) != 0u)
+                        right += (sample * volRight) >> 14;
+                }
+                // ADMA sound-data input, scaled by the core's BVOL (master block +0x0C/+0x0E).
+                if (c.inputLive)
+                {
+                    InputState &input = m_input[core];
+                    if (input.ringCount == 0u)
+                        feedInput(core);
+                    if constexpr (Diag)
+                        diagUnderrun(core);
+                    if (input.ringCount != 0u)
+                    {
+                        const auto &in = input.ring[input.ringRead];
+                        left += (in[0] * c.bvolLeft) >> 15;
+                        right += (in[1] * c.bvolRight) >> 15;
+                        input.ringRead = (input.ringRead + 1u) % InputFrames;
+                        --input.ringCount;
+                    }
+                }
+                coreOut[core][0] = left;
+                coreOut[core][1] = right;
+            }
+
+            // Core 0 output through its master volume, added to core 1's dry mix, all through core 1's master volume
+            // (a simplification of the MMIX routing).
+            int32_t streamOut[2] = {};
+            if (streamsLive)
+                mixStreams(streamOut[0], streamOut[1]);
+            const int32_t core0Left = (coreOut[0][0] * setup[0].masterLeft) >> 14;
+            const int32_t core0Right = (coreOut[0][1] * setup[0].masterRight) >> 14;
+            out[frame * 2u] = clamp16((((core0Left + coreOut[1][0]) * setup[1].masterLeft) >> 14) + streamOut[0]);
+            out[frame * 2u + 1u] = clamp16((((core0Right + coreOut[1][1]) * setup[1].masterRight) >> 14) + streamOut[1]);
         }
-        if (m_output.size() > kMaxBufferedFrames * 2u)
-            m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(m_output.size() / 2u & ~size_t{1}));
+    }
+
+    bool Spu2::anyStreamLive() const noexcept
+    {
+        for (const PcmStream &s : m_streams)
+            if (s.read < s.samples.size() / 2u)
+                return true; // not in underrun: mixStreams() would move it
+        return false;
+    }
+
+    void Spu2::pushOutput(const int16_t *stereo, size_t frames)
+    {
+        if (stereo == nullptr)
+        {
+            m_silentPending.fetch_add(frames, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        flushSilenceLocked();
+        pushOutputLocked(stereo, frames);
+    }
+
+    void Spu2::flushSilenceLocked()
+    {
+        const uint64_t pending = m_silentPending.exchange(0u, std::memory_order_relaxed);
+        if (pending != 0u)
+            pushOutputLocked(nullptr, static_cast<size_t>(std::min<uint64_t>(pending, SIZE_MAX)));
+    }
+
+    void Spu2::pushOutputLocked(const int16_t *stereo, size_t frames)
+    {
+        while (frames != 0u)
+        {
+            // The original pushed one frame at a time and, as soon as more than MaxBufferedFrames were buffered,
+            // dropped the oldest half; so a run is cut at the frame that triggers the drop.
+            const size_t untilDrop = MaxBufferedFrames + 1u - m_outCount;
+            const size_t take = std::min(frames, untilDrop);
+            size_t write = m_outRead + m_outCount;
+            if (write >= OutputRingFrames)
+                write -= OutputRingFrames;
+            const size_t first = std::min(take, OutputRingFrames - write);
+            if (stereo != nullptr)
+            {
+                std::copy_n(stereo, first * 2u, m_outRing.begin() + static_cast<std::ptrdiff_t>(write * 2u));
+                std::copy_n(stereo + first * 2u, (take - first) * 2u, m_outRing.begin());
+                stereo += take * 2u;
+            }
+            else
+            {
+                std::fill_n(m_outRing.begin() + static_cast<std::ptrdiff_t>(write * 2u), first * 2u, int16_t{0});
+                std::fill_n(m_outRing.begin(), (take - first) * 2u, int16_t{0});
+            }
+            m_outCount += take;
+            frames -= take;
+            if (m_outCount > MaxBufferedFrames)
+            {
+                const size_t drop = m_outCount / 2u;
+                m_outRead = (m_outRead + drop) % OutputRingFrames;
+                m_outCount -= drop;
+            }
+        }
+    }
+
+    void Spu2::runSamples(uint64_t count)
+    {
+        const bool diag = diagEnabled(); // read once per batch
+        constexpr size_t kChunkFrames = 256u;
+        int16_t chunk[kChunkFrames * 2u];
+        while (count != 0u)
+        {
+            // Streams stay "active" forever once pushed, so look at whether any still has frames to play. The lock is
+            // held for the whole chunk (mixStreams() needs it per sample) and released before the output is pushed.
+            std::unique_lock<std::mutex> streamLock(m_streamMutex, std::defer_lock);
+            bool streamsLive = false;
+            if (m_streamsActive.load(std::memory_order_relaxed))
+            {
+                streamLock.lock();
+                streamsLive = anyStreamLive();
+                if (!streamsLive)
+                    streamLock.unlock();
+            }
+
+            // Whole-batch fast path: with no voice to step, no ADMA input and no stream to mix every sample is exact
+            // silence (zero input through any volume is zero) and nothing else in step() can change state.
+            if (!diag && !streamsLive && m_activeVoices[0] == 0u && m_activeVoices[1] == 0u && inputIdle(0u) &&
+                inputIdle(1u))
+            {
+                m_bulkSamples += count;
+                pushOutput(nullptr, static_cast<size_t>(std::min<uint64_t>(count, SIZE_MAX)));
+                return;
+            }
+
+            const size_t frames = static_cast<size_t>(std::min<uint64_t>(count, kChunkFrames));
+            if (diag)
+                renderFrames<true>(frames, chunk, streamsLive);
+            else
+                renderFrames<false>(frames, chunk, streamsLive);
+            if (streamLock.owns_lock())
+                streamLock.unlock();
+            pushOutput(chunk, frames);
+            count -= frames;
+        }
+    }
+
+    void Spu2::step()
+    {
+        runSamples(1u);
+    }
+
+    void Spu2::streamPush(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames)
+    {
+        if (stream >= StreamCount || frames == 0u || rate == 0u)
+            return;
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        PcmStream &s = m_streams[stream];
+        // Drop the frames already played so the vector does not grow without bound.
+        if (s.read >= 16384u)
+        {
+            s.samples.erase(s.samples.begin(), s.samples.begin() + static_cast<std::ptrdiff_t>(s.read * 2u));
+            s.read = 0u;
+        }
+        s.rate = rate;
+        s.samples.insert(s.samples.end(), stereo, stereo + frames * 2u);
+        m_streamsActive.store(true, std::memory_order_relaxed);
+    }
+
+    uint64_t Spu2::streamConsumed(uint32_t stream) const
+    {
+        if (stream >= StreamCount)
+            return 0u;
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        return m_streams[stream].consumedFrames;
+    }
+
+    void Spu2::streamReset(uint32_t stream)
+    {
+        if (stream >= StreamCount)
+            return;
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        m_streams[stream] = PcmStream{};
+    }
+
+    void Spu2::mixStreams(int32_t &left, int32_t &right)
+    {
+        for (PcmStream &s : m_streams)
+        {
+            const size_t frames = s.samples.size() / 2u;
+            if (s.read >= frames)
+                continue; // underrun: silence, and the source position does not move
+            const size_t next = s.read + 1u < frames ? s.read + 1u : s.read;
+            const double a = s.fraction;
+            left += static_cast<int32_t>(s.samples[s.read * 2u] * (1.0 - a) + s.samples[next * 2u] * a);
+            right += static_cast<int32_t>(s.samples[s.read * 2u + 1u] * (1.0 - a) + s.samples[next * 2u + 1u] * a);
+            s.fraction += static_cast<double>(s.rate) / 48000.0;
+            while (s.fraction >= 1.0 && s.read < frames)
+            {
+                s.fraction -= 1.0;
+                ++s.read;
+                ++s.consumedFrames;
+            }
+            if (s.read >= frames)
+                s.fraction = 0.0;
+        }
     }
 
     void Spu2::advanceTo(uint64_t iopCycle)
     {
         if (iopCycle <= m_lastCycle)
             return;
-        const uint64_t samples = (iopCycle - m_lastCycle) / CyclesPerSample;
-        for (uint64_t i = 0; i < samples; ++i)
-            step();
+        const uint64_t elapsed = iopCycle - m_lastCycle;
+        // Most scheduler calls advance only a fraction of a sample. Preserve
+        // that remainder without performing a wide division or storing +0.
+        if (elapsed < CyclesPerSample)
+            return;
+        const uint64_t samples = elapsed / CyclesPerSample;
+        // runSamples' whole-batch silence path, without entering it: nothing playing, no stream, no ADMA input
+        if (!diagEnabled() && !m_streamsActive.load(std::memory_order_relaxed) && m_activeVoices[0] == 0u &&
+            m_activeVoices[1] == 0u && inputIdle(0u) && inputIdle(1u))
+        {
+            m_bulkSamples += samples;
+            pushOutput(nullptr, static_cast<size_t>(std::min<uint64_t>(samples, SIZE_MAX)));
+        }
+        else
+        {
+            runSamples(samples);
+        }
         m_lastCycle += samples * CyclesPerSample;
     }
 
     size_t Spu2::pendingFrames() const
     {
         std::lock_guard<std::mutex> lock(m_outputMutex);
-        return m_output.size() / 2u;
+        const_cast<Spu2 *>(this)->flushSilenceLocked();
+        return m_outCount;
     }
 
     size_t Spu2::drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
     {
         std::lock_guard<std::mutex> lock(m_outputMutex);
-        const size_t available = m_output.size() / 2u;
-        if (maxLatencyFrames != SIZE_MAX && available > maxFrames + maxLatencyFrames)
+        flushSilenceLocked();
+        if (maxLatencyFrames != SIZE_MAX && m_outCount > maxFrames + maxLatencyFrames)
         {
-            const size_t drop = available - maxFrames - maxLatencyFrames;
-            m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(drop * 2u));
+            const size_t drop = m_outCount - maxFrames - maxLatencyFrames;
+            m_outRead = (m_outRead + drop) % OutputRingFrames;
+            m_outCount -= drop;
         }
-        const size_t frames = std::min(maxFrames, m_output.size() / 2u);
-        std::copy_n(m_output.begin(), frames * 2u, stereo);
-        m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(frames * 2u));
+        const size_t frames = std::min(maxFrames, m_outCount);
+        if (frames != 0u)
+        {
+            const size_t first = std::min(frames, OutputRingFrames - m_outRead);
+            std::copy_n(m_outRing.begin() + static_cast<std::ptrdiff_t>(m_outRead * 2u), first * 2u, stereo);
+            std::copy_n(m_outRing.begin(), (frames - first) * 2u, stereo + first * 2u);
+            m_outRead = (m_outRead + frames) % OutputRingFrames;
+            m_outCount -= frames;
+        }
         return frames;
     }
 }

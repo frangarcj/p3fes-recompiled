@@ -25,6 +25,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        void deliverPendingEeCycles() noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
@@ -39,6 +40,10 @@ namespace ps2x::iop::detail
         // 48 kHz stereo samples produced by the SPU2 (see Spu2::drainOutput).
         size_t drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames);
         size_t pendingAudioFrames() const;
+        // PCM streams injected by HLE services (see Spu2::streamPush).
+        void pushPcmStream(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames);
+        [[nodiscard]] uint64_t pcmStreamConsumed(uint32_t stream) const;
+        void resetPcmStream(uint32_t stream);
         [[nodiscard]] uint64_t cycles() const noexcept;
         [[nodiscard]] uint64_t instructions() const noexcept;
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;

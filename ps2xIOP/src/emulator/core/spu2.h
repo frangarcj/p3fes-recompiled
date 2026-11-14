@@ -8,6 +8,7 @@
 // References: PCSX2 (pcsx2/SPU2) and psx-spx's SPU notes (ADPCM and ADSR are the same as on the PS1).
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -63,8 +64,22 @@ namespace ps2x::iop::detail
         // ADMA transfers complete when their last block enters the core's two-block input buffer (like the
         // hardware, which requests the next block while the other one plays); true once per completed transfer.
         [[nodiscard]] bool takeAdmaDone(uint32_t core) noexcept;
+        // True only when the entry-side SPU2 advance/drain has no work at this cycle.
+        // an ADMA completion or an IRQ is waiting to be taken
+        [[nodiscard]] bool eventsPending() const noexcept
+        {
+            return m_interrupt || m_input[0].doneCount != 0u || m_input[1].doneCount != 0u;
+        }
+        [[nodiscard]] bool canSkipServiceAt(uint64_t iopCycle) const noexcept
+        {
+            if (m_interrupt || m_input[0].doneCount != 0u || m_input[1].doneCount != 0u)
+                return false;
+            // Guest helper execution can happen outside runCycles and leave the sample clock behind.
+            return iopCycle <= m_lastCycle || iopCycle - m_lastCycle < CyclesPerSample;
+        }
 
-        // Advances to the given IOP cycle (one sample every CyclesPerSample cycles).
+        // Advances to the given IOP cycle (one sample every CyclesPerSample cycles). Stretches in which nothing can
+        // change state (no active voice, no ADMA input, no live PCM stream) are emitted as silence in bulk.
         void advanceTo(uint64_t iopCycle);
         void step(); // one 48 kHz sample
         [[nodiscard]] bool takeInterrupt() noexcept;
@@ -74,6 +89,15 @@ namespace ps2x::iop::detail
         // up (emulation can run faster than real time).
         [[nodiscard]] size_t pendingFrames() const;
         size_t drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames = SIZE_MAX);
+
+        // PCM streams fed by an HLE service instead of an IOP driver (the CRI ADX renderer when CRI_ADXI.IRX is not
+        // loaded): interleaved 16-bit stereo at any rate, resampled to 48 kHz (linear) and added to the output after
+        // the master volumes, so no SPU2 register has to be programmed. streamConsumed() counts source frames played;
+        // services use it to pace the buffer space they hand back to the EE. Thread safe.
+        static constexpr uint32_t StreamCount = 4u;
+        void streamPush(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames);
+        [[nodiscard]] uint64_t streamConsumed(uint32_t stream) const;
+        void streamReset(uint32_t stream);
 
         // A voice's state, for tests and diagnostics
         struct VoiceState
@@ -94,6 +118,8 @@ namespace ps2x::iop::detail
             int16_t lastOutput = 0;
         };
         [[nodiscard]] const VoiceState &voice(uint32_t core, uint32_t index) const { return m_voices[core][index]; }
+        // Samples emitted through the idle bulk path since construction, so tests can prove it was exercised.
+        [[nodiscard]] uint64_t bulkSamplesForTest() const noexcept { return m_bulkSamples; }
 
     private:
         [[nodiscard]] uint16_t &reg(uint32_t offset) noexcept { return m_regs[(offset & 0x7FFu) >> 1u]; }
@@ -117,6 +143,20 @@ namespace ps2x::iop::detail
         void checkIrqAddress(uint32_t halfwordAddress) noexcept;
 
         void feedInput(uint32_t core);
+        // True when feedInput() and the per-sample ring read would do nothing for this core.
+        [[nodiscard]] bool inputIdle(uint32_t core) const noexcept;
+
+        // Renders `count` frames into `out` (interleaved L, R) and runs `count` samples of state. Diag selects the
+        // PS2X_SPU2_DIAG instrumentation at compile time so the normal path carries none of it.
+        template <bool Diag>
+        void renderFrames(size_t count, int16_t *out, bool streamsLive);
+        void runSamples(uint64_t count);
+        void diagTick();                    // PS2X_SPU2_DIAG: once-per-second register dump
+        void diagUnderrun(uint32_t core);   // PS2X_SPU2_DIAG: ADMA underrun report
+        [[nodiscard]] bool anyStreamLive() const noexcept; // m_streamMutex must be held
+        void pushOutput(const int16_t *stereo, size_t frames); // stereo == nullptr pushes silence
+        void pushOutputLocked(const int16_t *stereo, size_t frames); // m_outputMutex held
+        void flushSilenceLocked(); // m_outputMutex held: writes the counted silent frames into the ring
 
         // ADMA sound-data input per core: queued PCM bytes and a ring of decoded stereo frames.
         static constexpr uint32_t InputFrames = 512u;
@@ -134,12 +174,40 @@ namespace ps2x::iop::detail
         };
         std::array<InputState, 2> m_input{};
 
+        struct PcmStream
+        {
+            std::vector<int16_t> samples; // interleaved L, R
+            size_t read = 0;              // index of the next frame, in frames
+            uint32_t rate = 48000u;
+            double fraction = 0.0;        // position between frame `read` and the next, 0..1
+            uint64_t consumedFrames = 0;
+        };
+        void mixStreams(int32_t &left, int32_t &right); // m_streamMutex must be held
+        std::array<PcmStream, StreamCount> m_streams{};
+        mutable std::mutex m_streamMutex;
+        std::atomic<bool> m_streamsActive{false};
+
         std::vector<uint16_t> m_ram;
         std::array<uint16_t, 0x400> m_regs{};
         std::array<std::array<VoiceState, VoicesPerCore>, 2> m_voices{};
         std::array<uint32_t, 2> m_endx{};
-        std::vector<int16_t> m_output;
+        // Voices that can still change state (key-on sets the bit, stepVoice clears it when the voice has gone
+        // fully idle). An inactive voice does nothing observable in step(), so only these are stepped.
+        std::array<uint32_t, 2> m_activeVoices{};
+        uint64_t m_bulkSamples = 0;
+
+        // Output FIFO of stereo frames: fixed-capacity ring. When more than MaxBufferedFrames are buffered (no
+        // consumer) the oldest half is dropped, so the capacity needs one extra frame.
+        static constexpr size_t MaxBufferedFrames = 48000u * 2u; // 2 s
+        static constexpr size_t OutputRingFrames = MaxBufferedFrames + 1u;
+        std::vector<int16_t> m_outRing; // OutputRingFrames * 2 samples
+        size_t m_outRead = 0;           // frame index of the oldest frame
+        size_t m_outCount = 0;          // frames buffered
         mutable std::mutex m_outputMutex;
+        // Silent frames not yet written to the ring. The IOP produces silence (no voice playing) many thousands of
+        // times a second; they are only counted here and written, in order, ahead of the next real frames or when the
+        // ring is read (drainOutput, pendingFrames), so the common case needs neither the mutex nor a memset.
+        std::atomic<uint64_t> m_silentPending{0};
         uint64_t m_lastCycle = 0;
         bool m_interrupt = false;
     };

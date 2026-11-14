@@ -1,3 +1,4 @@
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -26,6 +27,9 @@ namespace ps2x::iop
             coreServices.emplace_back(detail::createMcservService(host));
             coreServices.emplace_back(detail::createDbcmanService(host));
             coreServices.emplace_back(detail::createLibSdService(host));
+            coreServices.emplace_back(detail::createCriDtxService(host));
+            for (const auto &service : coreServices)
+                service->attachPcmSink(&pcmSink);
             refreshServiceModuleKeys();
             rebuildRoutes();
         }
@@ -89,6 +93,31 @@ namespace ps2x::iop
         std::string lastError;
         detail::IopModuleManager moduleManager;
         detail::IopEmulator emulator;
+
+        class EmulatorPcmSink final : public detail::PcmSink
+        {
+        public:
+            explicit EmulatorPcmSink(detail::IopEmulator &target)
+                : m_emulator(target)
+            {
+            }
+            void push(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames) override
+            {
+                m_emulator.pushPcmStream(stream, rate, stereo, frames);
+            }
+            [[nodiscard]] uint64_t consumed(uint32_t stream) const override
+            {
+                return m_emulator.pcmStreamConsumed(stream);
+            }
+            void reset(uint32_t stream) override
+            {
+                m_emulator.resetPcmStream(stream);
+            }
+
+        private:
+            detail::IopEmulator &m_emulator;
+        };
+        EmulatorPcmSink pcmSink{emulator};
     };
 
     IopSubsystem::IopSubsystem(IopHost &host)
@@ -123,7 +152,37 @@ namespace ps2x::iop
         if (!parsed)
             return {true, -1, -1};
 
-        if (parsed.device != Ps2PathDevice::Rom0)
+        // PS2X_IOP_HLE_ONLY=1 never loads a physical IRX: every module goes to
+        // its registered HLE provider (or is reported as loaded with no
+        // services), so no R3000 code runs at all. PS2X_IOP_SKIP_IRX is the
+        // same for a comma-separated list of module names (e.g. "CRI_ADXI,SKSOUND").
+        static const bool hleOnlyAll = []
+        {
+            const char *value = std::getenv("PS2X_IOP_HLE_ONLY");
+            return value != nullptr && value[0] == '1';
+        }();
+        static const std::string skipList = []
+        {
+            const char *value = std::getenv("PS2X_IOP_SKIP_IRX");
+            std::string list = value ? value : "";
+            for (char &c : list)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return "," + list + ",";
+        }();
+        bool hleOnly = hleOnlyAll;
+        if (!hleOnly && skipList.size() > 2u)
+        {
+            std::string upper(path);
+            for (char &c : upper)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            const size_t slash = upper.find_last_of("\\/:");
+            std::string leaf = slash == std::string::npos ? upper : upper.substr(slash + 1u);
+            const size_t dot = leaf.find('.');
+            if (dot != std::string::npos)
+                leaf.resize(dot);
+            hleOnly = skipList.find("," + leaf + ",") != std::string::npos;
+        }
+        if (parsed.device != Ps2PathDevice::Rom0 && !hleOnly)
         {
             ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
             if (physical.moduleId > 0)
@@ -144,6 +203,13 @@ namespace ps2x::iop
         else
         {
             m_impl->recordLoadOutcome(path, false);
+            if (hleOnly)
+            {
+                // Probe mode: report the module as loaded with no services so
+                // the boot shows which RPC servers the game then waits for.
+                static int32_t nextStubId = 0x7000;
+                return {true, nextStubId++, 0};
+            }
         }
         return hle;
     }
@@ -218,16 +284,71 @@ namespace ps2x::iop
         const auto route = m_impl->routes.find(request.sid);
         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
 
+        // Debug aid: PS2X_IOP_RPC_TRACE=<hex sid> dumps the send words and the reply words of every call to that
+        // server (after the physical IRX or the HLE service has answered), to compare a physical IRX with its HLE
+        // replacement.
+        static const uint32_t traceSid = []
+        {
+            const char *value = std::getenv("PS2X_IOP_RPC_TRACE");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 16)) : 0u;
+        }();
+        const auto traceCall = [&](const char *who, const RpcResult &served)
+        {
+            if (traceSid == 0u || request.sid != traceSid)
+                return;
+            const auto words = [&](GuestBuffer buffer)
+            {
+                std::ostringstream out;
+                uint32_t value = 0u;
+                for (uint32_t i = 0u; i + 4u <= buffer.size && i < 64u; i += 4u)
+                {
+                    if (buffer.address == 0u || !m_impl->host.readGuest(buffer.address + i, &value, sizeof(value)))
+                        break;
+                    out << (i ? "," : "") << std::hex << value;
+                }
+                return out.str();
+            };
+            std::fprintf(stderr, "[iop-rpc-trace] %s sid=%08x fn=%x handled=%d send(%u)=[%s] recv(%u)=[%s]\n", who,
+                         request.sid, request.function, served.handled ? 1 : 0, request.send.size,
+                         words(request.send).c_str(), request.receive.size, words(request.receive).c_str());
+        };
+
         RpcResult emulated = m_impl->emulator.handleRpc(request);
         if (emulated.handled || !hle)
         {
+            traceCall("iop", emulated);
             return emulated;
         }
-        return hle->handleRpc(request);
+        RpcResult served = hle->handleRpc(request);
+        traceCall("hle", served);
+        return served;
     }
 
     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
     {
+        // Debug aid: PS2X_IOP_DTX_TRACE=1 prints every EE -> IOP SIF DMA of 0x880 bytes (the CRI DTX channel blocks)
+        // whose first word (entry count) is non-zero, with its first entries.
+        static const bool traceXfer = std::getenv("PS2X_IOP_DTX_TRACE") != nullptr;
+        // PS2X_IOP_DTX_TRACE=all also lists every other EE -> IOP DMA (source, destination, size).
+        static const bool traceAll = traceXfer && std::string_view(std::getenv("PS2X_IOP_DTX_TRACE")) == "all";
+        if (traceAll && transfer.kind == SifTransferKind::SetDma && transfer.phase == SifTransferPhase::AfterCopy &&
+            transfer.size != 0x880u)
+            std::fprintf(stderr, "[iop-dma] src=%08x dst=%08x size=%x\n", transfer.sourceAddress,
+                         transfer.destinationAddress, transfer.size);
+        if (traceXfer && transfer.kind == SifTransferKind::SetDma && transfer.phase == SifTransferPhase::AfterCopy &&
+            transfer.size == 0x880u)
+        {
+            uint32_t block[4 + 4 * 6] = {};
+            if (m_impl->emulator.readMemory(transfer.destinationAddress, block, sizeof(block)) && block[0] != 0u)
+            {
+                std::fprintf(stderr, "[iop-dtx-xfer] src=%08x dst=%08x count=%u", transfer.sourceAddress,
+                             transfer.destinationAddress, block[0]);
+                for (uint32_t i = 0; i < 6u; ++i)
+                    std::fprintf(stderr, " | %08x %08x %08x %08x", block[4 + i * 4], block[5 + i * 4], block[6 + i * 4],
+                                 block[7 + i * 4]);
+                std::fprintf(stderr, "\n");
+            }
+        }
         for (auto &service : m_impl->coreServices)
         {
             if (service && m_impl->serviceActive(*service))

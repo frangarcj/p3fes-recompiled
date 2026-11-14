@@ -33,6 +33,7 @@ namespace ps2x::iop::detail
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
         m_currentThread = nullptr;
+        m_deadThreadPending = false;
     }
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
@@ -109,6 +110,8 @@ namespace ps2x::iop::detail
             if (m_currentThread != nullptr)
             {
                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
+                if (ordinal == 9)
+                    m_deadThreadPending = true;
                 cpu.stopped = true;
                 cpu.yielded = true;
             }
@@ -725,7 +728,7 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
-    IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+    IopThread *IopKernel::beginNextReadySlow(uint64_t currentCycle)
     {
         if (m_idleVersion == m_version && currentCycle < m_idleUntil)
             return nullptr; // nothing changed and no delayed thread wakes up yet
@@ -782,16 +785,23 @@ namespace ps2x::iop::detail
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
     {
         ++m_version; // invalidates the beginNextReady cache
-        if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
-            thread.state = IopThreadState::Dormant;
-        else if (thread.state == IopThreadState::Running)
-            thread.state = IopThreadState::Ready;
+        // A deferred deletion must survive stopped/return-sentinel handling.
+        if (thread.state != IopThreadState::Dead)
+        {
+            if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+                thread.state = IopThreadState::Dormant;
+            else if (thread.state == IopThreadState::Running)
+                thread.state = IopThreadState::Ready;
+        }
         m_currentThread = nullptr;
         cleanupDeadThreads();
     }
 
     void IopKernel::cleanupDeadThreads()
     {
+        if (!m_deadThreadPending)
+            return;
+
         ++m_version; // invalidates the beginNextReady cache
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
         {
@@ -804,6 +814,7 @@ namespace ps2x::iop::detail
                 (void)m_memory.freeAllocation(thread->second.stackBase);
             thread = m_threads.erase(thread);
         }
+        m_deadThreadPending = false;
     }
 
     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
@@ -813,7 +824,10 @@ namespace ps2x::iop::detail
         {
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
             if (pc >= base && pc < base + size)
+            {
                 thread.state = IopThreadState::Dead;
+                m_deadThreadPending = true;
+            }
         }
     }
 }

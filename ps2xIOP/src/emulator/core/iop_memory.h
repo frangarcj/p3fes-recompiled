@@ -141,7 +141,11 @@ namespace ps2x::iop::detail
             write8(address, value);
         }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        // Raw RAM / ownership-flag storage for the PS2X_IOP_FAST burst interpreter (fixed size, never reallocated).
+        [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }
+        [[nodiscard]] uint8_t *ownedData() noexcept { return m_owned.data(); }
         [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
+        [[nodiscard]] const Spu2 &spu2() const noexcept { return m_spu2; }
         [[nodiscard]] Sio2 &sio2() noexcept { return m_sio2; }
         [[nodiscard]] bool sio2Enabled() const noexcept { return m_sio2Enabled; }
 

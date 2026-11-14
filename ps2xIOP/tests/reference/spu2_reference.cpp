@@ -1,0 +1,703 @@
+// FROZEN REFERENCE for tests/spu2_equivalence_tests.cpp: a verbatim copy of src/emulator/core/spu2.cpp as it was
+// before the idle fast path / voice bitmask / ring buffer optimisation, with only the class renamed to
+// Spu2Reference. Do not optimise or fix it: the equivalence test proves the optimised Spu2 matches it exactly.
+#include "spu2_reference.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+
+namespace ps2x::iop::detail
+{
+    namespace
+    {
+        constexpr int32_t kAdpcmFilters[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
+        constexpr size_t kMaxBufferedFrames = 48000u * 2u; // 2 s; with no consumer the oldest samples are dropped
+
+        int16_t clamp16(int32_t value) noexcept
+        {
+            return static_cast<int16_t>(std::clamp(value, -32768, 32767));
+        }
+
+        // Voice or core volume. Fixed mode (bit 15 = 0): signed 15 bits. Sweeps (bit 15 = 1) are not emulated yet:
+        // their target applies at once (maximum when rising, 0 when falling).
+        int32_t volumeFromRegister(uint16_t value) noexcept
+        {
+            if ((value & 0x8000u) == 0u)
+                return static_cast<int16_t>(value << 1u) >> 1; // -0x4000..0x3FFF
+            return (value & 0x2000u) != 0u ? 0 : 0x3FFF;
+        }
+    }
+
+    namespace
+    {
+        // PS2X_SPU2_DIAG counters, per core, since the last diag line: voices keyed on, voice samples produced, and
+        // voice samples dropped because the voice's VMIX bit is off on both sides.
+        uint32_t g_diagKeyOns[2] = {};
+        uint32_t g_diagVoiceSamples[2] = {};
+        uint32_t g_diagUnmixedSamples[2] = {};
+        uint32_t g_diagWrites[2] = {};      // register writes
+        uint32_t g_diagVoiceWrites[2] = {}; // writes to the per-voice parameter / address blocks
+    }
+
+    Spu2Reference::Spu2Reference() : m_ram(RamHalfwords)
+    {
+        reset();
+    }
+
+    void Spu2Reference::reset()
+    {
+        std::fill(m_ram.begin(), m_ram.end(), uint16_t{0});
+        m_regs.fill(0);
+        for (auto &core : m_voices)
+            for (auto &voice : core)
+                voice = VoiceState{};
+        m_endx.fill(0);
+        {
+            std::lock_guard<std::mutex> lock(m_outputMutex);
+            m_output.clear();
+        }
+        for (auto &input : m_input)
+            input = InputState{};
+        {
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            for (auto &stream : m_streams)
+                stream = PcmStream{};
+            m_streamsActive.store(false, std::memory_order_relaxed);
+        }
+        m_lastCycle = 0;
+        m_interrupt = false;
+        reg(RegStatx) = StatxDmaReady;
+        reg(0x400u + RegStatx) = StatxDmaReady;
+    }
+
+    uint32_t Spu2Reference::reg32(uint32_t offset) const noexcept
+    {
+        return ((static_cast<uint32_t>(reg(offset)) & 0xFu) << 16u) | reg(offset + 2u);
+    }
+
+    void Spu2Reference::setReg32(uint32_t offset, uint32_t value) noexcept
+    {
+        value &= RamHalfwords - 1u;
+        reg(offset) = static_cast<uint16_t>(value >> 16u);
+        reg(offset + 2u) = static_cast<uint16_t>(value);
+    }
+
+    void Spu2Reference::writeRam(uint32_t halfwordAddress, uint16_t value) noexcept
+    {
+        halfwordAddress &= RamHalfwords - 1u;
+        m_ram[halfwordAddress] = value;
+        checkIrqAddress(halfwordAddress);
+    }
+
+    void Spu2Reference::checkIrqAddress(uint32_t halfwordAddress) noexcept
+    {
+        for (uint32_t core = 0; core < 2u; ++core)
+        {
+            const uint32_t base = core * 0x400u;
+            if ((reg(base + RegAttr) & 0x40u) != 0u && reg32(base + RegIrqa) == halfwordAddress)
+            {
+                m_interrupt = true;
+                reg(0x7C2u) |= static_cast<uint16_t>(4u << core); // SPDIF_IRQINFO
+            }
+        }
+    }
+
+    bool Spu2Reference::takeInterrupt() noexcept
+    {
+        const bool pending = m_interrupt;
+        m_interrupt = false;
+        return pending;
+    }
+
+    uint16_t Spu2Reference::read16(uint32_t physical) const
+    {
+        const uint32_t offset = (physical - RegBase) & 0x7FEu;
+        if (offset < 0x760u)
+        {
+            const uint32_t core = offset >= 0x400u ? 1u : 0u;
+            const uint32_t local = offset & 0x3FFu;
+            if (local < 0x180u)
+            {
+                const uint32_t index = local >> 4u;
+                const uint32_t field = local & 0xFu;
+                if (index < VoicesPerCore)
+                {
+                    const VoiceState &v = m_voices[core][index];
+                    if (field == 0xAu)
+                        return static_cast<uint16_t>(v.envelope);
+                    if (field == 0xCu || field == 0xEu)
+                        return static_cast<uint16_t>(volumeFromRegister(reg(voiceReg(core, index, field - 0xCu))) << 1u);
+                }
+            }
+            else if (local >= RegVoiceAddr && local < RegVoiceAddr + VoicesPerCore * 0xCu)
+            {
+                const uint32_t index = (local - RegVoiceAddr) / 0xCu;
+                const uint32_t field = (local - RegVoiceAddr) % 0xCu;
+                if (field == 8u)
+                    return static_cast<uint16_t>(m_voices[core][index].nax >> 16u);
+                if (field == 10u)
+                    return static_cast<uint16_t>(m_voices[core][index].nax);
+            }
+            else if (local == RegEndx)
+                return static_cast<uint16_t>(m_endx[core]);
+            else if (local == RegEndx + 2u)
+                return static_cast<uint16_t>(m_endx[core] >> 16u);
+        }
+        return reg(offset);
+    }
+
+    void Spu2Reference::write16(uint32_t physical, uint16_t value)
+    {
+        const uint32_t offset = (physical - RegBase) & 0x7FEu;
+        reg(offset) = value;
+        if (offset < 0x760u)
+        {
+            const uint32_t c = offset >= 0x400u ? 1u : 0u;
+            ++g_diagWrites[c];
+            const uint32_t l = offset & 0x3FFu;
+            if (l < 0x180u || (l >= 0x1C0u && l < 0x2E0u))
+                ++g_diagVoiceWrites[c];
+        }
+        if (offset >= 0x760u)
+            return;
+
+        const uint32_t core = offset >= 0x400u ? 1u : 0u;
+        const uint32_t base = core * 0x400u;
+        const uint32_t local = offset & 0x3FFu;
+        switch (local)
+        {
+        case RegKon:
+            keyOn(core, value, 0u);
+            return;
+        case RegKon + 2u:
+            keyOn(core, value & 0xFFu, 16u);
+            return;
+        case RegKoff:
+            keyOff(core, value, 0u);
+            return;
+        case RegKoff + 2u:
+            keyOff(core, value & 0xFFu, 16u);
+            return;
+        case RegData:
+        {
+            uint32_t tsa = reg32(base + RegTsa);
+            writeRam(tsa, value);
+            setReg32(base + RegTsa, tsa + 1u);
+            return;
+        }
+        case RegAdmas:
+            if ((value & (core + 1u)) == 0u)
+                m_input[core] = InputState{};
+            return;
+        case RegEndx:
+            m_endx[core] &= 0xFF0000u;
+            return;
+        case RegEndx + 2u:
+            m_endx[core] &= 0x00FFFFu;
+            return;
+        default:
+            break;
+        }
+
+        if (local >= RegVoiceAddr && local < RegVoiceAddr + VoicesPerCore * 0xCu)
+        {
+            const uint32_t index = (local - RegVoiceAddr) / 0xCu;
+            const uint32_t field = (local - RegVoiceAddr) % 0xCu;
+            VoiceState &v = m_voices[core][index];
+            if (field == 4u || field == 6u) // LSAX written by the driver: overrides the block's loop flag
+            {
+                v.lsa = reg32(voiceAddrReg(core, index, 4u));
+                v.lsaFromRegister = true;
+            }
+            else if (field == 8u || field == 10u)
+            {
+                v.nax = reg32(voiceAddrReg(core, index, 8u)) & ~7u;
+            }
+        }
+    }
+
+    bool Spu2Reference::dmaWrite(uint32_t core, const uint8_t *source, size_t bytes)
+    {
+        const uint32_t base = core * 0x400u;
+        if ((reg(base + RegAdmas) & (core + 1u)) != 0u)
+        {
+            // P3FES: AutoDMA. Needs proper testing beyond CRI ADX streams.
+            InputState &input = m_input[core];
+            if (input.queueRead != 0u && input.queueRead == input.queue.size())
+            {
+                input.queue.clear();
+                input.queueRead = 0u;
+            }
+            input.queue.insert(input.queue.end(), source, source + bytes);
+            input.bytesQueued += bytes;
+            input.transferEnds.push_back(input.bytesQueued);
+            feedInput(core);
+            return true;
+        }
+        uint32_t tsa = reg32(base + RegTsa);
+        for (size_t i = 0; i + 1u < bytes; i += 2u)
+            writeRam(tsa++, static_cast<uint16_t>(source[i] | (source[i + 1u] << 8u)));
+        setReg32(base + RegTsa, tsa);
+        return true;
+    }
+
+    bool Spu2Reference::dmaRead(uint32_t core, uint8_t *destination, size_t bytes)
+    {
+        const uint32_t base = core * 0x400u;
+        if ((reg(base + RegAdmas) & (core + 1u)) != 0u)
+            return false;
+        uint32_t tsa = reg32(base + RegTsa);
+        for (size_t i = 0; i + 1u < bytes; i += 2u)
+        {
+            const uint16_t value = ram(tsa++);
+            destination[i] = static_cast<uint8_t>(value);
+            destination[i + 1u] = static_cast<uint8_t>(value >> 8u);
+        }
+        setReg32(base + RegTsa, tsa);
+        return true;
+    }
+
+    bool Spu2Reference::takeAdmaDone(uint32_t core) noexcept
+    {
+        InputState &input = m_input[core & 1u];
+        if (input.doneCount == 0u)
+            return false;
+        --input.doneCount;
+        return true;
+    }
+
+    bool Spu2Reference::canSkipServiceAt(uint64_t iopCycle) const noexcept
+    {
+        if (m_interrupt || m_input[0].doneCount != 0u || m_input[1].doneCount != 0u)
+            return false;
+        // Guest helper execution can happen outside runCycles and leave the sample clock behind.
+        return iopCycle <= m_lastCycle || iopCycle - m_lastCycle < CyclesPerSample;
+    }
+
+    void Spu2Reference::markDmaReady(uint32_t core) noexcept
+    {
+        reg(core * 0x400u + RegStatx) |= StatxDmaReady;
+    }
+
+
+    void Spu2Reference::keyOn(uint32_t core, uint32_t mask, uint32_t firstVoice)
+    {
+        if (core < 2u)
+            g_diagKeyOns[core] += static_cast<uint32_t>(__builtin_popcount(mask));
+        for (uint32_t bit = 0; bit < 16u; ++bit)
+        {
+            if ((mask & (1u << bit)) == 0u || firstVoice + bit >= VoicesPerCore)
+                continue;
+            const uint32_t index = firstVoice + bit;
+            VoiceState &v = m_voices[core][index];
+            const uint32_t ssa = reg32(voiceAddrReg(core, index, 0u)) & ~7u;
+            v = VoiceState{};
+            v.active = true;
+            v.nax = ssa;
+            v.lsa = ssa;
+            v.phase = VoiceState::Phase::Attack;
+            m_endx[core] &= ~(1u << index);
+        }
+    }
+
+    void Spu2Reference::keyOff(uint32_t core, uint32_t mask, uint32_t firstVoice)
+    {
+        for (uint32_t bit = 0; bit < 16u; ++bit)
+        {
+            if ((mask & (1u << bit)) == 0u || firstVoice + bit >= VoicesPerCore)
+                continue;
+            VoiceState &v = m_voices[core][firstVoice + bit];
+            if (v.active)
+            {
+                v.phase = VoiceState::Phase::Release;
+                v.envelopeCounter = 0;
+            }
+        }
+    }
+
+    void Spu2Reference::decodeBlock(uint32_t core, uint32_t index)
+    {
+        VoiceState &v = m_voices[core][index];
+
+        // End of the previous block: with the end flag, jump to LSA; without "repeat" the voice stops.
+        if ((v.blockFlags & 1u) != 0u)
+        {
+            m_endx[core] |= 1u << index;
+            v.nax = v.lsa;
+            if ((v.blockFlags & 2u) == 0u)
+            {
+                v.active = false;
+                v.phase = VoiceState::Phase::Off;
+                v.envelope = 0;
+            }
+        }
+        v.blockFlags = 0;
+        if (!v.active)
+            return;
+
+        const uint32_t block = v.nax & (RamHalfwords - 1u);
+        const uint16_t header = ram(block);
+        uint32_t shift = header & 0xFu;
+        if (shift > 12u)
+            shift = 9u;
+        const uint32_t filter = std::min<uint32_t>((header >> 4u) & 7u, 4u);
+        v.blockFlags = static_cast<uint8_t>(header >> 8u);
+        if ((v.blockFlags & 4u) != 0u && !v.lsaFromRegister)
+            v.lsa = block;
+
+        for (uint32_t word = 1; word < 8u; ++word)
+        {
+            const uint16_t packed = ram(block + word);
+            checkIrqAddress((block + word) & (RamHalfwords - 1u));
+            for (uint32_t nibble = 0; nibble < 4u; ++nibble)
+            {
+                const int32_t raw = static_cast<int16_t>(((packed >> (nibble * 4u)) & 0xFu) << 12u) >> shift;
+                const int32_t predicted = (v.hist1 * kAdpcmFilters[filter][0] + v.hist2 * kAdpcmFilters[filter][1] + 32) >> 6;
+                const int16_t sample = clamp16(raw + predicted);
+                v.hist2 = v.hist1;
+                v.hist1 = sample;
+                v.decoded[(word - 1u) * 4u + nibble] = sample;
+            }
+        }
+        checkIrqAddress(block);
+        v.decodedIndex = 0;
+        v.nax = (block + 8u) & (RamHalfwords - 1u);
+    }
+
+    void Spu2Reference::stepEnvelope(uint32_t core, uint32_t index)
+    {
+        VoiceState &v = m_voices[core][index];
+        const uint16_t adsr1 = reg(voiceReg(core, index, 6u));
+        const uint16_t adsr2 = reg(voiceReg(core, index, 8u));
+
+        uint32_t rate = 0;
+        bool exponential = false;
+        bool increase = false;
+        switch (v.phase)
+        {
+        case VoiceState::Phase::Attack:
+            rate = (adsr1 >> 8u) & 0x7Fu;
+            exponential = (adsr1 & 0x8000u) != 0u;
+            increase = true;
+            break;
+        case VoiceState::Phase::Decay:
+            rate = ((adsr1 >> 4u) & 0xFu) * 4u;
+            exponential = true;
+            break;
+        case VoiceState::Phase::Sustain:
+            rate = (adsr2 >> 6u) & 0x7Fu;
+            exponential = (adsr2 & 0x8000u) != 0u;
+            increase = (adsr2 & 0x4000u) == 0u;
+            break;
+        case VoiceState::Phase::Release:
+            rate = (adsr2 & 0x1Fu) * 4u;
+            exponential = (adsr2 & 0x20u) != 0u;
+            break;
+        case VoiceState::Phase::Off:
+            return;
+        }
+
+        // psx-spx "SPU ADSR": ciclos = 1 << max(0, shift - 11); paso = valor << max(0, 11 - shift).
+        const int32_t shiftValue = static_cast<int32_t>(rate >> 2u);
+        const int32_t stepValue = static_cast<int32_t>(rate & 3u);
+        int32_t step = increase ? 7 - stepValue : -8 + stepValue;
+        uint32_t cycles = 1u << static_cast<uint32_t>(std::max(0, shiftValue - 11));
+        step <<= std::max(0, 11 - shiftValue);
+        if (exponential && increase && v.envelope > 0x6000)
+            cycles *= 4u;
+        if (exponential && !increase)
+            step = step * v.envelope / 0x8000;
+
+        if (++v.envelopeCounter >= cycles)
+        {
+            v.envelopeCounter = 0;
+            v.envelope = std::clamp(v.envelope + step, 0, 0x7FFF);
+        }
+
+        switch (v.phase)
+        {
+        case VoiceState::Phase::Attack:
+            if (v.envelope >= 0x7FFF)
+            {
+                v.phase = VoiceState::Phase::Decay;
+                v.envelopeCounter = 0;
+            }
+            break;
+        case VoiceState::Phase::Decay:
+            if (v.envelope <= static_cast<int32_t>(((adsr1 & 0xFu) + 1u) * 0x800u))
+            {
+                v.phase = VoiceState::Phase::Sustain;
+                v.envelopeCounter = 0;
+            }
+            break;
+        case VoiceState::Phase::Release:
+            if (v.envelope <= 0)
+            {
+                v.envelope = 0;
+                v.phase = VoiceState::Phase::Off;
+                v.active = false;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    int32_t Spu2Reference::stepVoice(uint32_t core, uint32_t index)
+    {
+        VoiceState &v = m_voices[core][index];
+        if (!v.active)
+            return 0;
+
+        // Pitch is 4.12 (0x1000 = 48 kHz). Linear interpolation between the last two samples (the hardware uses a
+        // 4-point Gaussian).
+        v.pitchCounter += std::min<uint32_t>(reg(voiceReg(core, index, 4u)), 0x3FFFu);
+        while (v.pitchCounter >= 0x1000u && v.active)
+        {
+            v.pitchCounter -= 0x1000u;
+            if (v.decodedIndex >= 28u)
+                decodeBlock(core, index);
+            if (!v.active)
+                break;
+            v.prev[1] = v.prev[0];
+            v.prev[0] = v.decoded[v.decodedIndex++];
+        }
+        if (!v.active)
+            return 0;
+
+        const int32_t fraction = static_cast<int32_t>(v.pitchCounter & 0xFFFu);
+        const int32_t sample = v.prev[1] + (((v.prev[0] - v.prev[1]) * fraction) >> 12);
+        stepEnvelope(core, index);
+        v.lastOutput = clamp16((sample * v.envelope) >> 15);
+        return v.lastOutput;
+    }
+
+    // Moves whole 512-byte ADMA blocks (256 L samples, then 256 R samples) into the input ring.
+    void Spu2Reference::feedInput(uint32_t core)
+    {
+        InputState &input = m_input[core];
+        constexpr size_t kBlockBytes = 1024u;
+        while (input.queue.size() - input.queueRead >= kBlockBytes && input.ringCount + 256u <= InputFrames)
+        {
+            const uint8_t *block = input.queue.data() + input.queueRead;
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                const uint32_t slot = (input.ringRead + input.ringCount + i) % InputFrames;
+                input.ring[slot][0] = static_cast<int16_t>(block[i * 2u] | (block[i * 2u + 1u] << 8u));
+                input.ring[slot][1] = static_cast<int16_t>(block[512u + i * 2u] | (block[512u + i * 2u + 1u] << 8u));
+            }
+            input.ringCount += 256u;
+            input.queueRead += kBlockBytes;
+            input.bytesConsumed += kBlockBytes;
+        }
+        // Transfers whose last byte is now in the ring are complete (a trailing partial block counts once the
+        // rest of the queue is consumed).
+        while (!input.transferEnds.empty())
+        {
+            const uint64_t end = input.transferEnds.front();
+            const bool inRing = end <= input.bytesConsumed;
+            const bool tailPartial = end == input.bytesQueued && input.bytesQueued - input.bytesConsumed < kBlockBytes;
+            if (!inRing && !tailPartial)
+                break;
+            input.transferEnds.erase(input.transferEnds.begin());
+            ++input.doneCount;
+        }
+        if (input.queueRead == input.queue.size() && input.queueRead != 0u)
+        {
+            input.queue.clear();
+            input.queueRead = 0u;
+        }
+    }
+
+    void Spu2Reference::step()
+    {
+        {
+            // Debug aid: PS2X_SPU2_DIAG=1 prints the mixer-relevant registers once per emulated second.
+            static const bool diag = std::getenv("PS2X_SPU2_DIAG") != nullptr;
+            static uint64_t samples = 0u;
+            if (diag && (++samples % 48000u) == 0u)
+            {
+                for (uint32_t core = 0; core < 2u; ++core)
+                {
+                    const uint32_t base = core * 0x400u;
+                    const uint32_t m = RegMvolBase + core * RegMvolStride;
+                    std::fprintf(stderr,
+                                 "[spu2-diag] t=%llus core%u admas=%04X attr=%04X mmix=%04X mvol=%04X/%04X bvol=%04X/%04X "
+                                 "avol=%04X/%04X ring=%u queue=%zu kon=%u voiceSamples=%u unmixed=%u writes=%u voiceWrites=%u endx=%06X active=%06X\n",
+                                 static_cast<unsigned long long>(samples / 48000u), core, reg(base + RegAdmas),
+                                 reg(base + RegAttr), reg(base + RegMmix), reg(m), reg(m + 2u), reg(m + 0x0Cu), reg(m + 0x0Eu),
+                                 reg(m + 0x08u), reg(m + 0x0Au), m_input[core].ringCount,
+                                 m_input[core].queue.size() - m_input[core].queueRead, g_diagKeyOns[core],
+                                 g_diagVoiceSamples[core], g_diagUnmixedSamples[core], g_diagWrites[core], g_diagVoiceWrites[core],
+                                 m_endx[core], [&] { uint32_t a = 0; for (uint32_t i = 0; i < VoicesPerCore; ++i) a |= m_voices[core][i].active ? 1u << i : 0u; return a; }());
+                    g_diagKeyOns[core] = g_diagVoiceSamples[core] = g_diagUnmixedSamples[core] = 0u;
+                    g_diagWrites[core] = g_diagVoiceWrites[core] = 0u;
+                }
+            }
+        }
+        int32_t coreOut[2][2] = {};
+        for (uint32_t core = 0; core < 2u; ++core)
+        {
+            const uint32_t base = core * 0x400u;
+            const uint32_t mixLeft = reg(base + RegVmixL) | (static_cast<uint32_t>(reg(base + RegVmixL + 2u)) << 16u);
+            const uint32_t mixRight = reg(base + RegVmixR) | (static_cast<uint32_t>(reg(base + RegVmixR + 2u)) << 16u);
+            int32_t left = 0;
+            int32_t right = 0;
+            for (uint32_t index = 0; index < VoicesPerCore; ++index)
+            {
+                const int32_t sample = stepVoice(core, index);
+                if (sample == 0)
+                    continue;
+                ++g_diagVoiceSamples[core];
+                if ((mixLeft & (1u << index)) == 0u && (mixRight & (1u << index)) == 0u)
+                    ++g_diagUnmixedSamples[core];
+                const int32_t volLeft = volumeFromRegister(reg(voiceReg(core, index, 0u)));
+                const int32_t volRight = volumeFromRegister(reg(voiceReg(core, index, 2u)));
+                if ((mixLeft & (1u << index)) != 0u)
+                    left += (sample * volLeft) >> 14;
+                if ((mixRight & (1u << index)) != 0u)
+                    right += (sample * volRight) >> 14;
+            }
+            // ADMA sound-data input, scaled by the core's BVOL (master block +0x0C/+0x0E).
+            InputState &input = m_input[core];
+            if (input.ringCount == 0u)
+                feedInput(core);
+            {
+                static const bool diag = std::getenv("PS2X_SPU2_DIAG") != nullptr;
+                static uint32_t reported = 0u;
+                if (diag && input.ringCount == 0u && admaActive(core) && input.bytesQueued != 0u && reported < 40u)
+                {
+                    ++reported;
+                    std::fprintf(stderr, "[spu2-diag] core%u ADMA underrun at cycle %llu: queued=%llu consumed=%llu pending=%zu done=%u\n",
+                                 core, static_cast<unsigned long long>(m_lastCycle), static_cast<unsigned long long>(input.bytesQueued),
+                                 static_cast<unsigned long long>(input.bytesConsumed), input.transferEnds.size(), input.doneCount);
+                }
+            }
+            if (input.ringCount != 0u)
+            {
+                const auto &frame = input.ring[input.ringRead];
+                const uint32_t bvol = RegMvolBase + core * RegMvolStride + 0x0Cu;
+                // BVOL is a plain signed 16-bit volume (0x7FFF = unity), unlike the sweep-format MVOL.
+                left += (frame[0] * static_cast<int16_t>(reg(bvol))) >> 15;
+                right += (frame[1] * static_cast<int16_t>(reg(bvol + 2u))) >> 15;
+                input.ringRead = (input.ringRead + 1u) % InputFrames;
+                --input.ringCount;
+            }
+            coreOut[core][0] = left;
+            coreOut[core][1] = right;
+        }
+
+        // Core 0 output through its master volume, added to core 1's dry mix, all through core 1's master volume
+        // (a simplification of the MMIX routing).
+        const auto master = [this](uint32_t core, uint32_t side)
+        {
+            return volumeFromRegister(reg(RegMvolBase + core * RegMvolStride + side * 2u));
+        };
+        int32_t streamOut[2] = {};
+        if (m_streamsActive.load(std::memory_order_relaxed))
+            mixStreams(streamOut[0], streamOut[1]);
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        for (uint32_t side = 0; side < 2u; ++side)
+        {
+            const int32_t core0 = (coreOut[0][side] * master(0u, side)) >> 14;
+            const int32_t mixed = (((core0 + coreOut[1][side]) * master(1u, side)) >> 14) + streamOut[side];
+            m_output.push_back(clamp16(mixed));
+        }
+        if (m_output.size() > kMaxBufferedFrames * 2u)
+            m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(m_output.size() / 2u & ~size_t{1}));
+    }
+
+    void Spu2Reference::streamPush(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames)
+    {
+        if (stream >= StreamCount || frames == 0u || rate == 0u)
+            return;
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        PcmStream &s = m_streams[stream];
+        // Drop the frames already played so the vector does not grow without bound.
+        if (s.read >= 16384u)
+        {
+            s.samples.erase(s.samples.begin(), s.samples.begin() + static_cast<std::ptrdiff_t>(s.read * 2u));
+            s.read = 0u;
+        }
+        s.rate = rate;
+        s.samples.insert(s.samples.end(), stereo, stereo + frames * 2u);
+        m_streamsActive.store(true, std::memory_order_relaxed);
+    }
+
+    uint64_t Spu2Reference::streamConsumed(uint32_t stream) const
+    {
+        if (stream >= StreamCount)
+            return 0u;
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        return m_streams[stream].consumedFrames;
+    }
+
+    void Spu2Reference::streamReset(uint32_t stream)
+    {
+        if (stream >= StreamCount)
+            return;
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        m_streams[stream] = PcmStream{};
+    }
+
+    void Spu2Reference::mixStreams(int32_t &left, int32_t &right)
+    {
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        for (PcmStream &s : m_streams)
+        {
+            const size_t frames = s.samples.size() / 2u;
+            if (s.read >= frames)
+                continue; // underrun: silence, and the source position does not move
+            const size_t next = s.read + 1u < frames ? s.read + 1u : s.read;
+            const double a = s.fraction;
+            left += static_cast<int32_t>(s.samples[s.read * 2u] * (1.0 - a) + s.samples[next * 2u] * a);
+            right += static_cast<int32_t>(s.samples[s.read * 2u + 1u] * (1.0 - a) + s.samples[next * 2u + 1u] * a);
+            s.fraction += static_cast<double>(s.rate) / 48000.0;
+            while (s.fraction >= 1.0 && s.read < frames)
+            {
+                s.fraction -= 1.0;
+                ++s.read;
+                ++s.consumedFrames;
+            }
+            if (s.read >= frames)
+                s.fraction = 0.0;
+        }
+    }
+
+    void Spu2Reference::advanceTo(uint64_t iopCycle)
+    {
+        if (iopCycle <= m_lastCycle)
+            return;
+        const uint64_t elapsed = iopCycle - m_lastCycle;
+        // Most scheduler calls advance only a fraction of a sample. Preserve
+        // that remainder without performing a wide division or storing +0.
+        if (elapsed < CyclesPerSample)
+            return;
+        const uint64_t samples = elapsed / CyclesPerSample;
+        for (uint64_t i = 0; i < samples; ++i)
+            step();
+        m_lastCycle += samples * CyclesPerSample;
+    }
+
+    size_t Spu2Reference::pendingFrames() const
+    {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        return m_output.size() / 2u;
+    }
+
+    size_t Spu2Reference::drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
+    {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        const size_t available = m_output.size() / 2u;
+        if (maxLatencyFrames != SIZE_MAX && available > maxFrames + maxLatencyFrames)
+        {
+            const size_t drop = available - maxFrames - maxLatencyFrames;
+            m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(drop * 2u));
+        }
+        const size_t frames = std::min(maxFrames, m_output.size() / 2u);
+        std::copy_n(m_output.begin(), frames * 2u, stereo);
+        m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(frames * 2u));
+        return frames;
+    }
+}

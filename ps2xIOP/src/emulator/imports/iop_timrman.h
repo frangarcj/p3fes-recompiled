@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 
 namespace ps2x::iop::detail
 {
@@ -16,7 +17,14 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
+        // true when serviceDue(currentCycle) would return at once (already servicing, or before the earliest event)
+        [[nodiscard]] bool nothingDueAt(uint64_t currentCycle) const noexcept
+        {
+            return m_servicing || (m_earliestValid && currentCycle < m_earliestEvent);
+        }
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+        // diagnostics (PS2X_IOP_PROFILE): one text line per running timer
+        void describe(std::ostream &out) const;
 
     private:
         struct Callback

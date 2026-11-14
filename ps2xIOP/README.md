@@ -39,6 +39,14 @@ Link with `target_link_libraries(my_runtime PRIVATE ps2x::iop)`. The public API
 is [iop_subsystem.h](include/ps2x/iop/iop_subsystem.h); `PS2Runtime` owns its
 subsystem and host adapter.
 
+`runEeCycles()` uses the kernel's versioned idle cache to avoid repeated scheduler
+and SPU2 service calls for short idle intervals. It requires no ready thread,
+callback, timer or DMA completion before the target, and no SPU2 sample or pending
+IRQ/ADMA notification through the target. Other intervals retain the original loop
+and final SPU2 service. Kernel mutations invalidate the idle cache; scheduling and
+event queues retain their existing single-executor ownership. Set
+`PS2X_IOP_IDLE_FAST=0` before constructing the subsystem to disable the fast path.
+
 ## Diagnostics and tests
 
 `debugSnapshot()` exposes emulator cycle/instruction counts, loaded module,
@@ -53,5 +61,47 @@ cmake --build out/build/iop-tests
 ctest --test-dir out/build/iop-tests --output-on-failure
 ```
 
-The suites cover IRX execution, RPC, imports, version resolution and generic
-HLE compatibility. `ps2x_tests` also covers runtime SIF RPC/DMA integration.
+The suites cover IRX execution, RPC, imports, version resolution, generic HLE
+compatibility, fragmented SPU2 clocks and idle-path A/B comparisons with thread
+wakes, timer callbacks and DMA interrupts. `ps2x_tests` also covers runtime SIF
+RPC/DMA integration.
+
+For aggregate scheduling diagnostics, configure with
+`-DPS2X_IOP_WORK_DIAGNOSTICS=ON` and run with `PS2X_IOP_WORK_DIAG=1`.
+The option defaults to OFF and removes the hot counter branches from normal
+builds. The resulting `[IOP:work]` windows report calls, iterations and emulated
+cycles, not host CPU time. With diagnostics enabled, the idle A/B test also checks
+that the fast path was exercised.
+
+## Burst interpreter (`PS2X_IOP_FAST=1`)
+
+Off by default (unset or `0` runs the original interpreter loop). Read once when the emulator is created.
+With `PS2X_IOP_FAST=1`, `IopEmulator::Impl::runCpu` runs straight-line register/RAM code through
+`IopCpuCore::runBurst` (registers, PC and branch/load-delay state in locals, RAM accessed directly) and hoists the
+checks `step()` makes per instruction (stop, sentinels, RAM range, pending interrupt, due DMA/guest callbacks, PC
+sampling) out of the loop. A burst ends *before* the first instruction that could affect any of them (COP0,
+syscall/break, overflowing add/sub, misaligned or non-RAM load/store, a `jr ra` that may be an import stub, a fetch
+outside RAM); that instruction runs through `step()` as before, so timing, interrupts and DMA are unchanged. The
+import dispatcher classifies the library once per call instead of comparing names in turn, and `resolve()` is
+memoised until the set of export libraries changes. `tests/iop_fast_equivalence_tests.cpp` compares full CPU state
+and RAM against `executeFetchedInstruction` on random instruction streams (`--bench` prints timings);
+`tests/iop_fast_integration_tests.cpp` runs the same synthetic IRX with the switch off and on and compares cycle and
+instruction counters, guest memory and logs (`--bench` times a compute loop).
+
+Since 2026-11-14 the burst interpreter is ON by default; `PS2X_IOP_FAST=0` selects the original loop. Round 2 added, all
+exact (the real-driver state hash is identical with `PS2X_IOP_FAST=0` and `PS2X_IOP_IDLE_FAST=0`):
+
+- `runBurst` runs a taken branch together with a simple delay-slot instruction, and a load together with the next
+  simple instruction, so no branch/load-delay state is carried between iterations; that state lives in `IopCpuState`.
+- `runCycles` jumps over an idle interval even when SPU2 samples fall due in it (`IdleJump::SpuCatchUp`), and skips
+  `serviceSpu2`, DMA, callback and timer servicing through inline "nothing due" tests.
+- `Spu2` counts silent output frames (`m_silentPending`) and writes them to the ring only when the ring is read or real
+  frames follow, instead of a mutex + memset per call.
+- `IopImportRegistry::decode` reads RAM directly; the import dispatcher classifies the library with a hash lookup.
+
+Diagnostics: `tests/iop_real_driver_bench.cpp` (`ps2_iop_real_driver_bench <game>/LIB31 [guest s] [warm-up] [chunk]`)
+loads the game's real sound drivers without the game and prints guest instructions per guest second and, on Apple
+Silicon, exact host instructions per guest instruction and per `runEeCycles` call, plus a state hash.
+`PS2X_IOP_PROFILE=<file>` (with `PS2X_IOP_FAST=0`, optionally `PS2X_IOP_PROFILE_FROM=<instruction>`) writes a guest PC
+histogram, per-thread instruction counts, import call counts per thread, hardware accesses and the running timers,
+plus `<file>.ram` (IOP RAM image) every 2 M instructions.

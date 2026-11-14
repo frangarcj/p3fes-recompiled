@@ -18,8 +18,12 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <cstdlib>
+#include <cstring>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -91,6 +95,7 @@ namespace ps2x::iop::detail
         };
 
         static constexpr uint64_t kSifDmaCompletionCycles = 2000u;
+        static constexpr uint64_t kWorkDiagWindowCycles = 5u * 48000u * Spu2::CyclesPerSample;
         struct ScheduledGuestCallback
         {
             uint32_t function = 0u;
@@ -115,6 +120,7 @@ namespace ps2x::iop::detail
               imports(memory),
               loadcore(memory, imports)
         {
+            imports.setResolveCache(fastEnabled);
             reset();
             kernel.setOutsideThreadWait([this](const std::function<bool()> &ready) { return waitOutsideThread(ready); });
             // Memory cards (PCSX2 .ps2 format). Slot 1: PS2X_MEMCARD1, else
@@ -156,7 +162,10 @@ namespace ps2x::iop::detail
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
             totalInstructions = 0;
+            nextPcSampleInstruction = 0u;
             eeCycleCarry = 0;
+            ++workDiagGeneration;
+            clearWorkDiagWindow();
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -265,8 +274,95 @@ namespace ps2x::iop::detail
             Missing,
         };
 
+        // Library families the import dispatcher tells apart. With PS2X_IOP_FAST the family is classified once per
+        // stub (IopImportCall::libraryClass) instead of comparing the name against each one in turn.
+        enum LibraryClass : int32_t
+        {
+            LibSysmem, LibCdvdman, LibLoadcore, LibThbase, LibThreadman, LibThsemap, LibThevent, LibSifcmd, LibIntrman,
+            LibSecrman, LibModload, LibIoman, LibSifman, LibVblank, LibTimrman, LibDmacman, LibStdio, LibSysclib,
+            LibHeaplib, LibNone
+        };
+        static constexpr const char *kLibraryNames[] = {
+            "sysmem", "cdvdman", "loadcore", "thbase", "threadman", "thsemap", "thevent", "sifcmd", "intrman",
+            "secrman", "modload", "ioman", "sifman", "vblank", "timrman", "dmacman", "stdio", "sysclib", "heaplib"};
+
+        static int32_t classifyLibrary(std::string_view name)
+        {
+            for (int32_t i = 0; i < LibNone; ++i)
+                if (iequals(name, kLibraryNames[i]))
+                    return i;
+            return LibNone;
+        }
+
+        // iequals() against the library names for ASCII input: the lowercased name (up to 9 chars) is packed into
+        // two words and looked up in a small open-addressing table built once.
+        static int32_t classifyLibraryFast(const std::string &name)
+        {
+            struct Entry
+            {
+                uint64_t lo = 0, hi = 0;
+                int32_t id = -1;
+            };
+            struct Table
+            {
+                std::array<Entry, 64> slots{};
+                static uint32_t slot(uint64_t lo, uint64_t hi) { return static_cast<uint32_t>(((lo ^ (hi * 0x9E3779B97F4A7C15ull)) * 0xD6E8FEB86659FD93ull) >> 58u); }
+                void insert(uint64_t lo, uint64_t hi, int32_t id)
+                {
+                    uint32_t i = slot(lo, hi);
+                    while (slots[i].id >= 0)
+                        i = (i + 1u) & 63u;
+                    slots[i] = {lo, hi, id};
+                }
+            };
+            static const Table table = []
+            {
+                Table t;
+                for (int32_t i = 0; i < LibNone; ++i)
+                {
+                    uint64_t lo = 0, hi = 0;
+                    const char *text = kLibraryNames[i];
+                    for (size_t k = 0; text[k] != '\0'; ++k)
+                        (k < 8u ? lo : hi) |= static_cast<uint64_t>(static_cast<uint8_t>(text[k])) << ((k & 7u) * 8u);
+                    t.insert(lo, hi, i);
+                }
+                return t;
+            }();
+            const size_t length = name.size();
+            if (length > 9u)
+                return LibNone;
+            uint64_t lo = 0, hi = 0;
+            for (size_t k = 0; k < length; ++k)
+            {
+                char c = name[k];
+                if (c >= 'A' && c <= 'Z')
+                    c = static_cast<char>(c + ('a' - 'A'));
+                (k < 8u ? lo : hi) |= static_cast<uint64_t>(static_cast<uint8_t>(c)) << ((k & 7u) * 8u);
+            }
+            for (uint32_t i = Table::slot(lo, hi); table.slots[i].id >= 0; i = (i + 1u) & 63u)
+                if (table.slots[i].lo == lo && table.slots[i].hi == hi)
+                    return table.slots[i].id;
+            return LibNone;
+        }
+
+        template <bool Fast>
+        static bool isLibrary(const IopImportCall &call, LibraryClass id)
+        {
+            if constexpr (Fast)
+                return call.libraryClass == id;
+            else
+                return iequals(call.library, kLibraryNames[id]);
+        }
+
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            return fastEnabled ? dispatchImportImpl<true>(call, cpu) : dispatchImportImpl<false>(call, cpu);
+        }
+
+        template <bool Fast>
+        ImportDisposition dispatchImportImpl(const IopImportCall &call, CpuState &cpu)
+        {
+            const auto isLib = [](const IopImportCall &c, LibraryClass id) { return isLibrary<Fast>(c, id); };
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -307,10 +403,10 @@ namespace ps2x::iop::detail
                 log(LogLevel::Info, trace.str());
             }
 
-            if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+            if (isLib(call, LibSysmem) && sysmem.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
-            if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
+            if (isLib(call, LibCdvdman) && cdvd.dispatchImport(call.ordinal, cpu))
             {
                 if (const auto callback = cdvd.takeCompletionCallback())
                 {
@@ -325,36 +421,36 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             }
 
-            if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
+            if (isLib(call, LibLoadcore) && loadcore.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
-            if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+            if (isLib(call, LibThbase) || isLib(call, LibThreadman))
             {
                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "thsemap"))
+            if (isLib(call, LibThsemap))
             {
                 return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "thevent"))
+            if (isLib(call, LibThevent))
             {
                 return kernel.dispatchEventImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "sifcmd"))
+            if (isLib(call, LibSifcmd))
             {
                 return rpc.dispatchSifCmdImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
+            if (isLib(call, LibIntrman) && intrman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
-            if (iequals(call.library, "secrman"))
+            if (isLib(call, LibSecrman))
             {
                 switch (call.ordinal)
                 {
@@ -376,15 +472,15 @@ namespace ps2x::iop::detail
                     break;
                 }
             }
-            if (iequals(call.library, "modload") && call.ordinal == 13u)
+            if (isLib(call, LibModload) && call.ordinal == 13u)
             {
                 checkKelfPathCallback = {a0, cpu.gpr[28]};
                 setV0(0);
                 return ImportDisposition::Handled;
             }
-            if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+            if (isLib(call, LibIoman) && ioman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
-            if (iequals(call.library, "sifman"))
+            if (isLib(call, LibSifman))
             {
                 const bool handled = rpc.dispatchSifManImport(call.ordinal, cpu);
                 // dbcman sends to the EE with sceSifSetDmaIntr and waits for its end-of-DMA callback.
@@ -394,11 +490,11 @@ namespace ps2x::iop::detail
                                                   ScheduledGuestCallback{callback.function, callback.gp, callback.argument});
                 return handled ? ImportDisposition::Handled : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+            if (isLib(call, LibVblank) && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
-            if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+            if (isLib(call, LibTimrman) && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
-            if (iequals(call.library, "dmacman"))
+            if (isLib(call, LibDmacman))
             {
                 // sio2man programs the SIO2's DMA 11 and 12 with sceSetSliceDMA/sceStartDMA.
                 const uint32_t channel = a0;
@@ -422,15 +518,15 @@ namespace ps2x::iop::detail
                 setV0(0);
                 return ImportDisposition::Handled;
             }
-            if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
+            if (isLib(call, LibStdio) && stdio.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
-            if (iequals(call.library, "sysclib"))
+            if (isLib(call, LibSysclib))
             {
                 return sysclib.dispatchImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
+            if (isLib(call, LibHeaplib) && heaplib.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
@@ -447,6 +543,114 @@ namespace ps2x::iop::detail
             log(LogLevel::Warning, out.str());
             setV0(0);
             return ImportDisposition::Missing;
+        }
+
+        // PS2X_IOP_PROFILE=<file>: guest-side profile for finding hot guest code (use with PS2X_IOP_FAST=0, which steps
+        // every instruction here). From instruction PS2X_IOP_PROFILE_FROM on it counts, per guest PC, per running
+        // thread, per import call (thread, library:ordinal) and per load/store that leaves RAM (pc, address, opcode),
+        // and rewrites <file> every 2 M instructions. Diagnostics only: nothing here changes guest execution.
+        struct Profile
+        {
+            std::string path;
+            uint64_t from = 0, startInstr = 0, startCycles = 0, nextDump = 0;
+            bool started = false;
+            std::vector<uint32_t> pc = std::vector<uint32_t>(kRamSize / 4u, 0u);
+            std::map<std::pair<int, uint32_t>, uint64_t> imports; // (thread, lib/ordinal) -> calls
+            std::map<std::pair<uint32_t, uint32_t>, uint64_t> hw; // (pc, address) -> accesses, address low bits hold nothing else
+            std::map<std::pair<uint32_t, uint32_t>, uint64_t> hwOp; // (pc, opcode) -> accesses
+            std::map<int, uint64_t> threadInstr;
+            std::map<int, uint32_t> threadEntry;
+            std::map<std::string, uint32_t> libIds;
+            uint64_t runCalls = 0, runCycles = 0, fastIdle = 0, readyLoops = 0, idleLoops = 0, cpuCalls = 0;
+        };
+        std::unique_ptr<Profile> profile = []() -> std::unique_ptr<Profile>
+        {
+            const char *path = std::getenv("PS2X_IOP_PROFILE");
+            if (path == nullptr || path[0] == '\0')
+                return nullptr;
+            auto result = std::make_unique<Profile>();
+            result->path = path;
+            const char *from = std::getenv("PS2X_IOP_PROFILE_FROM");
+            result->from = from ? std::strtoull(from, nullptr, 10) : 0ULL;
+            return result;
+        }();
+
+        void profileDump()
+        {
+            std::ofstream out(profile->path, std::ios::trunc);
+            out << "instructions " << (totalInstructions - profile->startInstr) << "\ncycles " << (totalCycles - profile->startCycles) << "\n";
+            out << "sched calls " << profile->runCalls << " cyclesRequested " << profile->runCycles << " fastIdle " << profile->fastIdle << " readyLoops " << profile->readyLoops << " idleLoops " << profile->idleLoops << " cpuCalls " << profile->cpuCalls << "\n";
+            timrman.describe(out);
+            for (const auto &[tid, count] : profile->threadInstr)
+                out << "thread " << tid << " entry " << std::hex << profile->threadEntry[tid] << std::dec << " instr " << count << "\n";
+            for (uint32_t i = 0; i < profile->pc.size(); ++i)
+                if (profile->pc[i])
+                    out << "pc " << std::hex << (i * 4u) << std::dec << " " << profile->pc[i] << "\n";
+            for (const auto &[key, count] : profile->imports)
+                out << "imp " << key.first << " " << std::hex << (key.second >> 16u) << std::dec << ":" << (key.second & 0xFFFFu) << " " << count << "\n";
+            for (const auto &[key, count] : profile->hw)
+                out << "hw " << std::hex << key.first << " " << key.second << std::dec << " " << count << "\n";
+            for (const auto &[key, count] : profile->hwOp)
+                out << "hwop " << std::hex << key.first << " " << key.second << std::dec << " " << count << "\n";
+            for (const auto &[name, id] : profile->libIds)
+                out << "lib " << id << " " << name << "\n";
+            out.close();
+            std::ofstream ram(profile->path + ".ram", std::ios::binary | std::ios::trunc);
+            const auto image = memory.ram();
+            ram.write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size()));
+        }
+
+        void profileInstruction(CpuState &cpu)
+        {
+            Profile &p = *profile;
+            if (!p.started)
+            {
+                if (totalInstructions < p.from)
+                    return;
+                p.started = true;
+                p.startInstr = totalInstructions;
+                p.startCycles = totalCycles;
+                p.nextDump = totalInstructions + 2000000u;
+            }
+            else if (totalInstructions >= p.nextDump)
+            {
+                p.nextDump += 2000000u;
+                profileDump();
+            }
+            const uint32_t phys = physicalAddress(cpu.pc);
+            if (phys < kRamSize)
+                ++p.pc[phys >> 2u];
+            const IopThread *thread = kernel.currentThread();
+            const int tid = thread ? thread->id : 0;
+            ++p.threadInstr[tid];
+            if (thread)
+                p.threadEntry[tid] = thread->entry;
+            const uint32_t word = memory.fetch32(cpu.pc);
+            const uint32_t op = word >> 26u;
+            if (op >= 0x20u && op <= 0x2Eu && op != 0x27u)
+            {
+                const uint32_t address = cpu.gpr[(word >> 21u) & 31u] + static_cast<uint32_t>(sign16(word));
+                if (physicalAddress(address) >= kRamSize)
+                {
+                    ++p.hw[{phys, physicalAddress(address)}];
+                    ++p.hwOp[{phys, op}];
+                }
+            }
+        }
+
+        void profileImport(const IopImportCall &call)
+        {
+            Profile &p = *profile;
+            if (!p.started)
+                return;
+            std::string lower = call.library;
+            for (char &c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto it = p.libIds.find(lower);
+            if (it == p.libIds.end())
+                it = p.libIds.emplace(lower, static_cast<uint32_t>(p.libIds.size() + 1u)).first;
+            const IopThread *thread = kernel.currentThread();
+            ++p.imports[{thread ? thread->id : 0, (it->second << 16u) | call.ordinal}];
         }
 
         bool step(CpuState &cpu)
@@ -470,9 +674,18 @@ namespace ps2x::iop::detail
                 return true;
 
             // import stubs start with "jr ra"; only those addresses are looked up in the tables.
-            const auto import = memory.fetch32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc) : std::nullopt;
+            const uint32_t instruction = memory.fetch32(cpu.pc);
+            std::optional<IopImportCall> import;
+            if (instruction == 0x03E00008u)
+            {
+                import = imports.decode(cpu.pc);
+                if (import && fastEnabled)
+                    import->libraryClass = classifyLibraryFast(import->library);
+            }
             if (import)
             {
+                if (profile)
+                    profileImport(*import);
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
                 ++totalCycles;
@@ -484,24 +697,96 @@ namespace ps2x::iop::detail
             }
 
             // IOP PC sampling (PS2X_IOP_PC_EVERY=<instructions>), read once when the IOP is created.
-            if (pcEvery != 0ULL && totalInstructions % pcEvery == 0ULL)
+            if (pcEvery != 0ULL && totalInstructions >= nextPcSampleInstruction)
             {
                 std::ostringstream out;
                 out << "[IOP:pc] instr=" << std::dec << totalInstructions << std::hex << " pc=0x" << cpu.pc
                     << " ra=0x" << cpu.gpr[31] << " sp=0x" << cpu.gpr[29] << " v0=0x" << cpu.gpr[2]
                     << " a0=0x" << cpu.gpr[4];
+                if (const std::string *moduleName = moduleNameForPC(cpu.pc))
+                    out << " module=" << *moduleName;
                 log(LogLevel::Info, out.str());
+                const uint64_t next = totalInstructions + pcEvery;
+                nextPcSampleInstruction = next < totalInstructions ? UINT64_MAX : next;
             }
 
-            const bool running = cpuCore.executeInstruction(cpu);
+            if (profile)
+                profileInstruction(cpu);
+            const bool running = cpuCore.executeFetchedInstruction(cpu, instruction);
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
             return running;
         }
 
+        // PS2X_IOP_FAST (read once; "0" = the original loop below): straight-line RAM/register code runs
+        // through IopCpuCore::runBurst with the per-instruction checks of step() hoisted out of the loop. A burst is
+        // only started when none of them can change inside it (no interrupt can fire, no DMA/callback becomes due, no
+        // PC sample is due) and ends before the first instruction that could (see runBurst); that instruction, and
+        // every one near a sentinel, import stub or hardware access, goes through step() exactly as before.
+        const bool fastEnabled = []
+        {
+            const char *value = std::getenv("PS2X_IOP_FAST");
+            // On by default since 2026-11-14 (differential fuzz and integration tests, Mac and console runs);
+            // PS2X_IOP_FAST=0 selects the original loop.
+            return value == nullptr || value[0] != '0';
+        }();
+
+        uint32_t runCpuFast(CpuState &cpu, uint32_t instructionBudget)
+        {
+            CpuState *previous = activeCpu;
+            activeCpu = &cpu;
+            const uint64_t start = totalInstructions;
+            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
+            {
+                uint32_t ran = 0u;
+                bool bailed = true;
+                // checkInterrupt() without side effects: nothing in a burst can change what it looks at.
+                const uint32_t status = cpu.cop0[12];
+                const bool interruptDue = (status & 3u) == 1u && memory.interruptControl() != 0u &&
+                                          (memory.interruptStatus() & memory.interruptMask()) != 0u;
+                if (!interruptDue)
+                {
+                    uint64_t limit = instructionBudget - (totalInstructions - start);
+                    if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                    {
+                        uint64_t due = UINT64_MAX;
+                        for (const auto &entry : pendingDmaInterrupts)
+                            due = std::min(due, entry.second);
+                        limit = std::min<uint64_t>(limit, due > totalCycles ? due - totalCycles : 0u);
+                    }
+                    if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                    {
+                        const uint64_t due = pendingGuestCallbacks.begin()->first;
+                        limit = std::min<uint64_t>(limit, due > totalCycles ? due - totalCycles : 0u);
+                    }
+                    if (pcEvery != 0ULL)
+                        limit = std::min<uint64_t>(limit, nextPcSampleInstruction > totalInstructions ? nextPcSampleInstruction - totalInstructions : 0u);
+                    if (limit != 0u)
+                    {
+                        ran = cpuCore.runBurst(cpu, static_cast<uint32_t>(limit), bailed);
+                        totalInstructions += ran;
+                        totalCycles += ran;
+                    }
+                }
+                if (ran == 0u || bailed)
+                {
+                    if (!step(cpu))
+                        break;
+                }
+                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                    servicePendingDmaInterrupts();
+                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                    servicePendingGuestCallbacks();
+            }
+            activeCpu = previous;
+            return static_cast<uint32_t>(totalInstructions - start);
+        }
+
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
         {
+            if (fastEnabled)
+                return runCpuFast(cpu, instructionBudget);
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
@@ -678,7 +963,29 @@ namespace ps2x::iop::detail
                 return value == nullptr || value[0] != '0';
             }();
             Spu2 &spu = memory.spu2();
+            // nothing to do: no sample due, no ADMA completion and no IRQ pending (what the code below would find)
+            if (!workDiagEnabled && spu.canSkipServiceAt(totalCycles))
+                return;
+            if (workDiagEnabled)
+            {
+                const uint64_t completedSamples = totalCycles / Spu2::CyclesPerSample;
+                const uint64_t samplesDue = completedSamples >= workDiagSpu2CompletedSamples
+                                                 ? completedSamples - workDiagSpu2CompletedSamples
+                                                 : completedSamples;
+                workDiagSpu2CompletedSamples = completedSamples;
+                ++workDiagSpu2Calls;
+                if (samplesDue == 0u)
+                    ++workDiagSpu2Due0;
+                else if (samplesDue == 1u)
+                    ++workDiagSpu2Due1;
+                else if (samplesDue <= 64u)
+                    ++workDiagSpu2Due2To64;
+                else
+                    ++workDiagSpu2DueOver64;
+            }
             spu.advanceTo(totalCycles);
+            if (!workDiagEnabled && !spu.eventsPending())
+                return; // no ADMA completion and no IRQ: the rest of this function would do nothing
             // ADMA transfers complete as the SPU2 takes their blocks: raise the core's DMA interrupt (4 / 7).
             for (uint32_t core = 0; core < 2u; ++core)
                 while (spu.takeAdmaDone(core))
@@ -739,56 +1046,293 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        void clearWorkDiagWindow() noexcept
+        {
+            workDiagWindowStartCycles = totalCycles;
+            workDiagSpu2CompletedSamples = totalCycles / Spu2::CyclesPerSample;
+            workDiagRunCalls = 0u;
+            workDiagRequestedCycles = 0u;
+            workDiagMinRequestedCycles = 0u;
+            workDiagMaxRequestedCycles = 0u;
+            workDiagReadyLoops = 0u;
+            workDiagIdleLoops = 0u;
+            workDiagRunElapsedCycles = 0u;
+            workDiagInstructions = 0u;
+            workDiagSpu2Calls = 0u;
+            workDiagSpu2Due0 = 0u;
+            workDiagSpu2Due1 = 0u;
+            workDiagSpu2Due2To64 = 0u;
+            workDiagSpu2DueOver64 = 0u;
+            workDiagWakeLimits = 0u;
+            workDiagDmaLimits = 0u;
+            workDiagCallbackLimits = 0u;
+            workDiagTimerLimits = 0u;
+            workDiagAdmaLimits = 0u;
+            workDiagTargetLimits = 0u;
+            workDiagFastIdle = 0u;
+        }
+
+        // How runCycles(target - now) can be skipped over. Pure: nothing can happen before `target` (the original idle
+        // fast path). SpuCatchUp (PS2X_IOP_FAST): the same except that SPU2 samples fall due inside the interval; the
+        // original loop would run serviceSpu2() (a no-op at `now`, which is required), find nothing else to do, jump
+        // the clock to `target` and run serviceSpu2() once more, which is what the caller then does.
+        enum class IdleJump { No, Pure, SpuCatchUp };
+
+        IdleJump idleJumpTo(uint64_t target) const noexcept
+        {
+            const uint64_t current = totalCycles;
+            if (target <= current || activeCpu != nullptr || callDepth != 0u || settlingThreads ||
+                waitingOutsideThread || servicingDmaInterrupts || servicingGuestCallbacks ||
+                servicingSpu2Interrupt)
+                return IdleJump::No;
+            // Require both SPU2 service points to be no-ops: no pending event
+            // and no sample due anywhere through target. Other intervals use
+            // the original loop, including its final sample/IRQ service.
+            if (!kernel.cachedIdleCovers(current, target))
+                return IdleJump::No;
+            const bool spuIdleAtTarget = memory.spu2().canSkipServiceAt(target);
+            if (!spuIdleAtTarget && (!fastEnabled || workDiagEnabled || !memory.spu2().canSkipServiceAt(current)))
+                return IdleJump::No;
+
+            // DMA is keyed by IRQ rather than deadline, so inspect every outstanding completion.
+            for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+            {
+                (void)irq;
+                if (completionCycle < target)
+                    return IdleJump::No;
+            }
+            if (!pendingGuestCallbacks.empty() && pendingGuestCallbacks.begin()->first < target)
+                return IdleJump::No;
+            if (timrman.nextEventCycle(target) < target)
+                return IdleJump::No;
+
+            constexpr uint64_t kAdmaWakeCycles = 64u * Spu2::CyclesPerSample;
+            if ((memory.spu2().admaActive(0u) || memory.spu2().admaActive(1u)) &&
+                target - current > kAdmaWakeCycles)
+                return IdleJump::No;
+            return spuIdleAtTarget ? IdleJump::Pure : IdleJump::SpuCatchUp;
+        }
+
+        bool canFastIdleTo(uint64_t target) const noexcept
+        {
+            return idleJumpTo(target) == IdleJump::Pure;
+        }
+
+        void emitWorkDiagWindow() noexcept
+        {
+            if (!workDiagEnabled || totalCycles < workDiagWindowStartCycles ||
+                totalCycles - workDiagWindowStartCycles < kWorkDiagWindowCycles)
+                return;
+
+            try
+            {
+                std::ostringstream out;
+                out << "[IOP:work] cycles=" << (totalCycles - workDiagWindowStartCycles)
+                    << " run_calls=" << workDiagRunCalls
+                    << " requested=" << workDiagRequestedCycles
+                    << " requested_min=" << workDiagMinRequestedCycles
+                    << " requested_max=" << workDiagMaxRequestedCycles
+                    << " loops_ready=" << workDiagReadyLoops
+                    << " loops_idle=" << workDiagIdleLoops
+                    << " run_elapsed_cycles=" << workDiagRunElapsedCycles
+                    << " instructions=" << workDiagInstructions
+                    << " spu_calls=" << workDiagSpu2Calls
+                    << " samples_due_0=" << workDiagSpu2Due0
+                    << " samples_due_1=" << workDiagSpu2Due1
+                    << " samples_due_2_64=" << workDiagSpu2Due2To64
+                    << " samples_due_over64=" << workDiagSpu2DueOver64
+                    << " idle_wake=" << workDiagWakeLimits
+                    << " idle_dma=" << workDiagDmaLimits
+                    << " idle_callback=" << workDiagCallbackLimits
+                    << " idle_timer=" << workDiagTimerLimits
+                    << " idle_adma=" << workDiagAdmaLimits
+                    << " idle_target=" << workDiagTargetLimits
+                    << " idle_fast=" << workDiagFastIdle;
+                log(LogLevel::Info, out.str());
+            }
+            catch (...)
+            {
+                // Optional diagnostics must not affect the emulated scheduler.
+            }
+            clearWorkDiagWindow();
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
+            const bool workDiagOutermost = workDiagEnabled && workDiagRunDepth == 0u;
+            uint64_t workDiagEntryCycles = 0u;
+            uint64_t workDiagEntryInstructions = 0u;
+            uint64_t workDiagEntryGeneration = 0u;
+            if (workDiagEnabled)
+            {
+                workDiagEntryCycles = totalCycles;
+                workDiagEntryInstructions = totalInstructions;
+                workDiagEntryGeneration = workDiagGeneration;
+                ++workDiagRunDepth;
+            }
             try
             {
                 const uint64_t target = totalCycles + cycles;
-                while (totalCycles < target)
+                if (profile && profile->started)
                 {
-                    serviceSpu2();
-                    servicePendingDmaInterrupts();
-                    servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
-                    IopThread *next = kernel.beginNextReady(totalCycles);
-                    if (!next)
-                    {
-                        // with PS2X_IOP_PC_EVERY, report now and then that the IOP is idle.
-                        static unsigned long long idleCount = 0ULL;
-                        // getenv scans the whole environment; in this idle loop it took almost 40% of the game thread
-                        // (ucrtbase!strchr). It is read once.
-                        static const bool idleTrace = std::getenv("PS2X_IOP_PC_EVERY") != nullptr;
-                        if (idleTrace && (++idleCount % 200000ULL) == 1ULL)
-                        {
-                            std::ostringstream out;
-                            out << "[IOP:idle] no ready threads (count=" << idleCount << ") instr=" << totalInstructions;
-                            log(LogLevel::Info, out.str());
-                        }
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
-                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
-                            nextWake = std::min(nextWake, completionCycle);
-                        if (!pendingGuestCallbacks.empty())
-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
-                        nextWake = timrman.nextEventCycle(nextWake);
-                        // P3FES: while a core streams ADMA input, wake at least every 64 samples so its DMA
-                        // completions reach the driver before the input buffer runs dry (idle jumps otherwise
-                        // skip whole blocks and the stream drops samples).
-                        if (memory.spu2().admaActive(0u) || memory.spu2().admaActive(1u))
-                            nextWake = std::min<uint64_t>(nextWake, totalCycles + 64u * Spu2::CyclesPerSample);
-                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
-                        continue;
-                    }
-                    const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
-                    kernel.endTimeslice(*next, kThreadReturnSentinel);
-                    if (totalCycles == before)
-                        ++totalCycles;
+                    ++profile->runCalls;
+                    profile->runCycles += cycles;
                 }
-                serviceSpu2(); // bring the SPU2 up to date after skipping idle cycles to the end
+                const IdleJump idleJump = idleFastEnabled ? idleJumpTo(target) : IdleJump::No;
+                if (idleJump == IdleJump::SpuCatchUp)
+                {
+                    if (profile && profile->started)
+                        ++profile->fastIdle;
+                    totalCycles = target;
+                    serviceSpu2(); // the loop's final service, with the SPU2 samples that fell due on the way
+                }
+                else if (idleJump == IdleJump::Pure)
+                {
+                    if (profile && profile->started)
+                        ++profile->fastIdle;
+                    totalCycles = target;
+                    if (workDiagEnabled)
+                        ++workDiagFastIdle;
+                }
+                else
+                {
+                    while (totalCycles < target)
+                    {
+                        serviceSpu2();
+                        if (!pendingDmaInterrupts.empty())
+                            servicePendingDmaInterrupts();
+                        if (!pendingGuestCallbacks.empty())
+                            servicePendingGuestCallbacks();
+                        if (!timrman.nothingDueAt(totalCycles))
+                            timrman.serviceDue(totalCycles, *this);
+                        IopThread *next = kernel.beginNextReady(totalCycles);
+                        if (!next)
+                        {
+                            if (profile && profile->started)
+                                ++profile->idleLoops;
+                            if (workDiagEnabled)
+                                ++workDiagIdleLoops;
+                            // with PS2X_IOP_PC_EVERY, report now and then that the IOP is idle.
+                            static unsigned long long idleCount = 0ULL;
+                            // getenv scans the whole environment; in this idle loop it took almost 40% of the game thread
+                            // (ucrtbase!strchr). It is read once.
+                            static const bool idleTrace = std::getenv("PS2X_IOP_PC_EVERY") != nullptr;
+                            if (idleTrace && (++idleCount % 200000ULL) == 1ULL)
+                            {
+                                std::ostringstream out;
+                                out << "[IOP:idle] no ready threads (count=" << idleCount << ") instr=" << totalInstructions;
+                                log(LogLevel::Info, out.str());
+                            }
+                            uint64_t nextWake = kernel.nextWakeCycle(target);
+                            if (workDiagEnabled)
+                            {
+                                enum class WakeSource : uint8_t
+                                {
+                                    Wake,
+                                    Target,
+                                    Dma,
+                                    Callback,
+                                    Timer,
+                                    Adma,
+                                };
+                                WakeSource source = nextWake < target ? WakeSource::Wake : WakeSource::Target;
+                                for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                                {
+                                    (void)irq;
+                                    if (completionCycle < nextWake)
+                                    {
+                                        nextWake = completionCycle;
+                                        source = WakeSource::Dma;
+                                    }
+                                }
+                                if (!pendingGuestCallbacks.empty() && pendingGuestCallbacks.begin()->first < nextWake)
+                                {
+                                    nextWake = pendingGuestCallbacks.begin()->first;
+                                    source = WakeSource::Callback;
+                                }
+                                const uint64_t timerWake = timrman.nextEventCycle(nextWake);
+                                if (timerWake < nextWake)
+                                {
+                                    nextWake = timerWake;
+                                    source = WakeSource::Timer;
+                                }
+                                // P3FES: while a core streams ADMA input, wake at least every 64 samples so its DMA
+                                // completions reach the driver before the input buffer runs dry (idle jumps otherwise
+                                // skip whole blocks and the stream drops samples).
+                                if (memory.spu2().admaActive(0u) || memory.spu2().admaActive(1u))
+                                {
+                                    const uint64_t admaWake = totalCycles + 64u * Spu2::CyclesPerSample;
+                                    if (admaWake < nextWake)
+                                    {
+                                        nextWake = admaWake;
+                                        source = WakeSource::Adma;
+                                    }
+                                }
+                                switch (source)
+                                {
+                                case WakeSource::Wake: ++workDiagWakeLimits; break;
+                                case WakeSource::Target: ++workDiagTargetLimits; break;
+                                case WakeSource::Dma: ++workDiagDmaLimits; break;
+                                case WakeSource::Callback: ++workDiagCallbackLimits; break;
+                                case WakeSource::Timer: ++workDiagTimerLimits; break;
+                                case WakeSource::Adma: ++workDiagAdmaLimits; break;
+                                }
+                            }
+                            else
+                            {
+                                for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                                    nextWake = std::min(nextWake, completionCycle);
+                                if (!pendingGuestCallbacks.empty())
+                                    nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                                nextWake = timrman.nextEventCycle(nextWake);
+                                // P3FES: while a core streams ADMA input, wake at least every 64 samples so its DMA
+                                // completions reach the driver before the input buffer runs dry (idle jumps otherwise
+                                // skip whole blocks and the stream drops samples).
+                                if (memory.spu2().admaActive(0u) || memory.spu2().admaActive(1u))
+                                    nextWake = std::min<uint64_t>(nextWake, totalCycles + 64u * Spu2::CyclesPerSample);
+                            }
+                            totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                            continue;
+                        }
+                        if (workDiagEnabled)
+                            ++workDiagReadyLoops;
+                        const uint64_t before = totalCycles;
+                        if (profile && profile->started)
+                            ++profile->readyLoops;
+                        runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                        kernel.endTimeslice(*next, kThreadReturnSentinel);
+                        if (totalCycles == before)
+                            ++totalCycles;
+                    }
+                    serviceSpu2(); // bring the SPU2 up to date after skipping idle cycles to the end
+                }
             }
             catch (...)
             {
                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
+            }
+            if (workDiagEnabled)
+            {
+                --workDiagRunDepth;
+                if (workDiagEntryGeneration == workDiagGeneration)
+                {
+                    if (workDiagRunCalls == 0u)
+                        workDiagMinRequestedCycles = cycles;
+                    else
+                        workDiagMinRequestedCycles = std::min(workDiagMinRequestedCycles, cycles);
+                    workDiagMaxRequestedCycles = std::max(workDiagMaxRequestedCycles, cycles);
+                    ++workDiagRunCalls;
+                    workDiagRequestedCycles += cycles;
+                    if (workDiagOutermost)
+                    {
+                        if (totalCycles >= workDiagEntryCycles)
+                            workDiagRunElapsedCycles += totalCycles - workDiagEntryCycles;
+                        if (totalInstructions >= workDiagEntryInstructions)
+                            workDiagInstructions += totalInstructions - workDiagEntryInstructions;
+                    }
+                }
+                if (workDiagRunDepth == 0u)
+                    emitWorkDiagWindow();
             }
         }
 
@@ -865,6 +1409,8 @@ namespace ps2x::iop::detail
 
             std::ostringstream out;
             out << "[IOP] loaded IRX id=" << result.moduleId
+                << " module=" << modules[result.moduleId].name
+                << " path='" << modules[result.moduleId].path << "'"
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
                 << " start=" << std::dec << result.startResult;
@@ -909,6 +1455,15 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        const std::string *moduleNameForPC(uint32_t pc) const noexcept
+        {
+            const uint32_t address = physicalAddress(pc);
+            for (const auto &[id, module] : modules)
+                if (address >= module.base && address - module.base < module.size)
+                    return &module.name;
+            return nullptr;
+        }
+
         IopHost &host;
         IopMemory memory;
         IopSysmem sysmem;
@@ -933,7 +1488,47 @@ namespace ps2x::iop::detail
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
+        uint64_t nextPcSampleInstruction = 0;
         uint64_t eeCycleCarry = 0;
+        const bool idleFastEnabled = []
+        {
+            const char *value = std::getenv("PS2X_IOP_IDLE_FAST");
+            return value == nullptr || value[0] != '0';
+        }();
+        // Optional counters are confined to the IOP worker; they use plain integers and no per-iteration clock reads.
+#if defined(PS2X_IOP_WORK_DIAGNOSTICS)
+        const bool workDiagEnabled = []
+        {
+            const char *value = std::getenv("PS2X_IOP_WORK_DIAG");
+            return value != nullptr && value[0] == '1' && value[1] == '\0';
+        }();
+#else
+        static constexpr bool workDiagEnabled = false;
+#endif
+        uint64_t workDiagGeneration = 0u;
+        uint32_t workDiagRunDepth = 0u;
+        uint64_t workDiagWindowStartCycles = 0u;
+        uint64_t workDiagRunCalls = 0u;
+        uint64_t workDiagRequestedCycles = 0u;
+        uint64_t workDiagMinRequestedCycles = 0u;
+        uint64_t workDiagMaxRequestedCycles = 0u;
+        uint64_t workDiagReadyLoops = 0u;
+        uint64_t workDiagIdleLoops = 0u;
+        uint64_t workDiagRunElapsedCycles = 0u;
+        uint64_t workDiagInstructions = 0u;
+        uint64_t workDiagSpu2CompletedSamples = 0u;
+        uint64_t workDiagSpu2Calls = 0u;
+        uint64_t workDiagSpu2Due0 = 0u;
+        uint64_t workDiagSpu2Due1 = 0u;
+        uint64_t workDiagSpu2Due2To64 = 0u;
+        uint64_t workDiagSpu2DueOver64 = 0u;
+        uint64_t workDiagWakeLimits = 0u;
+        uint64_t workDiagDmaLimits = 0u;
+        uint64_t workDiagCallbackLimits = 0u;
+        uint64_t workDiagTimerLimits = 0u;
+        uint64_t workDiagAdmaLimits = 0u;
+        uint64_t workDiagTargetLimits = 0u;
+        uint64_t workDiagFastIdle = 0u;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -971,9 +1566,48 @@ namespace ps2x::iop::detail
         return m_impl->stopModule(moduleId, result);
     }
 
+    namespace
+    {
+        // The EE charges its cycles in small steps (tens of thousands of
+        // times per second). Entering the IOP each time costs far more than
+        // the IOP work itself: on a PS Vita the entry/service machinery took
+        // half of the frame while the IOP ran ~260k instructions/s. EE cycles
+        // are accumulated and delivered in blocks; runCycles still steps
+        // internally from event to event, so only the EE/IOP interleaving
+        // coarsens. PS2X_IOP_BATCH_CYCLES is the block size in IOP cycles
+        // (36.864 MHz); 0 delivers every step as before.
+        uint64_t iopBatchEeCycles() noexcept
+        {
+            static const uint64_t value = []
+            {
+                const char *v = std::getenv("PS2X_IOP_BATCH_CYCLES");
+                // Off by default: on a PS Vita a 16384-cycle block hung the boot and a 2048 one starved the movie path.
+                const unsigned long long iopCycles = v ? std::strtoull(v, nullptr, 10) : 0ULL;
+                return static_cast<uint64_t>(iopCycles > 1000000ULL ? 1000000ULL : iopCycles) * 8u;
+            }();
+            return value;
+        }
+    }
+
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        if (total < iopBatchEeCycles())
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
+        const uint64_t iopCycles = total / 8u;
+        m_impl->eeCycleCarry = total % 8u;
+        if (iopCycles)
+            m_impl->runCycles(iopCycles);
+    }
+
+    // Brings the IOP clock up to the EE before an interaction that the IOP
+    // must see at the right time.
+    void IopEmulator::deliverPendingEeCycles() noexcept
+    {
+        const uint64_t total = m_impl->eeCycleCarry;
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
@@ -982,6 +1616,7 @@ namespace ps2x::iop::detail
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        deliverPendingEeCycles();
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -992,6 +1627,7 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        deliverPendingEeCycles();
         m_impl->rpc.onSifTransfer(transfer);
     }
 
@@ -1037,6 +1673,21 @@ namespace ps2x::iop::detail
     size_t IopEmulator::drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
     {
         return m_impl->memory.spu2().drainOutput(stereo, maxFrames, maxLatencyFrames);
+    }
+
+    void IopEmulator::pushPcmStream(uint32_t stream, uint32_t rate, const int16_t *stereo, size_t frames)
+    {
+        m_impl->memory.spu2().streamPush(stream, rate, stereo, frames);
+    }
+
+    uint64_t IopEmulator::pcmStreamConsumed(uint32_t stream) const
+    {
+        return m_impl->memory.spu2().streamConsumed(stream);
+    }
+
+    void IopEmulator::resetPcmStream(uint32_t stream)
+    {
+        m_impl->memory.spu2().streamReset(stream);
     }
 
     size_t IopEmulator::pendingAudioFrames() const

@@ -61,8 +61,20 @@ namespace ps2x::iop::detail
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
-        [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        // the cached "nothing is ready yet" answer is checked inline; everything else is beginNextReadySlow
+        [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle)
+        {
+            if (m_idleVersion == m_version && currentCycle < m_idleUntil)
+                return nullptr;
+            return beginNextReadySlow(currentCycle);
+        }
+        [[nodiscard]] IopThread *beginNextReadySlow(uint64_t currentCycle);
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
+        // True only while the cached no-ready result still covers the requested cycle range.
+        [[nodiscard]] bool cachedIdleCovers(uint64_t currentCycle, uint64_t target) const noexcept
+        {
+            return m_idleVersion == m_version && currentCycle < m_idleUntil && target <= m_idleUntil;
+        }
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
         void terminateThreadsInRange(uint32_t base, uint32_t size);
@@ -79,6 +91,8 @@ namespace ps2x::iop::detail
         {
             return m_currentThread ? m_currentThread->priority : 0u;
         }
+        // diagnostics (PS2X_IOP_PROFILE): the thread being run by runCycles, or nullptr
+        [[nodiscard]] const IopThread *currentThread() const noexcept { return m_currentThread; }
         // some thread with a better (lower) priority value than `priority` is ready to run
         [[nodiscard]] bool hasReadyThreadAbove(uint32_t priority) const noexcept
         {
@@ -126,6 +140,7 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        bool m_deadThreadPending = false;
         OutsideThreadWait m_outsideThreadWait;
         // The EE advances the IOP ~1.5 million times per second by a few cycles, almost always with no ready
         // thread. m_version changes with every operation that can change the threads; if it has not changed since

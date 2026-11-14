@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(ps2xIOP LANGUAGES CXX)
 
 option(PS2X_IOP_BUILD_TESTS "Build ps2xIOP emulator smoke tests" OFF)
+option(PS2X_IOP_WORK_DIAGNOSTICS "Enable opt-in IOP work diagnostic counters" OFF)
 
 add_library(ps2_iop STATIC
     src/ps2_path.cpp
@@ -27,12 +28,17 @@ add_library(ps2_iop STATIC
     src/emulator/imports/iop_sysmem.cpp
     src/emulator/imports/iop_timrman.cpp
     src/emulator/imports/iop_vblank.cpp
+    src/modules/cri_dtx.cpp
     src/modules/dbcman.cpp
     src/modules/libsd.cpp
     src/modules/mcserv.cpp
 )
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)
+
+if(PS2X_IOP_WORK_DIAGNOSTICS)
+    target_compile_definitions(ps2_iop PRIVATE PS2X_IOP_WORK_DIAGNOSTICS=1)
+endif()
 
 target_include_directories(ps2_iop
     PUBLIC
@@ -63,6 +69,57 @@ if(PS2X_IOP_BUILD_TESTS)
     target_link_libraries(ps2_iop_import_version_tests PRIVATE ps2_iop)
     target_include_directories(ps2_iop_import_version_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ps2_iop_import_version_tests COMMAND ps2_iop_import_version_tests)
+
+    add_executable(ps2_iop_spu2_clock_tests tests/spu2_clock_tests.cpp)
+    target_link_libraries(ps2_iop_spu2_clock_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_spu2_clock_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ps2_iop_spu2_clock_tests COMMAND ps2_iop_spu2_clock_tests)
+
+    # Equivalence of the optimised Spu2 against the frozen pre-optimisation copy in tests/reference.
+    # Run with --bench for a reference-vs-optimised samples/second report.
+    add_executable(ps2_iop_spu2_equivalence_tests
+        tests/spu2_equivalence_tests.cpp
+        tests/reference/spu2_reference.cpp
+    )
+    target_link_libraries(ps2_iop_spu2_equivalence_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_spu2_equivalence_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/reference
+    )
+    add_test(NAME ps2_iop_spu2_equivalence_tests COMMAND ps2_iop_spu2_equivalence_tests)
+
+    add_executable(ps2_iop_idle_fast_tests tests/idle_fast_tests.cpp)
+    target_link_libraries(ps2_iop_idle_fast_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_idle_fast_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    if(PS2X_IOP_WORK_DIAGNOSTICS)
+        target_compile_definitions(ps2_iop_idle_fast_tests PRIVATE PS2X_IOP_WORK_DIAGNOSTICS=1)
+    endif()
+    add_test(NAME ps2_iop_idle_fast_tests COMMAND ps2_iop_idle_fast_tests)
+
+    add_executable(ps2_iop_kernel_tests tests/iop_kernel_tests.cpp)
+    target_link_libraries(ps2_iop_kernel_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_kernel_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ps2_iop_kernel_tests COMMAND ps2_iop_kernel_tests)
+
+    add_executable(ps2_iop_fast_equivalence_tests tests/iop_fast_equivalence_tests.cpp)
+    target_link_libraries(ps2_iop_fast_equivalence_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_fast_equivalence_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ps2_iop_fast_equivalence_tests COMMAND ps2_iop_fast_equivalence_tests)
+
+    add_executable(ps2_iop_fast_integration_tests tests/iop_fast_integration_tests.cpp)
+    target_link_libraries(ps2_iop_fast_integration_tests PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_fast_integration_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME ps2_iop_fast_integration_tests COMMAND ps2_iop_fast_integration_tests)
+
+    add_executable(ps2_iop_real_driver_bench tests/iop_real_driver_bench.cpp)
+    target_link_libraries(ps2_iop_real_driver_bench PRIVATE ps2_iop)
+    # not a ctest: needs the game's LIB31 directory (ps2_iop_real_driver_bench <dir> [seconds] [warm-up] [chunk])
 
 endif()
 
