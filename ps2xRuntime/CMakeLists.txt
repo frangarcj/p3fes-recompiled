@@ -175,10 +175,12 @@ if(PS2X_IS_VITA AND PS2X_VITA_SDL2_SHIM)
         SceShaccCg_stub
         taihen_stub
         SceDisplay_stub
+        SceAvPlayer_stub
         SceCtrl_stub
         SceTouch_stub
         SceGxm_stub
         SceAudio_stub
+        SceAVConfig_stub
         SceAudioIn_stub
         SceSysmodule_stub
         SceHid_stub
@@ -215,6 +217,7 @@ elseif(PS2X_IS_VITA)
         SceCommonDialog_stub
         SceLibKernel_stub
         SceAudio_stub
+        SceAVConfig_stub
         SceTouch_stub
         SceHid_stub
         SceMotion_stub
@@ -450,10 +453,26 @@ else()
     set(PS2X_RUNTIME_LIBRARY_TYPE STATIC)
 endif()
 
+option(PS2X_P3FES_FRAME_TRACE "Enable bounded single-frame graphics diagnostics" OFF)
+
 add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
     src/lib/game_overrides.cpp
     src/lib/game_overrides/p3fes_renderware.cpp
     src/lib/game_overrides/p3fes_native_present.cpp
+    src/lib/game_overrides/p3fes_native_movie.cpp
+    src/lib/game_overrides/p3fes_native_raster_lifecycle.cpp
+    src/lib/game_overrides/p3fes_native_texture_access.cpp
+    src/lib/game_overrides/p3fes_native_camera.cpp
+    src/lib/game_overrides/p3fes_native_bgm.cpp
+    src/lib/game_overrides/p3fes_adx_stream.cpp
+    src/lib/game_overrides/p3fes_native_bgm_hooks.cpp
+    src/lib/game_overrides/p3fes_native_math.cpp
+    src/lib/game_overrides/p3fes_native_rw_math.cpp
+    src/lib/game_overrides/p3fes_native_hanim.cpp
+    src/lib/game_overrides/p3fes_native_frame_cuts.cpp
+    src/lib/game_overrides/p3fes_native_dialogue.cpp
+    src/lib/game_overrides/p3fes_native_ymisc.cpp
+    src/lib/game_overrides/p3fes_debug_warp.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
@@ -475,10 +494,12 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
     src/lib/gs/gpu/gs_gpu_shaders.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
+    src/lib/ps2_slow_mem.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/guest_heap.cpp # guest malloc/free allocator (O(log n)), see tests/guest_heap_test.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/ps2_host_vu1.cpp # VU1 on PCSX2's microVU (third_party/kzvu)
     src/lib/audio/stretch.cpp # sound time-stretching (from ps2-native-recomp, MIT)
@@ -531,6 +552,16 @@ target_compile_definitions(ps2_runtime PRIVATE
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
+
+if(PS2X_P3FES_FRAME_TRACE)
+    target_sources(ps2_runtime PRIVATE src/lib/game_overrides/p3fes_frame_trace.cpp)
+    set_property(SOURCE
+        src/lib/ps2_runtime.cpp
+        src/lib/Kernel/EeScheduler.cpp
+        src/lib/game_overrides/p3fes_renderware.cpp
+        src/lib/game_overrides/p3fes_native_present.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS PS2X_P3FES_FRAME_TRACE=1)
+endif()
 
 target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
@@ -616,6 +647,14 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# Profile-guided placement of the recompiled code (p3fes/scripts/perf/make_hot_header.py): the header re-declares the
+# functions a profile saw with __attribute__((hot)), so they land together in .text.hot.
+set(PS2X_HOT_FUNCTIONS_H "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_hot_functions.h")
+option(PS2X_VITA_HOT_FUNCTIONS "Group profiled recompiled functions in .text.hot on the Vita" ON)
+if(PS2X_IS_VITA AND PS2X_VITA_HOT_FUNCTIONS AND EXISTS "${PS2X_HOT_FUNCTIONS_H}")
+    target_compile_options(ps2EntryRunner PRIVATE "SHELL:-include ${PS2X_HOT_FUNCTIONS_H}")
+endif()
+
 if(PS2X_IS_VITA AND EXISTS "${PS2X_REGISTER_FUNCTIONS_CPP}")
     # This file only fills the generated function-pointer lookup table during
     # startup; it is not a runtime hot path. GCC ARM spends an excessive amount
@@ -662,6 +701,38 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+# Optional Vita diagnostic: PMU counters of the game thread through libperf
+# (platform/vita/vita_pmu.cpp, enabled at run time with PS2X_VITA_PMU=1).
+# OFF adds no source, definition, include path or link library.
+option(PS2X_VITA_LIBPERF "Vita: link libperf's weak ScePerf stubs and report game-thread PMU counters" OFF)
+set(PS2X_VITA_LIBPERF_SOURCE_DIR "/Users/frangar/Fun/libperf" CACHE PATH "libperf source tree (include/libperf.h)")
+set(PS2X_VITA_LIBPERF_BUILD_DIR "/Users/frangar/Fun/libperf/build" CACHE PATH "libperf build tree (user/user_stubs/libScePerf_stub_weak.a)")
+if(PS2X_VITA_LIBPERF)
+    if(NOT PS2X_IS_VITA)
+        message(FATAL_ERROR "PS2X_VITA_LIBPERF is only available for the Vita build")
+    endif()
+    set(PS2X_VITA_LIBPERF_STUB "${PS2X_VITA_LIBPERF_BUILD_DIR}/user/user_stubs/libScePerf_stub_weak.a")
+    if(NOT EXISTS "${PS2X_VITA_LIBPERF_SOURCE_DIR}/include/libperf.h" OR NOT EXISTS "${PS2X_VITA_LIBPERF_STUB}")
+        message(FATAL_ERROR "PS2X_VITA_LIBPERF: need ${PS2X_VITA_LIBPERF_SOURCE_DIR}/include/libperf.h and ${PS2X_VITA_LIBPERF_STUB} "
+                            "(set PS2X_VITA_LIBPERF_SOURCE_DIR / PS2X_VITA_LIBPERF_BUILD_DIR)")
+    endif()
+    foreach(PS2X_LIBPERF_MODULE IN ITEMS libperf.skprx user/libperf.suprx)
+        if(NOT EXISTS "${PS2X_VITA_LIBPERF_BUILD_DIR}/${PS2X_LIBPERF_MODULE}")
+            message(WARNING "PS2X_VITA_LIBPERF: ${PS2X_VITA_LIBPERF_BUILD_DIR}/${PS2X_LIBPERF_MODULE} not found "
+                            "(copy it to ux0:data/p3fes/ on the console)")
+        endif()
+    endforeach()
+    target_sources(ps2_runtime PRIVATE platform/vita/vita_pmu.cpp)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_VITA_LIBPERF=1)
+    target_include_directories(ps2_runtime PRIVATE "${PS2X_VITA_LIBPERF_SOURCE_DIR}/include")
+    # Weak imports: the app starts without libperf.suprx; vita_pmu.cpp loads it.
+    target_link_libraries(ps2_runtime PUBLIC "${PS2X_VITA_LIBPERF_STUB}" taihen_stub)
+    if(TARGET ps2x_vita_raylib)
+        target_compile_definitions(ps2x_vita_raylib PRIVATE PS2X_VITA_LIBPERF=1)
+    endif()
+    message(STATUS "Vita: libperf PMU diagnostic ON (${PS2X_VITA_LIBPERF_BUILD_DIR})")
+endif()
 if(NOT PS2X_IS_VITA)
     target_link_libraries(ps2_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
@@ -827,6 +898,14 @@ endif()
 # Vita: Work around for GCC 10's LTO plugin
 if(PS2X_IS_VITA)
     target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+    # The executable is far larger than a Thumb branch can span, so the linker
+    # inserts long-branch veneers. Its default veneers hold absolute addresses
+    # that get no relocation entry; the console loads the module at a different
+    # base than the link address and the first veneer call (memset from _start)
+    # jumps into unrelated code. Position-independent veneers need no relocation.
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--pic-veneer")
+    # Keep room after the text for vita-elf-create's SCE data (see link_pad.ld).
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/link_pad.ld")
     if(PS2X_VITA_SDL2_SHIM)
         # Vita3K currently loses GXM/vitaGL entry points when they are placed at
         # the far end of this very large recompiled executable. Pull the whole

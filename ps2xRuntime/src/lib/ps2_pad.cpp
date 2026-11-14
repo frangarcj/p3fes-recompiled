@@ -132,8 +132,15 @@ namespace
         static const float value = []()
         {
             const char *env = std::getenv("PS2X_PAD_DEADZONE");
-            const float v = env ? static_cast<float>(std::atof(env)) : 0.15f;
-            return (v >= 0.0f && v < 0.9f) ? v : 0.15f;
+            // The Vita's sticks do not return to an exact centre after being moved (they can rest a
+            // good 20 % off), which kept the camera turning and the character drifting with 0.15.
+#if defined(PLATFORM_VITA)
+            constexpr float kDefault = 0.28f;
+#else
+            constexpr float kDefault = 0.15f;
+#endif
+            const float v = env ? static_cast<float>(std::atof(env)) : kDefault;
+            return (v >= 0.0f && v < 0.9f) ? v : kDefault;
         }();
         return value;
     }

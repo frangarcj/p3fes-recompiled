@@ -32,6 +32,135 @@ using namespace GSInternal;
 
 namespace
 {
+    struct GsUploadDiagTuple
+    {
+        uint32_t dbp = 0u;
+        uint8_t dbw = 0u;
+        uint8_t psm = 0u;
+        uint16_t rrw = 0u;
+        uint16_t rrh = 0u;
+        uint16_t ssax = 0u;
+        uint16_t ssay = 0u;
+        uint16_t dsax = 0u;
+        uint16_t dsay = 0u;
+        uint8_t dir = 0u;
+        uint64_t windowCalls = 0u;
+        uint64_t windowBytes = 0u;
+    };
+
+    bool gsUploadDiagEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("P3FES_GS_UPLOAD_DIAG");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        return enabled;
+    }
+
+    void logGsUploadDiag(const GSTransferCommand &command,
+                         const GSTransferSnapshot &cursor,
+                         uint32_t sizeBytes)
+    {
+        if (!gsUploadDiagEnabled())
+            return;
+
+        static std::mutex mutex;
+        static std::array<GsUploadDiagTuple, 32> tuples{};
+        static size_t tupleCount = 0u;
+        static uint64_t windowCalls = 0u;
+        static uint64_t windowBytes = 0u;
+        static uint64_t overflowCalls = 0u;
+        static uint64_t overflowBytes = 0u;
+        static uint64_t totalCalls = 0u;
+        static uint64_t totalBytes = 0u;
+        static auto windowStart = std::chrono::steady_clock::now();
+
+        std::lock_guard<std::mutex> lock(mutex);
+        ++windowCalls;
+        windowBytes += sizeBytes;
+        ++totalCalls;
+        totalBytes += sizeBytes;
+
+        const auto &buf = command.bitbltbuf;
+        const auto &pos = command.trxpos;
+        const auto &reg = command.trxreg;
+        size_t index = 0u;
+        for (; index < tupleCount; ++index)
+        {
+            const auto &tuple = tuples[index];
+            if (tuple.dbp == buf.dbp && tuple.dbw == buf.dbw && tuple.psm == buf.dpsm &&
+                tuple.rrw == reg.rrw && tuple.rrh == reg.rrh && tuple.ssax == pos.ssax &&
+                tuple.ssay == pos.ssay && tuple.dsax == pos.dsax && tuple.dsay == pos.dsay &&
+                tuple.dir == pos.dir)
+                break;
+        }
+        if (index < tuples.size())
+        {
+            if (index == tupleCount)
+            {
+                ++tupleCount;
+                auto &tuple = tuples[index];
+                tuple.dbp = buf.dbp;
+                tuple.dbw = buf.dbw;
+                tuple.psm = buf.dpsm;
+                tuple.rrw = reg.rrw;
+                tuple.rrh = reg.rrh;
+                tuple.ssax = pos.ssax;
+                tuple.ssay = pos.ssay;
+                tuple.dsax = pos.dsax;
+                tuple.dsay = pos.dsay;
+                tuple.dir = pos.dir;
+                std::fprintf(stderr,
+                             "[gs-upload] tuple=%u DBP=%u DBW=%u PSM=%u TRXREG=%ux%u "
+                             "TRXPOS=src(%u,%u) dst(%u,%u) dir=%u cursor=(%u,%u) copied=%u/%u transferDir=%u\n",
+                             static_cast<unsigned>(index), buf.dbp, buf.dbw, buf.dpsm, reg.rrw, reg.rrh,
+                             pos.ssax, pos.ssay, pos.dsax, pos.dsay, pos.dir,
+                             cursor.x, cursor.y, cursor.copiedPixels, cursor.totalPixels, cursor.direction);
+            }
+            tuples[index].windowCalls++;
+            tuples[index].windowBytes += sizeBytes;
+        }
+        else
+        {
+            ++overflowCalls;
+            overflowBytes += sizeBytes;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - windowStart >= std::chrono::seconds(5))
+        {
+            const double seconds = std::chrono::duration<double>(now - windowStart).count();
+            std::fprintf(stderr,
+                         "[gs-upload] window=%.2fs calls=%llu bytes=%llu overflowCalls=%llu overflowBytes=%llu "
+                         "totalCalls=%llu totalBytes=%llu tuples=%u\n",
+                         seconds, static_cast<unsigned long long>(windowCalls),
+                         static_cast<unsigned long long>(windowBytes),
+                         static_cast<unsigned long long>(overflowCalls),
+                         static_cast<unsigned long long>(overflowBytes),
+                         static_cast<unsigned long long>(totalCalls),
+                         static_cast<unsigned long long>(totalBytes), static_cast<unsigned>(tupleCount));
+            for (size_t i = 0u; i < tupleCount; ++i)
+            {
+                auto &tuple = tuples[i];
+                if (tuple.windowCalls)
+                    std::fprintf(stderr, "[gs-upload] window-tuple=%u calls=%llu bytes=%llu\n",
+                                 static_cast<unsigned>(i),
+                                 static_cast<unsigned long long>(tuple.windowCalls),
+                                 static_cast<unsigned long long>(tuple.windowBytes));
+                tuple.windowCalls = 0u;
+                tuple.windowBytes = 0u;
+            }
+            windowCalls = 0u;
+            windowBytes = 0u;
+            overflowCalls = 0u;
+            overflowBytes = 0u;
+            tuples = {};
+            tupleCount = 0u;
+            windowStart = now;
+        }
+    }
+
     void hwShadowPageRange(uint32_t baseBlocks, uint32_t bufferWidthPixels,
                            uint32_t y0, uint32_t y1, uint32_t psm,
                            uint64_t &begin, uint64_t &end)
@@ -2112,6 +2241,8 @@ void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
         return;
 
+    logGsUploadDiag(m_transfer, m_transferState, sizeBytes);
+
     const uint32_t dbp = m_transfer.bitbltbuf.dbp;
     const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
     const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
@@ -2132,8 +2263,14 @@ void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
             return;
         }
 
-        m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
-        m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
+        // Uploads advance by at most two pixels. Recomputing the cursor with
+        // division/modulo for every pixel is expensive on Vita's ARMv7 CPU.
+        m_transferState.x += count;
+        while (m_transferState.x - dsax >= rrw)
+        {
+            m_transferState.x -= rrw;
+            ++m_transferState.y;
+        }
     };
 
     while (offset < sizeBytes && m_transferState.direction == 0u)
@@ -2191,15 +2328,19 @@ void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
             const uint8_t packed = data[offset++];
             const uint32_t firstPixel = m_transferState.copiedPixels;
             WriteVramUnlocked(dpsm, dbp, dbw,
-                              dsax + (firstPixel % rrw),
-                              m_transfer.trxpos.dsay + (firstPixel / rrw),
+                              m_transferState.x, m_transferState.y,
                               packed & 0x0Fu);
             if (firstPixel + 1u < m_transferState.totalPixels)
             {
-                const uint32_t secondPixel = firstPixel + 1u;
+                uint32_t secondX = m_transferState.x + 1u;
+                uint32_t secondY = m_transferState.y;
+                if (secondX - dsax >= rrw)
+                {
+                    secondX = dsax;
+                    ++secondY;
+                }
                 WriteVramUnlocked(dpsm, dbp, dbw,
-                                  dsax + (secondPixel % rrw),
-                                  m_transfer.trxpos.dsay + (secondPixel / rrw),
+                                  secondX, secondY,
                                   (packed >> 4u) & 0x0Fu);
             }
             advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));

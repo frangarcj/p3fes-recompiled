@@ -202,6 +202,27 @@ namespace
         return distance == 0u ? 0x10000ull : static_cast<uint64_t>(distance);
     }
 
+    [[gnu::noinline]] void advanceEeTimerGeneric(uint64_t eeCycles,
+                                                 uint64_t clockHz,
+                                                 uint64_t clockRemainder,
+                                                 uint64_t &ticks,
+                                                 uint64_t &newRemainder) noexcept
+    {
+        // Keep the wide fallback out of advanceEeTimers' fast path. If this is
+        // inlined, ARM can hoist its 64-bit division ahead of the bounded case.
+        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+        const uint64_t remainingCycles = eeCycles % kEeClockHz;
+        const uint64_t scaled = remainingCycles * clockHz + clockRemainder;
+        ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+        newRemainder = scaled % kEeClockHz;
+    }
+
+    [[gnu::noinline]] uint32_t eeTimerRemainder64(uint64_t value, uint32_t divisor) noexcept
+    {
+        // Only used when a timer's tick count does not fit in uint32_t.
+        return static_cast<uint32_t>(value % divisor);
+    }
+
     struct DmaTagView
     {
         uint16_t qwc = 0;
@@ -598,8 +619,10 @@ bool PS2Memory::initialize(size_t ramSize)
     try
     {
         // Allocate main RAM
-        m_rdram = new uint8_t[ramSize];
-        std::memset(m_rdram, 0, ramSize);
+        // Padded: the inline fast path reads up to 16 bytes from the last
+        // RAM address without a wrap check.
+        m_rdram = new uint8_t[ramSize + 16u];
+        std::memset(m_rdram, 0, ramSize + 16u);
 
         // Allocate scratchpad
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
@@ -733,7 +756,17 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 
         const uint32_t clockSource = timer.mode & kEeTimerModeClksMask;
         uint64_t ticks = 0u;
-        if (clockSource < 3u && eeCycles < kEeClockHz)
+        if (clockSource == 3u && eeCycles < kEeClockHz && timer.clockRemainder < kEeClockHz)
+        {
+            // H-sync is 15734 / 294912000. Here the exact numerator fits in 43 bits,
+            // and 294912000 == 4500 * 2^16. Therefore floor(scaled / 294912000)
+            // equals floor((scaled >> 16) / 4500); the narrowed constant 32-bit
+            // division avoids the generic 64-bit division helper without approximation.
+            const uint64_t scaled = eeCycles * kEeTimerClockHz[3] + timer.clockRemainder;
+            ticks = static_cast<uint32_t>(scaled >> 16u) / 4500u;
+            timer.clockRemainder = scaled - ticks * kEeClockHz;
+        }
+        else if (clockSource < 3u && eeCycles < kEeClockHz && timer.clockRemainder < kEeClockHz)
         {
             // BUSCLK/2, /32 and /512 divide the EE clock exactly (clock = Hz / d). With R = q * clock + r (r < clock),
             // floor((cycles * clock + R) / Hz) = (cycles + q) / d and the new remainder is ((cycles + q) % d) * clock + r:
@@ -741,12 +774,13 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             const auto step = [&](auto shiftTag)
             {
                 constexpr uint32_t shift = decltype(shiftTag)::value;
-                constexpr uint64_t clockHz = kEeClockHz >> shift; // constant: the division is a multiplication
-                const uint64_t q = timer.clockRemainder / clockHz;
-                const uint64_t r = timer.clockRemainder - q * clockHz;
-                const uint64_t units = eeCycles + q;
+                constexpr uint32_t clockHz = static_cast<uint32_t>(kEeClockHz >> shift);
+                const uint32_t remainder = static_cast<uint32_t>(timer.clockRemainder);
+                const uint32_t q = remainder / clockHz;
+                const uint32_t r = remainder - q * clockHz;
+                const uint32_t units = static_cast<uint32_t>(eeCycles) + q;
                 ticks = units >> shift;
-                timer.clockRemainder = (units & ((1ull << shift) - 1u)) * clockHz + r;
+                timer.clockRemainder = static_cast<uint64_t>(units & ((1u << shift) - 1u)) * clockHz + r;
             };
             if (clockSource == 0u)
                 step(std::integral_constant<uint32_t, 1u>{});
@@ -758,11 +792,9 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         else
         {
             const uint64_t clockHz = kEeTimerClockHz[clockSource];
-            const uint64_t wholeSeconds = eeCycles / kEeClockHz;
-            const uint64_t remainingCycles = eeCycles % kEeClockHz;
-            const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
-            ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
-            timer.clockRemainder = scaled % kEeClockHz;
+            uint64_t newRemainder = 0u;
+            advanceEeTimerGeneric(eeCycles, clockHz, timer.clockRemainder, ticks, newRemainder);
+            timer.clockRemainder = newRemainder;
         }
         if (ticks == 0u)
         {
@@ -785,7 +817,9 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
                 const uint64_t remaining = ticks - compareDistance;
                 timer.count = compare == 0u
                                   ? static_cast<uint32_t>(remaining & 0xFFFFu)
-                                  : static_cast<uint32_t>(remaining % compare);
+                                  : (remaining <= std::numeric_limits<uint32_t>::max()
+                                         ? static_cast<uint32_t>(remaining) % compare
+                                         : eeTimerRemainder64(remaining, compare));
             }
             else
             {
@@ -846,9 +880,55 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
             continue;
         }
 
-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
-        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
-        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+        const uint32_t clockSource = timer.mode & kEeTimerModeClksMask;
+        uint64_t cycles = 0u;
+        if (timer.clockRemainder < kEeClockHz)
+        {
+            const uint32_t remainder = static_cast<uint32_t>(timer.clockRemainder);
+            switch (clockSource)
+            {
+            case 0u:
+                // clockHz = kEeClockHz / 2. Since remainder < kEeClockHz,
+                // ceil((ticks * kEeClockHz - remainder) / clockHz)
+                // is exactly ticks * 2 - floor(remainder / clockHz).
+                cycles = eventTicks * 2u - (remainder >= 147456000u ? 1u : 0u);
+                break;
+            case 1u:
+            {
+                constexpr uint32_t kClockHz = 9216000u;
+                cycles = eventTicks * 32u - remainder / kClockHz;
+                break;
+            }
+            case 2u:
+            {
+                constexpr uint32_t kClockHz = 576000u;
+                cycles = eventTicks * 512u - remainder / kClockHz;
+                break;
+            }
+            case 3u:
+            {
+                // Split the exact ceiling by the constant H-sync frequency.
+                // eventTicks <= 65536 and the signed correction fits in int32.
+                constexpr int32_t kClockHz = 15734;
+                constexpr uint32_t kBaseQuotient = static_cast<uint32_t>(kEeClockHz) / kClockHz;
+                constexpr uint32_t kBaseRemainder = static_cast<uint32_t>(kEeClockHz) % kClockHz;
+                const int32_t correctionNumerator =
+                    static_cast<int32_t>(eventTicks * kBaseRemainder) - static_cast<int32_t>(remainder);
+                int32_t correction = correctionNumerator / kClockHz;
+                if (correctionNumerator > 0 && correctionNumerator % kClockHz != 0)
+                    ++correction;
+                const int64_t hsyncCycles = static_cast<int64_t>(eventTicks * kBaseQuotient) + correction;
+                cycles = static_cast<uint64_t>(hsyncCycles);
+                break;
+            }
+            }
+        }
+        else
+        {
+            const uint64_t clockHz = kEeTimerClockHz[clockSource];
+            const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+            cycles = (numerator + clockHz - 1u) / clockHz;
+        }
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
     }
     return nearest;

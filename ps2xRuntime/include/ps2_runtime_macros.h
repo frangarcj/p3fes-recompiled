@@ -14,6 +14,17 @@
 #endif
 
 #include "ps2_runtime.h"
+
+// Target-shaped access paths are the default. PS2X_LEGACY_ACCESS restores the
+// original vector-register and fully-checked memory macros for comparison.
+#if !defined(PS2X_LEGACY_ACCESS)
+#if !defined(PS2X_SCALAR_GPR)
+#define PS2X_SCALAR_GPR 1
+#endif
+#if !defined(PS2X_FAST_MEM)
+#define PS2X_FAST_MEM 1
+#endif
+#endif
 // VU0 VF0 is a constant register. Evaluate the destination once and skip the
 // value expression for VF0 so generated instruction side effects stay intact.
 #define PS2_VU0_VF_WRITE(ctx, reg, value) \
@@ -770,6 +781,170 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 #define FAST_WRITE64(addr, val) Ps2FastWrite64(rdram, (uint32_t)(addr), (uint64_t)(val))
 #define FAST_WRITE128(addr, val) Ps2FastWrite128(rdram, (uint32_t)(addr), (val))
 
+// Register locals (generated code only, see ps2xRecomp register_locals.cpp):
+// the low 64 bits of each guest register live in a local variable of the
+// generated function. PS2_ST/PS2_LD move one register to or from the context.
+#define PS2_REG_LOCALS                                                   \
+    uint64_t ps2_r1, ps2_r2, ps2_r3, ps2_r4, ps2_r5, ps2_r6, ps2_r7, ps2_r8, ps2_r9, ps2_r10, ps2_r11, ps2_r12, ps2_r13, ps2_r14, ps2_r15, ps2_r16, ps2_r17, ps2_r18, ps2_r19, ps2_r20, ps2_r21, ps2_r22, ps2_r23, ps2_r24, ps2_r25, ps2_r26, ps2_r27, ps2_r28, ps2_r29, ps2_r30, ps2_r31; \
+    const uint64_t ps2_r0 = 0u;                                          \
+    (void)ps2_r0; (void)ps2_r1; (void)ps2_r2; (void)ps2_r3; (void)ps2_r4; (void)ps2_r5; (void)ps2_r6; (void)ps2_r7; (void)ps2_r8; (void)ps2_r9; (void)ps2_r10; (void)ps2_r11; (void)ps2_r12; (void)ps2_r13; (void)ps2_r14; (void)ps2_r15; (void)ps2_r16; (void)ps2_r17; (void)ps2_r18; (void)ps2_r19; (void)ps2_r20; (void)ps2_r21; (void)ps2_r22; (void)ps2_r23; (void)ps2_r24; (void)ps2_r25; (void)ps2_r26; (void)ps2_r27; (void)ps2_r28; (void)ps2_r29; (void)ps2_r30; (void)ps2_r31;
+#define PS2R_U32(n) (static_cast<uint32_t>(ps2_r##n))
+#define PS2R_S32(n) (static_cast<int32_t>(ps2_r##n))
+#define PS2R_U64(n) (static_cast<uint64_t>(ps2_r##n))
+#define PS2R_S64(n) (static_cast<int64_t>(ps2_r##n))
+#define PS2_WR_0(v) ((void)(v))
+#define PS2_WR_1(v) (ps2_r1 = (v))
+#define PS2_WR_2(v) (ps2_r2 = (v))
+#define PS2_WR_3(v) (ps2_r3 = (v))
+#define PS2_WR_4(v) (ps2_r4 = (v))
+#define PS2_WR_5(v) (ps2_r5 = (v))
+#define PS2_WR_6(v) (ps2_r6 = (v))
+#define PS2_WR_7(v) (ps2_r7 = (v))
+#define PS2_WR_8(v) (ps2_r8 = (v))
+#define PS2_WR_9(v) (ps2_r9 = (v))
+#define PS2_WR_10(v) (ps2_r10 = (v))
+#define PS2_WR_11(v) (ps2_r11 = (v))
+#define PS2_WR_12(v) (ps2_r12 = (v))
+#define PS2_WR_13(v) (ps2_r13 = (v))
+#define PS2_WR_14(v) (ps2_r14 = (v))
+#define PS2_WR_15(v) (ps2_r15 = (v))
+#define PS2_WR_16(v) (ps2_r16 = (v))
+#define PS2_WR_17(v) (ps2_r17 = (v))
+#define PS2_WR_18(v) (ps2_r18 = (v))
+#define PS2_WR_19(v) (ps2_r19 = (v))
+#define PS2_WR_20(v) (ps2_r20 = (v))
+#define PS2_WR_21(v) (ps2_r21 = (v))
+#define PS2_WR_22(v) (ps2_r22 = (v))
+#define PS2_WR_23(v) (ps2_r23 = (v))
+#define PS2_WR_24(v) (ps2_r24 = (v))
+#define PS2_WR_25(v) (ps2_r25 = (v))
+#define PS2_WR_26(v) (ps2_r26 = (v))
+#define PS2_WR_27(v) (ps2_r27 = (v))
+#define PS2_WR_28(v) (ps2_r28 = (v))
+#define PS2_WR_29(v) (ps2_r29 = (v))
+#define PS2_WR_30(v) (ps2_r30 = (v))
+#define PS2_WR_31(v) (ps2_r31 = (v))
+#define PS2W_S32(n, v) PS2_WR_##n(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v))))
+#define PS2W_ZE32(n, v) PS2_WR_##n(static_cast<uint64_t>(static_cast<uint32_t>(v)))
+#define PS2W_U64(n, v) PS2_WR_##n(static_cast<uint64_t>(v))
+typedef uint64_t __attribute__((may_alias)) ps2_reg_u64;
+#define PS2_ST(n) (*reinterpret_cast<ps2_reg_u64 *>(&ctx->r[n]) = ps2_r##n)
+#define PS2_LD(n) (ps2_r##n = *reinterpret_cast<const ps2_reg_u64 *>(&ctx->r[n]))
+
+// Profiling builds (PS2X_EE_SAMPLE_BUILD) publish the callee of every direct
+// call for the in-process sampler (PS2X_EE_SAMPLE=1); normal builds pay nothing.
+#if defined(PS2X_EE_SAMPLE_BUILD)
+#include <atomic>
+extern std::atomic<uint32_t> g_ps2EeSampleCurrent;
+#define PS2_SAMPLE_ENTER(target)                                                                     \
+    const uint32_t ps2_sample_previous = g_ps2EeSampleCurrent.load(std::memory_order_relaxed);      \
+    g_ps2EeSampleCurrent.store((target), std::memory_order_relaxed)
+#define PS2_SAMPLE_LEAVE() g_ps2EeSampleCurrent.store(ps2_sample_previous, std::memory_order_relaxed)
+#else
+#define PS2_SAMPLE_ENTER(target) ((void)0)
+#define PS2_SAMPLE_LEAVE() ((void)0)
+#endif
+
+// Direct call to a generated function. The fast path needs the function table
+// to still hold the generated symbol (no runtime override or stub) and no
+// scheduler visit to be due; everything else goes through the dispatcher.
+// A callee that does not come back at the return address (yield, stop, guest
+// non-local transfer) unwinds this frame exactly as the dispatcher path does.
+#define PS2_CALL_DIRECT(SYM, target, source, ret)                                                         \
+    do                                                                                                    \
+    {                                                                                                     \
+        if (__builtin_expect(g_ps2RecompiledFunctionTable[((target) - g_ps2RecompiledFunctionTableBase) >> 2] == &SYM && \
+                                 runtime->eeTryChargeCall(8u), 1))                                         \
+        {                                                                                                 \
+            PS2_SAMPLE_ENTER(target);                                                                     \
+            SYM(rdram, ctx, runtime);                                                                     \
+            PS2_SAMPLE_LEAVE();                                                                           \
+            if (ctx->pc != (ret))                                                                         \
+                return;                                                                                   \
+        }                                                                                                 \
+        else if (!runtime->dispatchGuestBranch(rdram, ctx, (target), (source), (ret),                     \
+                                               PS2Runtime::GuestBranchKind::DirectCall, "JAL"))           \
+        {                                                                                                 \
+            return;                                                                                       \
+        }                                                                                                 \
+    } while (0)
+
+// The generated code keeps the guest PC in a function-local constant
+// (ps2_cur_pc) and only stores it to the context on paths that can observe it.
+// Outside generated functions the name resolves to this empty tag instead.
+struct Ps2NoLocalPc {};
+inline constexpr Ps2NoLocalPc ps2_cur_pc{};
+static inline void ps2SyncPc(R5900Context *, Ps2NoLocalPc) {}
+static inline void ps2SyncPc(R5900Context *ctx, uint32_t pc) { ctx->pc = pc; }
+#define PS2_SYNC_PC() ps2SyncPc(ctx, ps2_cur_pc)
+
+#if defined(PS2X_FAST_MEM)
+// One test selects main RAM through its four address windows (KUSEG, the
+// uncached mirror, KSEG0, KSEG1). Everything else (scratchpad, I/O, GS, VU,
+// BIOS, KSEG2/3, unmapped mirrors) takes the complete original path, out of line.
+// The RAM block is padded so an access at the very end needs no wrap check.
+static inline constexpr uint32_t PS2_FAST_RAM_TEST = 0x5E000000u;
+#define PS2_IS_PLAIN_RAM(a) ((((uint32_t)(a)) & PS2_FAST_RAM_TEST) == 0u)
+
+template <typename T>
+static inline T Ps2RamLoad(const uint8_t *rdram, uint32_t addr)
+{
+    T value;
+    std::memcpy(&value, rdram + (addr & PS2_RAM_MASK), sizeof(T));
+    return value;
+}
+
+template <typename T>
+static inline void Ps2RamStore(uint8_t *rdram, uint32_t addr, T value)
+{
+    std::memcpy(rdram + (addr & PS2_RAM_MASK), &value, sizeof(T));
+}
+
+uint8_t ps2SlowLoad8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr);
+uint16_t ps2SlowLoad16(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr);
+uint32_t ps2SlowLoad32(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr);
+uint64_t ps2SlowLoad64(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr);
+__m128i ps2SlowLoad128(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr);
+void ps2SlowStore8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint8_t value);
+void ps2SlowStore16(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint16_t value);
+void ps2SlowStore32(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint32_t value);
+void ps2SlowStore64(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, uint64_t value);
+void ps2SlowStore128(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr, __m128i value);
+
+#define PS2_FAST_READ(T, SLOW, addr) ([&]() -> T {                    \
+    const uint32_t _addr = (uint32_t)(addr);                          \
+    if (__builtin_expect(PS2_IS_PLAIN_RAM(_addr), 1))                 \
+        return Ps2RamLoad<T>(rdram, _addr);                           \
+    PS2_SYNC_PC();                                                    \
+    return SLOW(rdram, ctx, runtime, _addr); }())
+
+#define READ8(addr) PS2_FAST_READ(uint8_t, ps2SlowLoad8, addr)
+#define READ16(addr) PS2_FAST_READ(uint16_t, ps2SlowLoad16, addr)
+#define READ32(addr) PS2_FAST_READ(uint32_t, ps2SlowLoad32, addr)
+#define READ64(addr) PS2_FAST_READ(uint64_t, ps2SlowLoad64, addr)
+#define READ128(addr) PS2_FAST_READ(__m128i, ps2SlowLoad128, ((uint32_t)(addr) & ~0xFu))
+
+#define PS2_FAST_WRITE(T, SLOW, addr, val)                            \
+    do                                                                \
+    {                                                                 \
+        const uint32_t _addr = (uint32_t)(addr);                      \
+        const T _val = (T)(val);                                      \
+        if (__builtin_expect(PS2_IS_PLAIN_RAM(_addr), 1))             \
+            Ps2RamStore<T>(rdram, _addr, _val);                       \
+        else                                                          \
+        {                                                             \
+            PS2_SYNC_PC();                                            \
+            SLOW(rdram, ctx, runtime, _addr, _val);                   \
+        }                                                             \
+    } while (0)
+
+#define WRITE8(addr, val) PS2_FAST_WRITE(uint8_t, ps2SlowStore8, addr, val)
+#define WRITE16(addr, val) PS2_FAST_WRITE(uint16_t, ps2SlowStore16, addr, val)
+#define WRITE32(addr, val) PS2_FAST_WRITE(uint32_t, ps2SlowStore32, addr, val)
+#define WRITE64(addr, val) PS2_FAST_WRITE(uint64_t, ps2SlowStore64, addr, val)
+#define WRITE128(addr, val) PS2_FAST_WRITE(__m128i, ps2SlowStore128, ((uint32_t)(addr) & ~0xFu), val)
+
+#else // !PS2X_FAST_MEM
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
     return PS2Runtime::isSpecialAddress(_addr)                \
@@ -867,6 +1042,24 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             FAST_WRITE128(_addr, _value);                                            \
         }                                                                            \
     } while (0)
+#endif // PS2X_FAST_MEM
+
+// The complete original access path, used out of line by the fast macros.
+#define PS2_ORIG_READ(T, LOAD, FAST, addr) ([&]() -> T {      \
+    uint32_t _addr = (uint32_t)(addr);                        \
+    return PS2Runtime::isSpecialAddress(_addr)                \
+        ? runtime->LOAD(rdram, ctx, _addr)                    \
+        : FAST(_addr); }())
+#define PS2_ORIG_WRITE(STORE, FAST, addr, val)                \
+    do                                                        \
+    {                                                         \
+        uint32_t _addr = (addr);                              \
+        if (PS2Runtime::isSpecialAddress(_addr))              \
+            runtime->STORE(rdram, ctx, _addr, (val));         \
+        else                                                  \
+            FAST(_addr, (val));                               \
+    } while (0)
+
 
 // Packed Compare Greater Than (PCGT)
 #define PS2_PCGTW(a, b) _mm_cmpgt_epi32((__m128i)(a), (__m128i)(b))
@@ -1267,6 +1460,50 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 #define PS2_VSQRT(x) sqrtf(x)
 #define PS2_VRSQRT(x) (1.0f / sqrtf(x))
 
+#if defined(PS2X_SCALAR_GPR)
+// Plain scalar access to the low 64 bits of a GPR. The registers stay 128-bit
+// in the context, but ordinary integer code never touches the vector unit:
+// on ARMv7 a NEON<->core transfer per guest instruction dominates the cost.
+typedef uint32_t __attribute__((may_alias)) ps2_gpr_u32;
+typedef int32_t __attribute__((may_alias)) ps2_gpr_s32;
+typedef uint64_t __attribute__((may_alias)) ps2_gpr_u64;
+typedef int64_t __attribute__((may_alias)) ps2_gpr_s64;
+
+#define GPR_U32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0U : *reinterpret_cast<const ps2_gpr_u32 *>(&(ctx_ptr)->r[reg_idx]))
+#define GPR_S32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0 : *reinterpret_cast<const ps2_gpr_s32 *>(&(ctx_ptr)->r[reg_idx]))
+#define GPR_U64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0ULL : *reinterpret_cast<const ps2_gpr_u64 *>(&(ctx_ptr)->r[reg_idx]))
+#define GPR_S64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0LL : *reinterpret_cast<const ps2_gpr_s64 *>(&(ctx_ptr)->r[reg_idx]))
+#define GPR_VEC(ctx_ptr, reg_idx) ((reg_idx == 0) ? _mm_setzero_si128() : ctx_ptr->r[reg_idx])
+
+static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
+{
+    if (reg != 0)
+    {
+        *reinterpret_cast<ps2_gpr_s64 *>(&ctx->r[reg]) = _mm_cvtsi128_si64(new_low);
+    }
+}
+
+#define PS2_SET_GPR_LOW64(ctx_ptr, reg_idx, val64)                                     \
+    do                                                                                 \
+    {                                                                                  \
+        if ((reg_idx) != 0)                                                            \
+            *reinterpret_cast<ps2_gpr_s64 *>(&(ctx_ptr)->r[reg_idx]) = (int64_t)(val64); \
+    } while (0)
+
+#define SET_GPR_U32(ctx_ptr, reg_idx, val) PS2_SET_GPR_LOW64(ctx_ptr, reg_idx, (int64_t)(int32_t)(val))
+#define SET_GPR_ZE32(ctx_ptr, reg_idx, val) PS2_SET_GPR_LOW64(ctx_ptr, reg_idx, (int64_t)(uint32_t)(val))
+#define SET_GPR_S32(ctx_ptr, reg_idx, val) PS2_SET_GPR_LOW64(ctx_ptr, reg_idx, (int64_t)(int32_t)(val))
+#define SET_GPR_U64(ctx_ptr, reg_idx, val) PS2_SET_GPR_LOW64(ctx_ptr, reg_idx, (int64_t)(val))
+#define SET_GPR_S64(ctx_ptr, reg_idx, val) SET_GPR_U64(ctx_ptr, reg_idx, val)
+
+#define SET_GPR_VEC(ctx_ptr, reg_idx, val) \
+    do                                     \
+    {                                      \
+        if (reg_idx != 0)                  \
+            ctx_ptr->r[reg_idx] = (val);   \
+    } while (0)
+
+#else
 #define GPR_U32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0U : static_cast<uint32_t>(PS2_EXTRACT_EPI32_0(ctx_ptr->r[reg_idx])))
 #define GPR_S32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0 : PS2_EXTRACT_EPI32_0(ctx_ptr->r[reg_idx]))
 #define GPR_U64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0ULL : static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(ctx_ptr->r[reg_idx])))
@@ -1331,6 +1568,8 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
         if (reg_idx != 0)                  \
             ctx_ptr->r[reg_idx] = (val);   \
     } while (0)
+
+#endif // PS2X_SCALAR_GPR
 
 // PMULTH keeps eight signed 16x16-bit products without adding them.
 // LO={p0,p1,p4,p5}, HI={p2,p3,p6,p7}; rd={p0,p2,p4,p6}.

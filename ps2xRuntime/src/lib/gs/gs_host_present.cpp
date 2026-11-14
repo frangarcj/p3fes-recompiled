@@ -1,6 +1,7 @@
 // host context, frame selection and raylib drawing used by the port.
 #include "runtime/gs/gs_host_present.h"
 #include "../game_overrides/p3fes_native_present.h"
+#include "../game_overrides/p3fes_native_movie.h"
 #include "runtime/gs/gs_direct_frame.h"
 #include "runtime/gs/gs_host_present_diag.h" // window without extra GPU reads.
 #include "runtime/gs/gs_frontend.h"
@@ -19,6 +20,16 @@
 #if defined(__APPLE__) && !defined(PLATFORM_VITA)
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl3.h>
+#endif
+
+#if !defined(PLATFORM_VITA)
+#include <rlgl.h>
+#include <string>
+#include <vector>
+#endif
+
+#if !defined(PLATFORM_VITA)
+extern uint64_t g_path3TraceVsync; // the current vsync count (ps2_memory.cpp)
 #endif
 
 namespace
@@ -48,6 +59,86 @@ namespace
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     }
+
+#if !defined(PLATFORM_VITA)
+    // Desktop reference capture, same settings and file format as the native path
+    // (p3fes_native_present.cpp frameDiagFor/capturePath): P3FES_FRAME_DIAG=<s>[,<s>...] seconds after the
+    // first presented (non-blank) frame, written as $P3FES_CAPTURE_DIR/frame-<s>.p3fb ("P3FB", u32 width,
+    // u32 height, RGBA8 rows top first). It reads the window (the GS picture stretched to it), so its size
+    // equals the native path's for the same window.
+    struct GsFrameDiag
+    {
+        std::vector<double> times;
+        size_t next = 0u;
+        bool parsed = false;
+        bool started = false;
+        std::chrono::steady_clock::time_point start{};
+        uint64_t startVsync = 0u;
+        bool fields = false;
+    } s_frameDiag;
+
+    // Returns the label (whole seconds) when this frame is to be captured, or -1.
+    int gsFrameDiagDue(bool blank)
+    {
+        GsFrameDiag &diag = s_frameDiag;
+        if (!diag.parsed)
+        {
+            diag.parsed = true;
+            const char *value = std::getenv("P3FES_FRAME_DIAG");
+            for (const char *cursor = value ? value : ""; *cursor;)
+            {
+                char *end = nullptr;
+                const double seconds = std::strtod(cursor, &end);
+                if (end == cursor)
+                    break;
+                diag.times.push_back(seconds);
+                cursor = *end == ',' ? end + 1 : end;
+            }
+            // P3FES_FRAME_DIAG_CLOCK=fields (GS path only): count emulated time (vsyncs / 59.94) instead of wall
+            // time, since this path can run at a fraction of real time. Matches PS2X_PAD_SCRIPT_CLOCK=fields.
+            const char *clock = std::getenv("P3FES_FRAME_DIAG_CLOCK");
+            diag.fields = clock && std::strcmp(clock, "fields") == 0;
+        }
+        if (diag.next >= diag.times.size() || blank)
+            return -1;
+        const auto now = std::chrono::steady_clock::now();
+        if (!diag.started)
+        {
+            diag.started = true;
+            diag.start = now;
+            diag.startVsync = g_path3TraceVsync;
+            if (diag.fields)
+                std::fprintf(stderr, "[gs-present] first frame at emulated t=%.2f s\n", g_path3TraceVsync * 1001.0 / 60000.0);
+        }
+        const double elapsed = diag.fields ? static_cast<double>(g_path3TraceVsync - diag.startVsync) * 1001.0 / 60000.0
+                                           : std::chrono::duration<double>(now - diag.start).count();
+        if (elapsed < diag.times[diag.next])
+            return -1;
+        return static_cast<int>(diag.times[diag.next++]);
+    }
+
+    void gsCaptureWindow(int label)
+    {
+        rlDrawRenderBatchActive();
+        const int width = std::max(GetRenderWidth(), 1), height = std::max(GetRenderHeight(), 1);
+        unsigned char *pixels = rlReadScreenPixels(width, height);
+        if (!pixels)
+            return;
+        const char *directory = std::getenv("P3FES_CAPTURE_DIR");
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s%sframe-%d.p3fb", directory ? directory : "", directory ? "/" : "", label);
+        if (FILE *file = std::fopen(path, "wb"))
+        {
+            const uint32_t header[2] = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+            std::fwrite("P3FB", 1, 4, file);
+            std::fwrite(header, sizeof(uint32_t), 2, file);
+            std::fwrite(pixels, 4u, static_cast<size_t>(width) * height, file);
+            std::fclose(file);
+            std::fprintf(stderr, "[gs-present] captured %s (%dx%d)\n", path, width, height);
+        }
+        RL_FREE(pixels);
+    }
+#endif
 
     void waitDirectFrame(uint64_t fence)
     {
@@ -370,6 +461,8 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
 
 GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncTick, const std::function<void()> &overlay)
 {
+    if (p3fes_native_movie::renderHostFrame())
+        return current;
     if (p3fes_native_present::active())
     {
         // Game-thread hooks only record CPU-side draw commands. Execute every
@@ -377,7 +470,14 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         // context, and never paint an interlaced GS fallback over the native
         // progressive frame.
         if (!p3fes_native_present::renderHostFrame())
+        {
             PollInputEvents();
+            // No swap means no vitaGL frame limiter either (including during
+            // Sofdec's direct display path). Do not spin on input and contend
+            // with the game thread while waiting for its next complete frame.
+            ps2_perf::Scope wait(ps2_perf::Bucket::HostWait);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         return current;
     }
     View selected;
@@ -412,6 +512,10 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
                                 destinationWidth, destinationHeight};
     // PBO texture with rows in order; do not flip source.height.
     DrawTexturePro(selected.texture, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+#if !defined(PLATFORM_VITA)
+    if (const int label = gsFrameDiagDue(selected.blank); label >= 0)
+        gsCaptureWindow(label);
+#endif
     if (overlay)
         overlay();
     {

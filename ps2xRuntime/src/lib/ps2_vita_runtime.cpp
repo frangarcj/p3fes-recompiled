@@ -2,6 +2,60 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+// Vita launchers do not supply a shell environment. Read the same runtime
+// switches used on desktop before any of their function-local caches initialize.
+// This also lets Vita3K boot tests change diagnostics without relinking the game.
+void ps2xVitaConfigure()
+{
+    if (FILE *config = std::fopen("ux0:data/p3fes/runtime.cfg", "r"))
+    {
+        char line[2048];
+        while (std::fgets(line, sizeof(line), config))
+        {
+            // Ignore an overlong entry rather than applying its truncated value.
+            if (!std::strchr(line, '\n') && !std::feof(config))
+            {
+                int ch;
+                while ((ch = std::fgetc(config)) != '\n' && ch != EOF) {}
+                continue;
+            }
+            auto trim = [](char *text) {
+                text += std::strspn(text, " \t\r\n");
+                size_t length = std::strlen(text);
+                while (length && std::strchr(" \t\r\n", text[length - 1]))
+                    text[--length] = '\0';
+                return text;
+            };
+            char *key = trim(line);
+            if (*key == '#' || *key == '\0')
+                continue;
+            char *equals = std::strchr(key, '=');
+            if (!equals)
+                continue;
+            *equals = '\0';
+            key = trim(key);
+            char *value = trim(equals + 1);
+            if ((std::strncmp(key, "PS2X_", 5) == 0 || std::strncmp(key, "P3FES_", 6) == 0) &&
+                std::strspn(key, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") == std::strlen(key))
+                setenv(key, value, 1);
+        }
+        std::fclose(config);
+    }
+    if (const char *path = std::getenv("PS2X_LOG_FILE"); path && *path)
+    {
+        FILE *log = std::fopen(path, "w");
+        if (!log)
+            return;
+        std::fclose(log);
+        std::freopen(path, "a", stdout);
+        std::freopen(path, "a", stderr);
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);
+        std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    }
+}
 
 // Heap sizes must live in a native object as well(bc of LTO).
 // the newlib malloc/new arena (PS2 guest RAM 32MB + GS + buffers live here).
@@ -78,3 +132,9 @@ extern "C"
 }
 
 #endif // PLATFORM_VITA
+
+// vita-elf-create appends its SCE data after the code segment and needs ~5 KB before the data segment, which the
+// linker places at the next 1 MiB boundary. When the code ends within 5 KB of that boundary the conversion aborts
+// ("Cannot allocate ... bytes for SCE data at end of segment 0"). This read-only pad moved the end of the code past
+// the boundary the day that happened; change its size (or remove it) if the message comes back.
+extern "C" __attribute__((used)) const char g_ps2xLayoutPad[16384] = {1};

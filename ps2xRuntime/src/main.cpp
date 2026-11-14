@@ -20,6 +20,10 @@
 #include <cstdio>
 #include <thread>
 
+#if defined(PLATFORM_VITA)
+void ps2xVitaConfigure();
+#endif
+
 namespace
 {
     // Debug aid: set PS2X_THREAD_DUMP=<seconds> to print every guest EE thread,
@@ -300,6 +304,9 @@ int ps2xRuntimeMain(int argc, char *argv[], const char *abiHash)
 #else
 int main(int argc, char *argv[])
 {
+#if defined(PLATFORM_VITA)
+    ps2xVitaConfigure();
+#endif
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
 #endif

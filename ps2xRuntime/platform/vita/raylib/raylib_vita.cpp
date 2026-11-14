@@ -15,6 +15,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 #include <psp2/touch.h>
 
@@ -676,6 +677,7 @@ namespace
     SDL_AudioDeviceID g_audioDevice = 0;
     int g_audioBufferFrames = 1024;
     std::atomic<AudioCallback> g_audioCallback{nullptr};
+    std::atomic<bool> g_movieAudioExclusive{false};
 
     void pollInput()
     {
@@ -700,9 +702,15 @@ namespace
 
         // Vita 1000/2000 have no L2/R2: the rear touchpad's left and right
         // halves stand in for them.
+        // Opt-in (PS2X_VITA_REAR_L2R2=1): the fingers that hold the console rest on that pad, so
+        // by default it would hold L2/R2 down most of the time.
+        static const bool rearTouch = [] {
+            const char *value = std::getenv("PS2X_VITA_REAR_L2R2");
+            return value && *value == '1';
+        }();
         SceTouchData touch{};
         g_rearLeft = g_rearRight = false;
-        if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &touch, 1) > 0)
+        if (rearTouch && sceTouchPeek(SCE_TOUCH_PORT_BACK, &touch, 1) > 0)
         {
             for (unsigned i = 0; i < touch.reportNum; ++i)
             {
@@ -721,11 +729,64 @@ namespace
             callback(stream, frames);
         else
             std::memset(stream, 0, static_cast<size_t>(bytes));
+        if (g_movieAudioExclusive.load(std::memory_order_relaxed))
+            std::memset(stream, 0, static_cast<size_t>(bytes));
+    }
+}
+
+extern "C" void ps2x_vita_pause_game_audio(int paused)
+{
+    // Keep draining the guest stream, but let AVPlayer's BGM port own the
+    // audible movie soundtrack until the native player has stopped.
+    g_movieAudioExclusive.store(paused != 0, std::memory_order_release);
+}
+
+// Set by the runtime when the EE executor thread starts.
+extern "C" int ps2x_vita_game_thread;
+#if defined(PS2X_VITA_LIBPERF)
+#include "../vita_pmu.h"
+#endif
+
+namespace
+{
+    // PS2X_VITA_WATCHDOG_SEC=N: if the host loop stops presenting for N
+    // seconds, crash on purpose. The resulting psp2dmp holds every thread's
+    // registers and stack, which is the only way to see where a silent
+    // freeze on the console is stuck (no debugger, no host sampling).
+    std::atomic<uint32_t> g_hostHeartbeat{0};
+    int watchdogThread(SceSize, void *)
+    {
+        const char *value = std::getenv("PS2X_VITA_WATCHDOG_SEC");
+        const int limit = value ? std::atoi(value) : 0;
+        if (limit <= 0)
+            return 0;
+        uint32_t last = 0;
+        int quiet = 0;
+        for (;;)
+        {
+            sceKernelDelayThread(1000000);
+            const uint32_t now = g_hostHeartbeat.load(std::memory_order_relaxed);
+            quiet = (now == last) ? quiet + 1 : 0;
+            last = now;
+            if (quiet >= limit)
+            {
+                // No logging here: if the freeze is a thread stuck inside a
+                // file write, stdio's lock would block this thread too.
+                *static_cast<volatile uint32_t *>(nullptr) = 0xDEAD0001u + static_cast<uint32_t>(quiet);
+            }
+        }
+    }
+    void startWatchdog()
+    {
+        const SceUID thread = sceKernelCreateThread("p3fes-watchdog", watchdogThread, 0x40, 0x4000, 0, 0, nullptr);
+        if (thread >= 0)
+            sceKernelStartThread(thread, 0, nullptr);
     }
 }
 
 void InitWindow(int, int, const char *)
 {
+    startWatchdog();
     // The Vita screen, whatever size the host asked for.
     const int width = 960, height = 544;
     g_width = width;
@@ -848,11 +909,15 @@ void InitWindow(int, int, const char *)
     const char *pools = std::getenv("SOTC_VGL_POOLS");
     if (pools && std::strcmp(pools, "console") == 0)
     {
-        std::fprintf(stderr, "[vita] SOTC_VGL_POOLS=console: vitaGL pools of RAM 16, CDRAM 96, phycont 26 MB (a console's)\n");
-        vglInitWithCustomSizes(immediateKb * 1024, width, height, 16 * 1024 * 1024, 96 * 1024 * 1024, 26 * 1024 * 1024, 0, SCE_GXM_MULTISAMPLE_NONE);
+        std::fprintf(stderr, "[vita] SOTC_VGL_POOLS=console: vitaGL pools of RAM 16, CDRAM 96, phycont 14 MB; 12 MB reserved for video\n");
+        vglInitWithCustomSizes(immediateKb * 1024, width, height, 16 * 1024 * 1024, 96 * 1024 * 1024, 14 * 1024 * 1024, 0, SCE_GXM_MULTISAMPLE_NONE);
     }
     else
-        vglInitWithCustomThreshold(immediateKb * 1024, width, height, 96 * 1024 * 1024, 0, 0, 0x8C6000 /* the common dialog share, as vglInitExtended */,
+        // Reserve 20 MiB of PHYCONT for AVPlayer's decoder/frame buffers. On
+        // the console the decoder asks for a 2.1 MB block (rounded to 3 MiB)
+        // and then one contiguous 10 MiB block; with a 12 MiB reserve the
+        // second request failed (0x80024302) and no movie ever played.
+        vglInitWithCustomThreshold(immediateKb * 1024, width, height, 96 * 1024 * 1024, 0, 20 * 1024 * 1024, 0x8C6000 /* the common dialog share, as vglInitExtended */,
                                    SCE_GXM_MULTISAMPLE_NONE);
     bootMark("window: vitaGL up");
     pace110::init();
@@ -951,6 +1016,10 @@ void EndDrawing(void)
         vglSwapBuffers(GL_FALSE);
         ps2x_vita_swap_us += sceKernelGetProcessTimeWide() - swapStart;
     }
+    g_hostHeartbeat.fetch_add(1u, std::memory_order_relaxed);
+    // Playing with no touch or button input must not dim the screen or
+    // suspend the console (movies, cutscenes, long loads).
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
     const bool pacePrint = g_glReady;
     static bool firstShown = false;
     if (!firstShown)
@@ -980,16 +1049,59 @@ void EndDrawing(void)
         // Vita3K's mspace statistics are not real) and the GPU objects vitaGL
         // put in the newlib heap because its pools had no room.
         size_t used[VGL_MEM_ALL] = {}, spill = 0, spills = 0, spillTotal = 0, spillPeak = 0;
-        if (vglCeloMemStats)
+        const bool haveVglMemStats = vglCeloMemStats != nullptr;
+        if (haveVglMemStats)
             vglCeloMemStats(used, &spill, &spills, &spillTotal, &spillPeak);
         const double MB = 1048576.0;
+        const size_t vramFree = vglMemFree(VGL_MEM_VRAM);
+        const size_t vramTotal = vglMemTotal(VGL_MEM_VRAM);
+        const size_t ramFree = vglMemFree(VGL_MEM_RAM);
+        const size_t ramTotal = vglMemTotal(VGL_MEM_RAM);
+        const size_t phycontFree = vglMemFree(VGL_MEM_PHYCONT);
+        const size_t phycontTotal = vglMemTotal(VGL_MEM_PHYCONT);
         std::fprintf(stderr, "[vita:mem] t=%.0f heap used=%.1f MB arena=%.1f MB | vgl vram=%.1f/%.1f ram=%.1f/%.1f MB | system free user=%.1f cdram=%.1f phycont=%.1f MB"
-                             " | vgl used vram %.1f/%.1f ram %.1f/%.1f phycont %.1f/%.1f budget %.1f/%.1f MB, GPU objects in the heap %u (%.1f MB, peak %.1f, %.1f MB put there in all)\n",
-                     now, mi.uordblks / MB, mi.arena / MB, vglMemFree(VGL_MEM_VRAM) / MB, vglMemTotal(VGL_MEM_VRAM) / MB, vglMemFree(VGL_MEM_RAM) / MB,
-                     vglMemTotal(VGL_MEM_RAM) / MB, freeInfo.size_user / MB, freeInfo.size_cdram / MB, freeInfo.size_phycont / MB, used[VGL_MEM_VRAM] / MB,
-                     vglMemTotal(VGL_MEM_VRAM) / MB, used[VGL_MEM_RAM] / MB, vglMemTotal(VGL_MEM_RAM) / MB, used[VGL_MEM_PHYCONT] / MB,
-                     vglMemTotal(VGL_MEM_PHYCONT) / MB, used[VGL_MEM_BUDGET] / MB, vglMemTotal(VGL_MEM_BUDGET) / MB, static_cast<unsigned>(spills), spill / MB,
-                     spillPeak / MB, spillTotal / MB);
+                             " | vgl free validity vram=%s ram=%s phycont=%s\n",
+                     now, mi.uordblks / MB, mi.arena / MB, vramFree / MB, vramTotal / MB, ramFree / MB,
+                     ramTotal / MB, freeInfo.size_user / MB, freeInfo.size_cdram / MB, freeInfo.size_phycont / MB,
+                     vramFree <= vramTotal ? "ok" : "INVALID(free>total)",
+                     ramFree <= ramTotal ? "ok" : "INVALID(free>total)",
+                     phycontFree <= phycontTotal ? "ok" : "INVALID(free>total)");
+        if (haveVglMemStats)
+            std::fprintf(stderr,
+                         "[vita:mem] vgl used vram %.1f/%.1f ram %.1f/%.1f phycont %.1f/%.1f budget %.1f/%.1f MB, GPU objects in heap %u (%.1f MB, peak %.1f, %.1f MB total)\n",
+                         used[VGL_MEM_VRAM] / MB, vramTotal / MB, used[VGL_MEM_RAM] / MB, ramTotal / MB,
+                         used[VGL_MEM_PHYCONT] / MB, phycontTotal / MB, used[VGL_MEM_BUDGET] / MB,
+                         vglMemTotal(VGL_MEM_BUDGET) / MB, static_cast<unsigned>(spills), spill / MB,
+                         spillPeak / MB, spillTotal / MB);
+        else
+            std::fprintf(stderr, "[vita:mem] vgl used-pool/GPU-spill stats unavailable (vitaGL extension not linked)\n");
+        // CPU time each of the two main threads actually got in this window.
+        // Wall-clock buckets cannot tell running from waiting or being
+        // descheduled; a game thread at much less than 100% is not CPU-bound.
+        {
+            static uint64_t lastRun[2] = {0, 0};
+            static uint64_t lastWall = 0;
+            const uint64_t wall = sceKernelGetProcessTimeWide();
+            const SceUID ids[2] = {ps2x_vita_game_thread, sceKernelGetThreadId()};
+            const char *names[2] = {"game", "host"};
+            for (int i = 0; i < 2; ++i)
+            {
+                SceKernelThreadInfo info{};
+                info.size = sizeof(info);
+                if (ids[i] <= 0 || sceKernelGetThreadInfo(ids[i], &info) < 0)
+                    continue;
+                const uint64_t run = info.runClocks;
+                if (lastWall != 0u && wall > lastWall)
+                    std::fprintf(stderr, "[vita:cpu] %s thread: %.0f%% of a core, priority %d, affinity 0x%X, cpu %d, migrations %d\n",
+                                 names[i], (run - lastRun[i]) * 100.0 / (wall - lastWall), info.currentPriority,
+                                 static_cast<unsigned>(info.currentCpuAffinityMask), info.currentCpuId, info.changeCpuCount);
+                lastRun[i] = run;
+            }
+            lastWall = wall;
+        }
+#if defined(PS2X_VITA_LIBPERF)
+        ps2x_vita_pmu_report();
+#endif
         ps2x_vita_heap_tick(now, mi.uordblks); // round mem99: the emergency reserve, SOTC_HEAP_PROF's [heap] lines
         // Round 35, SOTC_VGL_MEMDUMP=<seconds> (0: off): what vitaGL's pools
         // hold by the code that asked for it, the circular pool's peak and
