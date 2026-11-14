@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "ps2recomp/control_flow_analyzer.h"
 #include "ps2recomp/types.h"
 #include "ps2recomp/instructions.h"
@@ -194,7 +196,11 @@ namespace ps2recomp
             {
                 if (jrInst->function == SPECIAL_JALR)
                 {
+                    // An indirect call leaves the function and comes back at
+                    // the resume entry. It is never a local computed jump, so
+                    // it must not promote every instruction to an entry point.
                     queueResumeEntryTarget(jrInst->address + 8u);
+                    continue;
                 }
 
                 bool foundTable = false;
@@ -396,6 +402,11 @@ namespace ps2recomp
                 if (!foundTable)
                 {
                     needsIndirectFallback = true;
+                    if (std::getenv("PS2RECOMP_JR_DIAG"))
+                    {
+                        std::fprintf(stderr, "[jr-unresolved] %s jr=0x%08x reg=%u size=%zu\n",
+                                     function.name.c_str(), jrInst->address, jrInst->rs, instructions.size());
+                    }
                 }
             }
 

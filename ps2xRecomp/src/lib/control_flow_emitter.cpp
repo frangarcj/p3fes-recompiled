@@ -131,11 +131,20 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
-
         const std::string code = delaySlotCode();
+        // A delay slot that cannot raise or call into the runtime needs neither
+        // the PC nor the branch-delay state in the context.
+        const bool observable = translationObservesGuestPc(code);
+        if (observable)
+        {
+            m_ss << fmt::format("{}ctx->pc = ps2_cur_pc = 0x{:X}u;\n", indent, delayPc());
+            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
+        else
+        {
+            m_ss << fmt::format("{}ps2_cur_pc = 0x{:X}u;\n", indent, delayPc());
+        }
         std::istringstream lines(code);
         std::string line;
         while (std::getline(lines, line))
@@ -146,7 +155,10 @@ namespace ps2recomp
             }
         }
 
-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        if (observable)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        }
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
@@ -330,7 +342,13 @@ namespace ps2recomp
         emitDelaySlot("    ");
 
         const uint32_t target = buildAbsoluteJumpTarget(m_branchInst.address, m_branchInst.target);
-        if (isInternalTarget(target))
+        // A jal to the function's own entry is a recursive call, not a loop: it needs a host frame. Emitted as a
+        // goto, the guest return address pointed back into this function while the host stack had only one frame, so
+        // the first recursive return left the host function and every caller above it (each PS2_CALL_DIRECT sees
+        // ctx->pc != its return address) and the whole chain was re-entered through the dispatcher's resume switch,
+        // once per tree node (RenderWare frame hierarchy sync, world sector walks, qsort ...).
+        const bool selfCall = kind == StaticBranchKind::Call && target == m_function.start;
+        if (isInternalTarget(target) && !selfCall)
         {
             emitInternalTarget(target, branchPc(), "    ");
             return;
@@ -346,6 +364,21 @@ namespace ps2recomp
         if (emitDirectFunctionJumpIfAvailable(target, kind, "    "))
         {
             return;
+        }
+
+        if (kind == StaticBranchKind::Call)
+        {
+            // A call to a known generated function goes straight to its symbol
+            // when the function table still holds it (no runtime override) and
+            // no scheduler checkpoint is due; otherwise PS2_CALL_DIRECT falls
+            // back to the complete dispatcher.
+            const std::string functionName = m_gen.getFunctionName(target);
+            if (!functionName.empty())
+            {
+                m_ss << fmt::format("    PS2_CALL_DIRECT({}, 0x{:X}u, 0x{:X}u, 0x{:X}u);\n",
+                                    functionName, target, branchPc(), fallthroughPc());
+                return;
+            }
         }
 
         emitExternalJumpDispatch(target, kind, "    ");

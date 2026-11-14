@@ -1,12 +1,16 @@
+#include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/Emitters/function_emitter.h"
+#include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/recompiler_reporter.h"
+#include "ps2recomp/register_locals.h"
 #include "ps2recomp/types.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -87,6 +91,9 @@ namespace ps2recomp
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
+        // The guest PC lives in a local constant; it is stored to the context
+        // only where something can observe it (see PS2_SYNC_PC).
+        ss << "    uint32_t ps2_cur_pc = 0x" << std::hex << function.start << std::dec << "u; (void)ps2_cur_pc;\n";
         ss << "\n";
         if (!resumeTargets.empty())
         {
@@ -200,10 +207,19 @@ namespace ps2recomp
                         continue;
                     }
 
-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                       << std::dec;
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
+                    const std::string translated = cg.translateInstruction(inst, memoryHint);
+                    if (translationObservesGuestPc(translated))
+                    {
+                        ss << "    ctx->pc = ps2_cur_pc = 0x" << std::hex << inst.address << "u;\n"
+                           << std::dec;
+                    }
+                    else
+                    {
+                        ss << "    ps2_cur_pc = 0x" << std::hex << inst.address << "u;\n"
+                           << std::dec;
+                    }
+                    ss << "    " << translated;
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
@@ -234,6 +250,12 @@ namespace ps2recomp
         }
 
         ss << "}\n";
-        return ss.str();
+        // PS2RECOMP_REG_LOCALS=0 keeps every register access on the context.
+        static const bool registerLocals = []
+        {
+            const char *value = std::getenv("PS2RECOMP_REG_LOCALS");
+            return value == nullptr || value[0] != '0';
+        }();
+        return registerLocals ? applyRegisterLocals(ss.str()) : ss.str();
     }
 }
