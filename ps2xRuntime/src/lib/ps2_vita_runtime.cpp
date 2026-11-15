@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <psp2/kernel/threadmgr.h>
 
 // Vita launchers do not supply a shell environment. Read the same runtime
 // switches used on desktop before any of their function-local caches initialize.
@@ -52,8 +54,34 @@ void ps2xVitaConfigure()
         std::fclose(log);
         std::freopen(path, "a", stdout);
         std::freopen(path, "a", stderr);
-        std::setvbuf(stdout, nullptr, _IOLBF, 0);
-        std::setvbuf(stderr, nullptr, _IOLBF, 0);
+        // A line-buffered log writes to the memory card on every line, on the thread that prints:
+        // 20-60 ms each time on the console. The render thread's 5-second status lines alone held
+        // a frame on screen for four or more refreshes every few seconds. Buffer the log in memory
+        // and let a low-priority thread write it out once a second instead. PS2X_LOG_SYNC=1 keeps
+        // the old behaviour (every line on disk at once, e.g. when chasing a crash).
+        const char *sync = std::getenv("PS2X_LOG_SYNC");
+        if (sync && *sync == '1')
+        {
+            std::setvbuf(stdout, nullptr, _IOLBF, 0);
+            std::setvbuf(stderr, nullptr, _IOLBF, 0);
+        }
+        else
+        {
+            static char stdoutBuffer[64 * 1024];
+            static char stderrBuffer[256 * 1024];
+            std::setvbuf(stdout, stdoutBuffer, _IOFBF, sizeof(stdoutBuffer));
+            std::setvbuf(stderr, stderrBuffer, _IOFBF, sizeof(stderrBuffer));
+            std::thread([] {
+                sceKernelChangeThreadPriority(sceKernelGetThreadId(), 180);
+                sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x10000); // core 0: not the game's
+                for (;;)
+                {
+                    sceKernelDelayThread(1000 * 1000);
+                    std::fflush(stdout);
+                    std::fflush(stderr);
+                }
+            }).detach();
+        }
     }
 }
 
