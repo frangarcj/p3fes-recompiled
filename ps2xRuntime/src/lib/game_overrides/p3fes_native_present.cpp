@@ -54,6 +54,27 @@ struct MeshDraw
         : id(meshId), model(meshModel), state(std::move(meshState)) {}
 };
 
+// A draw of a retained record (drawMeshShared): the immutable state belongs to the producer's static-atomic cache, which
+// keeps the other reference; nobody on either side mutates it. A small alternative of its own: the draw of a cached
+// atomic writes ~130 bytes instead of a whole MeshDraw with its default-constructed state.
+struct SharedMeshDraw
+{
+    MeshId id = 0;
+    Matrix4 model = kIdentityMatrix;
+    std::shared_ptr<const MeshDrawState> state;
+    // The draw's own material colours (RGBA bytes packed as they lie in guest memory) when they are not the ones the
+    // retained state holds: the host copies the state and patches the colours (colorCount <= 8).
+    uint32_t colorOverride[8];
+    uint8_t colorCount = 0;
+
+    SharedMeshDraw(MeshId meshId, const Matrix4 &meshModel, const std::shared_ptr<const MeshDrawState> &retained, const uint32_t *colors,
+                   uint32_t count)
+        : id(meshId), model(meshModel), state(retained), colorCount(static_cast<uint8_t>(count))
+    {
+        for (uint32_t i = 0; i < count; ++i) colorOverride[i] = colors[i];
+    }
+};
+
 struct TransientMeshDraw
 {
     MeshData mesh;
@@ -109,7 +130,7 @@ struct TextureDefinition
     mutable uint64_t readyEpoch = 0;
 };
 
-using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw, ClearDraw, CameraDraw, TargetDraw>;
+using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw, ClearDraw, CameraDraw, TargetDraw, SharedMeshDraw>;
 
 struct Frame
 {
@@ -140,6 +161,7 @@ std::atomic<int> g_widescreen{0};
 // Bumped by setActive(false) and shutdownHost; the producer drops its private state on the next call.
 std::atomic<uint32_t> g_resetEpoch{0};
 std::mutex g_mutex;
+std::atomic<unsigned> g_submittedFrames{0u}, g_supersededFrames{0u};
 std::optional<Frame> g_pending;
 // Shared so that neither side copies a mesh (vertex/index arrays) while holding g_mutex: the producer
 // builds the shared copy before taking the lock, the host copies the pointer.
@@ -179,9 +201,13 @@ struct NameCacheSlot
     TextureEntry *entry = nullptr;
 };
 NameCacheSlot g_nameCache[256];
+// Bumped whenever TextureEntry nodes may have been erased (clearNameCache is called before every erase or clear of
+// g_textureDefinitions): retained-draw plans that hold entry pointers are valid only for the generation they were made in.
+uint64_t g_textureTableGen = 1;
 void clearNameCache()
 {
     for (NameCacheSlot &slot : g_nameCache) slot = {};
+    ++g_textureTableGen;
 }
 std::vector<MeshDrawState> g_stateStock;
 // stockDrawState() bookkeeping: the state handed out is the back of g_stateStock (g_stockLent) or g_lentScratch.
@@ -379,6 +405,64 @@ void retainTexture(const std::string &name)
     g_building.textures.push_back(entry.definition);
 }
 
+// The entry retainTexture resolves `name` to, or null (no entry for it yet). Same lookups as retainTexture.
+TextureEntry *findTextureEntry(const std::string &name)
+{
+    if (name.empty()) return nullptr;
+    if (name.size() <= 15)
+    {
+        uint64_t key[2] = {0, 0};
+        const size_t size = name.size();
+        std::memcpy(&key[0], name.data(), 8);
+        std::memcpy(&key[1], name.data() + 8, 8);
+        if (size < 8)
+        {
+            key[0] &= (1ull << (8 * size)) - 1;
+            key[1] = 0;
+        }
+        else
+            key[1] &= size == 8 ? 0ull : (1ull << (8 * (size - 8))) - 1;
+        NameCacheSlot &slot = g_nameCache[((key[0] * 0x9E3779B97F4A7C15ull) ^ (key[1] * 0xC2B2AE3D27D4EB4Full)) >> 56];
+        if (slot.entry && slot.key0 == key[0] && slot.key1 == key[1]) return slot.entry;
+        const auto found = g_textureDefinitions.find(name);
+        if (found == g_textureDefinitions.end()) return nullptr;
+        slot = {key[0], key[1], &found->second};
+        return &found->second;
+    }
+    const auto found = g_textureDefinitions.find(name);
+    return found == g_textureDefinitions.end() ? nullptr : &found->second;
+}
+
+// retainTexture for an entry that is already known (the body that follows the lookup there).
+inline void retainEntry(TextureEntry &entry)
+{
+    if (!entry.definition) return;
+    if (entry.retainedSequence == g_building.sequence)
+    {
+        auto &held = g_building.textures[entry.slot];
+        if (held != entry.definition) held = entry.definition;
+        return;
+    }
+    entry.retainedSequence = g_building.sequence;
+    entry.slot = static_cast<uint32_t>(g_building.textures.size());
+    g_building.textures.push_back(entry.definition);
+}
+
+// A draw state kept by the producer (makeRetainedState) with the texture entries its names resolve to, so that
+// re-submitting it each frame does not hash the names again.
+struct RetainedState : MeshDrawState
+{
+    explicit RetainedState(const MeshDrawState &state) : MeshDrawState(state) {}
+    struct Item
+    {
+        TextureEntry *entry;
+        const std::string *name;
+    };
+    mutable uint64_t planGen = 0;     // g_textureTableGen the plan was made for (0: none yet)
+    mutable bool planUsable = false;  // false: the plain retainPasses path is used
+    mutable std::vector<Item> plan;
+};
+
 void retainMaterials(const MeshData &mesh, size_t first = 0)
 {
     for (size_t i = first; i < mesh.materials.size(); ++i)
@@ -477,6 +561,11 @@ p3fes_frame_trace::DrawInfo drawInfo(const Frame &frame, const Draw &draw, uint3
     {
         info.kind = "mesh";
         textureName = firstTexture(mesh->state);
+    }
+    else if (const auto *shared = std::get_if<SharedMeshDraw>(&draw))
+    {
+        info.kind = "mesh";
+        textureName = firstTexture(*shared->state);
     }
     else if (const auto *transient = std::get_if<TransientMeshDraw>(&draw))
     {
@@ -706,6 +795,17 @@ void dumpFrame(const Frame &frame, const std::function<std::string(const ScreenD
                          static_cast<unsigned>(mesh->state.materialTextures.size()), mesh->state.lightingEnabled ? 1 : 0,
                          mesh->state.blendEnabled ? 1 : 0, mesh->state.depthTest ? 1 : 0,
                          mesh->state.depthWrite ? 1 : 0, static_cast<unsigned>(mesh->state.skinPalette.size()));
+        }
+        else if (const auto *shared = std::get_if<SharedMeshDraw>(&draw))
+        {
+            const MeshDrawState &st = *shared->state;
+            const std::string *name = nullptr;
+            for (const auto &texture : st.materialTextures)
+                if (!texture.empty()) { name = &texture; break; }
+            std::fprintf(stderr, "[p3fes-frame] %u mesh %llX (retained) tex=%s mats=%u lit=%d blend=%d depth=%d/%d colors-override=%u pos=%.0f,%.0f,%.0f\n", index,
+                         static_cast<unsigned long long>(shared->id), name ? name->c_str() : "-", static_cast<unsigned>(st.materialTextures.size()),
+                         st.lightingEnabled ? 1 : 0, st.blendEnabled ? 1 : 0, st.depthTest ? 1 : 0, st.depthWrite ? 1 : 0,
+                         static_cast<unsigned>(shared->colorCount), shared->model[12], shared->model[13], shared->model[14]);
         }
         else if (const auto *transient = std::get_if<TransientMeshDraw>(&draw))
         {
@@ -1276,6 +1376,75 @@ void drawMeshFromStock(MeshId id, const Matrix4 &model)
     finishLentState();
 }
 
+std::shared_ptr<const MeshDrawState> makeRetainedState(const MeshDrawState &state)
+{
+    return std::make_shared<const RetainedState>(state);
+}
+
+void drawMeshShared(MeshId id, const Matrix4 &model, const std::shared_ptr<const MeshDrawState> &state, const uint32_t *colors, uint32_t colorCount)
+{
+    if (!active() || !state)
+        return;
+    syncProducer();
+    if (g_buildingOpen)
+    {
+        // Same recording as drawMesh, with the retained state: its textures are retained for this frame as for any
+        // other draw (the frame keeps a reference to the definition each name resolves to now).
+        const RetainedState &retained = static_cast<const RetainedState &>(*state); // only makeRetainedState makes these
+        if (retained.planGen != g_textureTableGen)
+        {
+            retained.planGen = g_textureTableGen;
+            retained.plan.clear();
+            retained.planUsable = false;
+            const auto mesh = g_meshDefinitions.find(id);
+            if (mesh != g_meshDefinitions.end() && retained.materialTextures.size() >= mesh->second->materials.size())
+            {
+                retained.planUsable = true;
+                for (const auto &name : retained.materialTextures)
+                    if (!name.empty()) retained.plan.push_back({findTextureEntry(name), &name});
+                for (const auto &pass : retained.materialDualPasses)
+                    if (pass.enabled && !pass.textureName.empty()) retained.plan.push_back({findTextureEntry(pass.textureName), &pass.textureName});
+                for (const auto &pass : retained.materialEnvPasses)
+                    if (pass.enabled && !pass.textureName.empty()) retained.plan.push_back({findTextureEntry(pass.textureName), &pass.textureName});
+            }
+        }
+        if (retained.planUsable)
+        {
+            for (RetainedState::Item &item : retained.plan)
+            {
+                if (!item.entry)
+                {
+                    // no entry when the plan was made: look again (the texture may be defined by now)
+                    item.entry = findTextureEntry(*item.name);
+                    if (!item.entry) continue;
+                }
+                retainEntry(*item.entry);
+            }
+        }
+        else
+        {
+            MaterialCountSlot &slot = g_materialCountCache[((id * 0x9E3779B97F4A7C15ull) >> 56) & 255u];
+            if (!slot.valid || slot.id != id)
+            {
+                const auto mesh = g_meshDefinitions.find(id);
+                slot = mesh != g_meshDefinitions.end()
+                    ? MaterialCountSlot{id, static_cast<uint32_t>(mesh->second->materials.size()), true}
+                    : MaterialCountSlot{};
+            }
+            if (slot.valid && state->materialTextures.size() < slot.count)
+            {
+                const auto mesh = g_meshDefinitions.find(id);
+                if (mesh != g_meshDefinitions.end()) retainMaterials(*mesh->second, state->materialTextures.size());
+            }
+            retainPasses(*state);
+        }
+#if defined(PS2X_P3FES_FRAME_TRACE)
+        recordDrawOrigin();
+#endif
+        g_building.draws.emplace_back(std::in_place_type<SharedMeshDraw>, id, model, state, colors, colorCount);
+    }
+}
+
 void drawTransientMesh(MeshData mesh, const Matrix4 &model, MeshDrawState state)
 {
     if (!active() || mesh.vertices.empty())
@@ -1371,7 +1540,8 @@ void endFrame()
 #if defined(PS2X_P3FES_FRAME_TRACE)
     uint32_t meshCount = 0;
     for (const Draw &draw : g_building.draws)
-        if (std::holds_alternative<MeshDraw>(draw) || std::holds_alternative<TransientMeshDraw>(draw))
+        if (std::holds_alternative<MeshDraw>(draw) || std::holds_alternative<SharedMeshDraw>(draw) ||
+            std::holds_alternative<TransientMeshDraw>(draw))
             ++meshCount;
     p3fes_frame_trace::endProducer(g_building.trace,
         static_cast<uint32_t>(g_building.draws.size()), meshCount,
@@ -1396,6 +1566,9 @@ void endFrame()
             g_pending = std::move(g_building);
         }
     }
+    g_submittedFrames.fetch_add(1u, std::memory_order_relaxed);
+    if (superseded)
+        g_supersededFrames.fetch_add(1u, std::memory_order_relaxed);
     g_building = {};
     g_buildingOpen = false;
     ++g_cameraEpoch;
@@ -2145,8 +2318,12 @@ bool renderHostFrame()
         uint64_t submitStartNs = 0u;
 #endif
         const uint64_t drawStartUs = timing ? nowUs() : 0u;
-        if (const auto *mesh = std::get_if<MeshDraw>(&draw))
+        if (const auto *mesh = std::get_if<MeshDraw>(&draw); mesh || std::holds_alternative<SharedMeshDraw>(draw))
         {
+            // MeshDraw and SharedMeshDraw replay the same way; the shared one draws its retained state, with the colour
+            // override patched in when the draw has one.
+            const SharedMeshDraw *shared = mesh ? nullptr : &std::get<SharedMeshDraw>(draw);
+            const MeshId meshId = mesh ? mesh->id : shared->id;
             ++g_lastFrameMeshes;
             // P3FES_SKIP_MESH=<hex id>[,<hex id>...]: leave those meshes out (to find which draw paints what).
             static const std::vector<MeshId> skipped = [] {
@@ -2162,15 +2339,29 @@ bool renderHostFrame()
                     }
                 return ids;
             }();
-            if (!skipped.empty() && std::find(skipped.begin(), skipped.end(), mesh->id) != skipped.end())
+            if (!skipped.empty() && std::find(skipped.begin(), skipped.end(), meshId) != skipped.end())
                 continue;
             if (timing) ++g_timing.meshDraws;
-            const bool meshReady = ensureMesh(mesh->id);
+            const bool meshReady = ensureMesh(meshId);
 #if defined(PS2X_P3FES_FRAME_TRACE)
             if (traceDraw) submitStartNs = p3fes_frame_trace::nowNs();
 #endif
             if (meshReady)
-                g_renderer->drawMesh(mesh->id, mesh->model, mesh->state);
+            {
+                if (mesh)
+                    g_renderer->drawMesh(mesh->id, mesh->model, mesh->state);
+                else if (shared->colorCount)
+                {
+                    // retained state with this draw's own material colours: patch a copy (host thread only)
+                    static MeshDrawState patched;
+                    patched = *shared->state;
+                    for (uint32_t i = 0; i < shared->colorCount && i < patched.materialColors.size(); ++i)
+                        std::memcpy(patched.materialColors[i].data(), &shared->colorOverride[i], 4);
+                    g_renderer->drawMesh(shared->id, shared->model, patched);
+                }
+                else
+                    g_renderer->drawMesh(shared->id, shared->model, *shared->state);
+            }
         }
         else if (const auto *transient = std::get_if<TransientMeshDraw>(&draw))
         {
@@ -2260,8 +2451,8 @@ bool renderHostFrame()
         if (timing && !targetPass)
         {
             // mesh-like draws and the rest; the screen draws account for themselves
-            if (std::holds_alternative<MeshDraw>(draw) || std::holds_alternative<TransientMeshDraw>(draw) ||
-                std::holds_alternative<WorldLineDraw>(draw))
+            if (std::holds_alternative<MeshDraw>(draw) || std::holds_alternative<SharedMeshDraw>(draw) ||
+                std::holds_alternative<TransientMeshDraw>(draw) || std::holds_alternative<WorldLineDraw>(draw))
                 g_timing.meshes += nowUs() - drawStartUs;
             else if (!std::holds_alternative<ScreenDraw>(draw))
                 g_timing.other += nowUs() - drawStartUs;
@@ -2351,6 +2542,42 @@ bool renderHostFrame()
         g_timing.total += nowUs() - timingStart;
     }
     reportResources();
+    // P3FES_PRESENT_STATS=1: every 10 s, from this (host) thread, how many game frames were
+    // submitted, how many of them were replaced before being shown, and how many were presented.
+    {
+        static const bool stats = [] {
+            const char *value = std::getenv("P3FES_PRESENT_STATS");
+            return value && *value == '1';
+        }();
+        if (stats)
+        {
+            static auto windowStart = std::chrono::steady_clock::now();
+            static unsigned presented = 0u, lastSubmitted = 0u, lastSuperseded = 0u;
+            ++presented;
+            const auto now = std::chrono::steady_clock::now();
+            // Interval between consecutive presents in display refreshes (16.68 ms): an even
+            // 30 fps is all "2"; a mix of 1 and 3 is the same average shown unevenly.
+            static auto lastPresent = now;
+            static unsigned intervals[5] = {};
+            {
+                const double ms = std::chrono::duration<double, std::milli>(now - lastPresent).count();
+                const int fields = static_cast<int>(ms / 16.683 + 0.5);
+                ++intervals[fields <= 0 ? 0 : fields >= 4 ? 4 : fields];
+                lastPresent = now;
+            }
+            const double seconds = std::chrono::duration<double>(now - windowStart).count();
+            if (seconds >= 10.0)
+            {
+                const unsigned submitted = g_submittedFrames.load(std::memory_order_relaxed);
+                const unsigned superseded = g_supersededFrames.load(std::memory_order_relaxed);
+                std::fprintf(stderr, "[native-present] stats %.1fs submitted=%u superseded=%u presented=%u intervals 0:%u 1:%u 2:%u 3:%u 4+:%u\n",
+                             seconds, submitted - lastSubmitted, superseded - lastSuperseded, presented,
+                             intervals[0], intervals[1], intervals[2], intervals[3], intervals[4]);
+                for (unsigned &count : intervals) count = 0u;
+                lastSubmitted = submitted; lastSuperseded = superseded; presented = 0u; windowStart = now;
+            }
+        }
+    }
 #if defined(PS2X_P3FES_FRAME_TRACE)
     if (traceFrame)
     {

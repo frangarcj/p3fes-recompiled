@@ -13,6 +13,7 @@ inline void shutdownHost() {}
 
 #include "native_renderer/renderer.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,16 @@ nr::MeshDrawState acquireDrawState();
 nr::MeshDrawState &stockDrawState();
 void drawMeshFromStock(nr::MeshId id, const nr::Matrix4 &model);
 void dropStockDrawState();
+// Draws mesh `id` with a retained, immutable state that the caller keeps and re-submits frame after frame (the
+// static-atomic cache in p3fes_renderware.cpp). The frame holds a reference; the host reads it and never mutates or
+// recycles it. Equivalent to drawMesh(id, model, copy of *state), without the copy.
+// `colors` (colorCount <= 8, or null): the draw's own material colours, one RGBA word per material, replacing the
+// state's materialColors for this draw only (the retained state is never modified).
+// Copies `state` into a retained record for drawMeshShared (the only way to make one: it carries the producer's cached
+// texture lookups next to the state).
+std::shared_ptr<const nr::MeshDrawState> makeRetainedState(const nr::MeshDrawState &state);
+void drawMeshShared(nr::MeshId id, const nr::Matrix4 &model, const std::shared_ptr<const nr::MeshDrawState> &state,
+                    const uint32_t *colors = nullptr, uint32_t colorCount = 0);
 void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
 void setCamera(const nr::Camera &camera);
 // Producer side: bumped whenever the camera recorded in the frame under construction can have changed (frame begin

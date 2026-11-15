@@ -280,6 +280,10 @@ namespace
         static constexpr int kStages = 11;
         uint64_t ns[kStages] = {};      // time (mode 1) or instructions (mode 2)
         uint64_t cyc[kStages] = {};     // cycles (mode 2)
+        // Calls answered by the static-atomic cache (not counted in `calls`): prefix, ensure, camera, validate, submit.
+        static constexpr int kHitStages = 5;
+        uint64_t hitIns[kHitStages] = {}, hitCyc[kHitStages] = {};
+        uint64_t hitCalls = 0u;
         uint64_t calls = 0u, syncNs = 0u, syncCalls = 0u;
     };
     HookStageTimes g_hookTimes;
@@ -383,6 +387,75 @@ namespace
         // must separately reject NULL before treating it as an attribute buffer.
         return size <= PS2_RAM_SIZE && address <= PS2_RAM_SIZE - size;
     }
+
+    // Static-atomic cache (see staticAtomicEnabled below): the guest words a draw record was built from. A word is
+    // recorded with the bytes that matter (mask) and the value they had; the record is valid while every one of
+    // them still has it. Addresses are word aligned and inside RAM (checked when added).
+    struct StaticDep
+    {
+        uint32_t addr, value;
+    };
+    struct StaticMDep
+    {
+        uint32_t addr, mask, value;
+    };
+    struct DepRecorder
+    {
+        std::vector<StaticDep> full;
+        std::vector<StaticMDep> masked;
+        bool invalid = false; // a read the recorder cannot express, or a walk that ended abnormally: not cacheable
+        void clear()
+        {
+            full.clear();
+            masked.clear();
+            invalid = false;
+        }
+        // The bytes [addr, addr + size) of guest RAM, as they are now.
+        void add(const uint8_t *rdram, uint32_t addr, uint32_t size)
+        {
+            if (size == 0u || addr > PS2_RAM_SIZE - size)
+            {
+                invalid = true;
+                return;
+            }
+            const uint32_t end = addr + size;
+            for (uint32_t word = addr & ~3u; word < end; word += 4u)
+            {
+                const uint32_t lo = std::max(word, addr), hi = std::min(word + 4u, end);
+                uint32_t value = 0u;
+                std::memcpy(&value, rdram + word, 4u);
+                if (hi - lo == 4u)
+                {
+                    if (!full.empty() && full.back().addr == word)
+                        continue;
+                    full.push_back({word, value});
+                }
+                else
+                {
+                    const uint32_t mask = ((hi - lo == 2u ? 0xFFFFu : (hi - lo == 1u ? 0xFFu : 0xFFFFFFu))) << (8u * (lo - word));
+                    if (!masked.empty() && masked.back().addr == word && masked.back().mask == mask)
+                        continue;
+                    masked.push_back({word, mask, value & mask});
+                }
+            }
+        }
+        // The dependency on a 32-bit word that holds a pointer or number read as a whole.
+        void word(const uint8_t *rdram, uint32_t addr) { add(rdram, addr, 4u); }
+        // Only the given bits of the byte at `byteAddr` matter.
+        void bits(const uint8_t *rdram, uint32_t byteAddr, uint8_t bitMask)
+        {
+            if (byteAddr >= PS2_RAM_SIZE)
+            {
+                invalid = true;
+                return;
+            }
+            const uint32_t word = byteAddr & ~3u;
+            const uint32_t mask = static_cast<uint32_t>(bitMask) << (8u * (byteAddr - word));
+            uint32_t value = 0u;
+            std::memcpy(&value, rdram + word, 4u);
+            masked.push_back({word, mask, value & mask});
+        }
+    };
 
     struct AtomicSummary
     {
@@ -716,6 +789,7 @@ namespace
 #endif
 
     bool decodeNativeRaster(const uint8_t *rdram, uint32_t raster, TextureData &texture);
+    bool isCameraTextureRaster(const uint8_t *rdram, uint32_t raster);
     bool prepareNativeRasterTexture(const uint8_t *rdram, uint32_t raster, std::string &textureName);
     bool readMaterialUvTransform(const uint8_t *rdram, uint32_t material,
                                  MeshDrawState::UvTransform &out);
@@ -1285,16 +1359,29 @@ namespace
         return true;
     }
 
-    bool readNativeLighting(const uint8_t *rdram, bool worldGeometry, uint32_t object, MeshDrawState &state)
+    // `rec` (static-atomic cache, nullable): receives the guest words the result is a function of.
+    bool readNativeLighting(const uint8_t *rdram, bool worldGeometry, uint32_t object, MeshDrawState &state,
+                            DepRecorder *rec = nullptr)
     {
-        uint32_t world = 0u;
-        if (!readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldGlobalLightsOffset + 8u))
+        const auto dep = [&](uint32_t address, uint32_t size) {
+            if (rec)
+                rec->add(rdram, address, size);
+        };
+        const auto fail = [&]() {
+            if (rec)
+                rec->invalid = true;
             return false;
+        };
+        uint32_t world = 0u;
+        dep(kRwCurrentWorld, 4u);
+        if (!readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldGlobalLightsOffset + 8u))
+            return fail();
 
         const uint32_t sentinel = world + kWorldGlobalLightsOffset;
         uint32_t link = 0u;
+        dep(sentinel, 4u);
         if (!readGuest(rdram, sentinel, link))
-            return false;
+            return fail();
 
         state.lightingEnabled = true;
         state.ambientLight = {0.0f, 0.0f, 0.0f};
@@ -1304,18 +1391,20 @@ namespace
         for (uint32_t guard = 0u; link && link != sentinel && guard < 64u; ++guard)
         {
             if (link < kLightWorldLinkOffset || !guestPointer(link, 8u))
-                return false;
+                return fail();
             const uint32_t light = link - kLightWorldLinkOffset;
             if (!guestPointer(light, kLightWorldLinkOffset + 8u))
-                return false;
+                return fail();
 
             uint8_t type = 0u, flags = 0u;
+            dep(light + kLightTypeOffset, 2u); // type and flags are adjacent bytes
             if (!readGuest(rdram, light + kLightTypeOffset, type) ||
                 !readGuest(rdram, light + kLightFlagsOffset, flags))
-                return false;
+                return fail();
             if ((flags & targetFlag) != 0u)
             {
                 std::array<float, 4> color{};
+                dep(light + kLightColorOffset, 12u); // r, g, b (the fourth float is never used)
                 std::memcpy(color.data(), rdram + light + kLightColorOffset, sizeof(color));
                 const bool finiteColor = std::all_of(color.begin(), color.begin() + 3,
                                                      [](float v) { return std::isfinite(v); });
@@ -1328,8 +1417,10 @@ namespace
                 {
                     uint32_t frame = 0u;
                     Matrix4 ltm{};
+                    dep(light + kLightFrameOffset, 4u);
                     if (readGuest(rdram, light + kLightFrameOffset, frame) && readFrameMatrix(rdram, frame, ltm))
                     {
+                        dep(frame + kFrameLtmOffset + 32u, 12u); // the "at" row: the light's direction
                         MeshDrawState::DirectionalLight nativeLight;
                         nativeLight.direction = {ltm[8], ltm[9], ltm[10]};
                         nativeLight.color = {color[0], color[1], color[2]};
@@ -1337,8 +1428,9 @@ namespace
                     }
                 }
             }
+            dep(link, 4u);
             if (!readGuest(rdram, link, link))
-                return false;
+                return fail();
         }
 
         // A light reachable through several sectors is added once. Only appended lights need
@@ -1351,6 +1443,7 @@ namespace
                 return;
 
             uint8_t type = 0u, flags = 0u;
+            dep(light + kLightTypeOffset, 2u);
             if (!readGuest(rdram, light + kLightTypeOffset, type) ||
                 !readGuest(rdram, light + kLightFlagsOffset, flags) || (flags & targetFlag) == 0u ||
                 (type != kLightPoint && type != kLightSpot && type != kLightSoftSpot))
@@ -1360,10 +1453,16 @@ namespace
             std::array<float, 4> color{};
             uint32_t frame = 0u;
             Matrix4 ltm{};
+            dep(light + kLightRadiusOffset, 4u);
+            dep(light + kLightMinusCosAngleOffset, 4u);
+            dep(light + kLightFrameOffset, 4u);
             if (!readGuest(rdram, light + kLightRadiusOffset, radius) ||
                 !readGuest(rdram, light + kLightMinusCosAngleOffset, minusCos) ||
                 !readGuest(rdram, light + kLightFrameOffset, frame) || !readFrameMatrix(rdram, frame, ltm))
                 return;
+            dep(frame + kFrameLtmOffset + 32u, 12u); // direction row
+            dep(frame + kFrameLtmOffset + 48u, 12u); // position row
+            dep(light + kLightColorOffset, 12u);
             std::memcpy(color.data(), rdram + light + kLightColorOffset, sizeof(color));
             if (!(radius > 0.0f) || !std::isfinite(radius) || !std::isfinite(minusCos) ||
                 !std::all_of(color.begin(), color.begin() + 3, [](float v) { return std::isfinite(v); }))
@@ -1387,6 +1486,7 @@ namespace
                 return;
             const uint32_t sectorSentinel = sector + kSectorLightTiesOffset;
             uint32_t sectorLink = 0u;
+            dep(sectorSentinel, 4u);
             if (!readGuest(rdram, sectorSentinel, sectorLink))
                 return;
             for (uint32_t guard = 0u; sectorLink && sectorLink != sectorSentinel && guard < 64u; ++guard)
@@ -1394,10 +1494,12 @@ namespace
                 // Sector lists use the tie's sector link at +0; the light is
                 // the common tie object pointer at +8.
                 uint32_t light = 0u;
+                dep(sectorLink + kTieObjectOffset, 4u);
                 if (!guestPointer(sectorLink, kTieObjectOffset + 4u) ||
                     !readGuest(rdram, sectorLink + kTieObjectOffset, light))
                     return;
                 appendLocalLight(light);
+                dep(sectorLink, 4u);
                 if (!readGuest(rdram, sectorLink, sectorLink))
                     return;
             }
@@ -1411,6 +1513,7 @@ namespace
         {
             const uint32_t atomicSentinel = object + kAtomicSectorTiesOffset;
             uint32_t atomicLink = 0u;
+            dep(atomicSentinel, 4u);
             if (readGuest(rdram, atomicSentinel, atomicLink))
             {
                 for (uint32_t guard = 0u; atomicLink && atomicLink != atomicSentinel && guard < 64u; ++guard)
@@ -1420,9 +1523,11 @@ namespace
                         break;
                     const uint32_t tie = atomicLink - kTieObjectLinkOffset;
                     uint32_t sector = 0u;
+                    dep(tie + kTieSectorOffset, 4u);
                     if (guestPointer(tie, kTieSectorOffset + 4u) &&
                         readGuest(rdram, tie + kTieSectorOffset, sector))
                         walkSectorLights(sector);
+                    dep(atomicLink, 4u);
                     if (!readGuest(rdram, atomicLink, atomicLink))
                         break;
                 }
@@ -2531,14 +2636,16 @@ namespace
     constexpr uint32_t kAspectRatioNarrow = 0x3FAAAAABu; // 4/3
     constexpr float kHostAspect = 960.0f / 544.0f;
 
+    int g_widescreenModeCached = -1; // not a function-local static: applyWidescreen runs for every draw
     int widescreenMode()
     {
-        static const int mode = [] {
+        if (g_widescreenModeCached < 0)
+        {
             const char *value = std::getenv("P3FES_WIDESCREEN");
             const int parsed = value && *value ? std::atoi(value) : 2;
-            return parsed < 0 || parsed > 2 ? 2 : parsed;
-        }();
-        return mode;
+            g_widescreenModeCached = parsed < 0 || parsed > 2 ? 2 : parsed;
+        }
+        return g_widescreenModeCached;
     }
 
     void applyWidescreen(uint8_t *rdram)
@@ -2568,7 +2675,7 @@ namespace
                    readGuest(rdram, camera + 0x60u, raster) && openCameraTexture(rdram, raster);
         }
         closeCameraTexture();
-        if (!openNativeFrame(rdram))
+        if (!g_nativeFrameActive && !openNativeFrame(rdram)) // (openNativeFrame returns at once when the frame is open)
             return false;
         g_frameHasDisplayContent = true;
         return true;
@@ -2581,22 +2688,65 @@ namespace
     // This runs for every draw and the camera hardly ever changes between two of them, so the Camera
     // built from the guest is kept together with the guest words it was built from (these are all
     // that readCurrentCamera reads): while they are unchanged the same Camera comes back.
+    constexpr size_t kCameraKeyWords = 21u;
+    struct NativeCameraCache
+    {
+        bool valid = false;
+        bool ok = false;
+        bool submitted = false;      // setCamera(camera) was called and nothing recorded since changed the camera
+        uint64_t presentEpoch = 0u;  // p3fes_native_present::cameraEpoch() right after that call
+        uint32_t words[kCameraKeyWords]{};
+        Camera camera;
+    };
+    // At namespace scope (a function-local static pays a guard check on every call) and without a lazily initialised
+    // switch for the same reason: -1 until the first call.
+    NativeCameraCache g_nativeCameraCache;
+    int g_cutCameraEnv = -1;
+
     void captureNativeDrawCamera(const uint8_t *rdram)
     {
-        constexpr size_t kKeyWords = 21u;
-        struct CameraCache
-        {
-            bool valid = false;
-            bool ok = false;
-            bool submitted = false;      // setCamera(camera) was called and nothing recorded since changed the camera
-            uint64_t presentEpoch = 0u;  // p3fes_native_present::cameraEpoch() right after that call
-            uint32_t words[kKeyWords]{};
-            Camera camera;
-        };
+        constexpr size_t kKeyWords = kCameraKeyWords;
+        using CameraCache = NativeCameraCache;
         // P3FES_CUT_CAMERA=0: compare with memcmp and call setCamera for every draw (the previous behaviour).
-        static const bool cutCameraEnv = [] { const char *v = std::getenv("P3FES_CUT_CAMERA"); return !v || *v != '0'; }();
-        const bool cutCamera = cutCameraEnv && g_cutsOn;
-        static CameraCache cache;
+        if (g_cutCameraEnv < 0)
+        {
+            const char *v = std::getenv("P3FES_CUT_CAMERA");
+            g_cutCameraEnv = !v || *v != '0' ? 1 : 0;
+        }
+        const bool cutCamera = g_cutCameraEnv != 0 && g_cutsOn;
+        CameraCache &cache = g_nativeCameraCache;
+        if (cutCamera && cache.valid && cache.ok && cache.submitted && cache.presentEpoch == p3fes_native_present::cameraEpoch())
+        {
+            // The steady state (one camera, nothing recorded since its setCamera): compare the 21 guest words in place
+            // against the ones the Camera was built from, without gathering them first. The pointers were range-checked
+            // when the cache was filled, and equal values pass the same checks.
+            uint32_t cameraNow = 0u, frameNow = 0u;
+            std::memcpy(&cameraNow, rdram + kRwCurrentCamera, 4u);
+            if (cameraNow == cache.words[0] && (std::memcpy(&frameNow, rdram + cameraNow + kCameraFrameOffset, 4u), frameNow == cache.words[1]))
+            {
+                const auto ld = [](const uint8_t *at) {
+                    uint32_t v;
+                    std::memcpy(&v, at, 4u);
+                    return v;
+                };
+                const uint8_t *ltm = rdram + frameNow + kFrameLtmOffset;
+                const uint8_t *cam = rdram + cameraNow;
+                uint32_t diff = 0u;
+                for (uint32_t row = 0u; row < 4u; ++row)
+                    diff |= (ld(ltm + row * 16u + 0u) ^ cache.words[2u + row * 3u + 0u]) | (ld(ltm + row * 16u + 4u) ^ cache.words[2u + row * 3u + 1u]) |
+                            (ld(ltm + row * 16u + 8u) ^ cache.words[2u + row * 3u + 2u]);
+                diff |= (ld(cam + kCameraProjectionOffset) ^ cache.words[14]) | (ld(cam + kCameraViewWindowXOffset) ^ cache.words[15]) |
+                        (ld(cam + kCameraViewWindowYOffset) ^ cache.words[16]) | (ld(cam + kCameraViewOffsetXOffset) ^ cache.words[17]) |
+                        (ld(cam + kCameraViewOffsetYOffset) ^ cache.words[18]) | (ld(cam + kCameraNearPlaneOffset) ^ cache.words[19]) |
+                        (ld(cam + kCameraFarPlaneOffset) ^ cache.words[20]);
+                if (diff == 0u)
+                {
+                    if (cutVerifyEnabled())
+                        noteVerify(p3fes_native_present::setCameraWouldBeNoop(cache.camera), "camera", static_cast<uint32_t>(cache.presentEpoch));
+                    return;
+                }
+            }
+        }
         uint32_t cameraAddress = 0u, frame = 0u;
         if (!readGuest(rdram, kRwCurrentCamera, cameraAddress) ||
             !guestPointer(cameraAddress, kCameraFarPlaneOffset + sizeof(float)) ||
@@ -2662,6 +2812,896 @@ namespace
         }
     }
 
+    // ---- Static atomic cache (P3FES_STATIC_ATOMIC) --------------------------------------------------------------
+    // Most atomics of a scene (the shop's scenery: ~240 per frame) are drawn with exactly the same inputs frame after
+    // frame, and building their draw record (materials, GS state, lighting, matrix) costs ~3300 instructions each.
+    // A record built from guest memory is a pure function of the guest words it read plus a few host globals, so the
+    // cache keeps (a) the record, (b) the list of those words with the bytes that matter and the values they had, and
+    // (c) the host-side inputs; a later draw whose list still matches word for word re-submits the record untouched.
+    // Nothing is assumed about what the game does: every word is compared on every draw, so an atomic that is freed
+    // and reallocated, a material that is recoloured or a light that moves simply stops matching.
+    //
+    // What a record depends on, by stage:
+    //  inspect   atomic+2 render flag (bit 2), atomic+4 frame, atomic+0x18 geometry, atomic+0x50 current morph (16 bits);
+    //            geometry+0x10 triangles, +0x14 vertices, +0x18 morph targets, +0x2C triangle data, +0x5C morph array and
+    //            morph[0]+0x14 vertex data (what inspectAtomic validates)                                   [prefix list]
+    //  mesh      the geometry address and morph make the mesh id (defined once, as before); a mesh the game rewrites in
+    //            place (contentHash != 0), a dynamic one and a skinned one are never cached
+    //  matrix    frame+0xA0 update node and its dirty bit (a dirty frame needs the guest sync: full path), and the 12
+    //            LTM lanes the model matrix is made of. These are NOT part of the retained state: the entry keeps the
+    //            lanes it saw and, when they changed, rebuilds the model from the current ones (moving objects hit).
+    //  materials geometry+0x20/0x24 (array, count), per material: the pointer, colour, texture; per texture: the
+    //            filter/address word, the raster pointer and its type byte; the MatFX plugin offset, extension pointer
+    //            and effect word (materials with a MatFX effect 2..6 are not cached). Colours of atomics with at most
+    //            8 materials are compared apart: a changed colour (the pulsing light glows) does not invalidate, the
+    //            current colours travel with the draw (colour override). The names the rasters resolve to change only
+    //            when p3fes_native_rasters::epoch() does (then each raster's generation and revision are compared)
+    //  gsstate   the RenderWare/GS words readNativeGlobalMeshState used, each reduced to the bits it reads and the blend
+    //            and fog words only when their enable flag makes it read them (StaticGlobalKey); g_minAlphaVersion
+    //            (the texture alpha classes behind the solid-texture alpha-test rule)
+    //  lighting  geometry+8 lighting flag, and when set every word readNativeLighting read (DepRecorder): the world
+    //            pointer, the global light list (links, type and flags, colour, frame, direction row), the atomic's
+    //            sector ties and each sector's light ties and lights (radius, cone, frame, rows, colour)
+    //  skin      the skin plugin offset and geometry+offset (zero: not skinned)
+    //  pass      the render-target raster being recorded, and which draw of this atomic in the frame it is: entries are
+    //            keyed by (atomic, n-th draw, pass), because the game draws some atomics several times per frame
+    // Not part of a record, so not compared: the camera (captureNativeDrawCamera runs for every draw as before),
+    // widescreen, g_gsColorMasked (such draws never reach the cache).
+    enum class StaticMode : uint8_t { Off, On, Verify };
+    constexpr bool kStaticAtomicDefaultOn = true;
+    StaticMode staticAtomicMode()
+    {
+        static const StaticMode mode = [] {
+            const char *v = std::getenv("P3FES_STATIC_ATOMIC");
+            if (v && std::strcmp(v, "verify") == 0)
+                return StaticMode::Verify;
+            if (v && *v)
+                return *v == '0' ? StaticMode::Off : StaticMode::On;
+            return kStaticAtomicDefaultOn ? StaticMode::On : StaticMode::Off;
+        }();
+        return mode;
+    }
+    constexpr uint32_t kStaticSets = 512u, kStaticWays = 4u;
+    constexpr uint32_t kStaticMaxDeps = 600u, kStaticMaxColors = 8u;
+    constexpr uint8_t kStaticFree = 0u, kStaticSeen = 1u, kStaticRecorded = 2u, kStaticVolatile = 3u;
+    constexpr uint32_t kStaticMaxFails = 4u;
+    constexpr uint64_t kStaticVolatileFrames = 90u, kStaticNeverFrames = 900u;
+
+    struct StaticGlobalKey
+    {
+        uint32_t w[16];
+    };
+    struct StaticRasterRef
+    {
+        uint32_t raster;
+        p3fes_native_rasters::Version version;
+    };
+    struct StaticAtomicEntry
+    {
+        uint32_t keyAO = 0u;   // atomic | min(ordinal, 15) << 28: the key compared first (an atomic address is below 2^25)
+        uint32_t atomic = 0u, pass = 0u, ordinal = 0u; // ordinal: which draw of this atomic within the frame
+        uint8_t state = kStaticFree;
+        uint8_t fails = 0u, lastWhy = 0u; // lastWhy: 1 global key, 2 rasters, 3 dependency list, 4 prefix
+        uint64_t until = 0u;   // kStaticVolatile: frame number from which it is tried again
+        uint64_t lastUse = 0u;
+        MeshId meshId = 0u;
+        Matrix4 model{};
+        // The model matrix is not part of the retained state: a frame whose LTM changed (an object that moves while
+        // its materials, lights and GS state stay put) refreshes `model` from the 12 LTM lanes and reuses the state.
+        uint32_t frame = 0u, updateNode = 0u;
+        bool updateNodeValid = false;
+        uint32_t ltm[12] = {};
+        // Material colours: the draw's colour words are compared apart from the dependency list. A draw whose colours
+        // changed (the pulsing light glows) is not a miss: the retained state is submitted with the current colours
+        // attached (drawMeshShared's colour override), as long as the atomic has at most kStaticMaxColors materials.
+        std::vector<uint32_t> colorAddr; // per material: address of its colour word, 0 for the default white
+        uint32_t colorBase[8] = {};      // the colour words the retained state holds
+        std::shared_ptr<const MeshDrawState> record;
+        StaticGlobalKey key{};
+        uint64_t rasterEpoch = 0u;
+        std::vector<StaticRasterRef> rasters;
+        DepRecorder prefix, rest;
+        uint32_t fullEnd[2] = {}, maskedEnd[2] = {}; // end of the matrix and of the material sections of `rest` (the rest is lighting)
+    };
+    struct StaticStats
+    {
+        uint64_t hits = 0u, fullFirst = 0u, fullFailed = 0u, fullVolatile = 0u, recorded = 0u, uncacheable = 0u, rasterRechecks = 0u;
+        uint64_t verified = 0u, verifyBad = 0u, depWords = 0u, recordWords = 0u;
+        uint32_t entries = 0u;
+        uint32_t whyMiss[8] = {};
+        uint64_t sectionMiss[6] = {}; // P3FES_STATIC_DIAG: first stale word by section (full: matrix, materials, lighting; masked: the same)
+    };
+    StaticStats g_static, g_staticWindow;
+    // P3FES_STATIC_DIAG=1: the guest word whose change made a record stale, by address (reported every 5 s).
+    struct StaticMissInfo
+    {
+        uint64_t count = 0u;
+        uint32_t atomic = 0u, index = 0u, total = 0u, oldValue = 0u, newValue = 0u, ordinal = 0u;
+        MeshId mesh = 0u;
+    };
+    std::unordered_map<uint32_t, StaticMissInfo> g_staticMiss;
+    std::vector<StaticAtomicEntry *> g_staticTable; // kStaticSets x kStaticWays slots, entries allocated on demand
+    uint64_t g_staticClock = 0u;
+    bool g_staticAltOff = false; // P3FES_STATIC_ALTERNATE: the cache is switched off for this phase of the run
+
+    inline uint32_t staticKeyAO(uint32_t atomic, uint32_t ordinal) { return atomic | (std::min(ordinal, 15u) << 28u); }
+    inline uint32_t staticSet(uint32_t keyAO) { return ((keyAO * 0x9E3779B1u) >> 23u) & (kStaticSets - 1u); }
+
+    StaticAtomicEntry *staticFindPass(uint32_t keyAO, uint32_t pass)
+    {
+        if (g_staticTable.empty())
+            return nullptr;
+        StaticAtomicEntry *const *set = &g_staticTable[staticSet(keyAO) * kStaticWays];
+        for (uint32_t w = 0u; w < kStaticWays; ++w)
+            if (set[w] && set[w]->keyAO == keyAO && set[w]->pass == pass && set[w]->state != kStaticFree)
+                return set[w];
+        return nullptr;
+    }
+    // Any recorded way of the atomic's n-th draw (the pass is not known yet when the inspect-equivalent prefix is tested).
+    inline StaticAtomicEntry *staticFindRecorded(uint32_t keyAO)
+    {
+        if (g_staticTable.empty())
+            return nullptr;
+        StaticAtomicEntry *const *set = &g_staticTable[staticSet(keyAO) * kStaticWays];
+        for (uint32_t w = 0u; w < kStaticWays; ++w)
+            if (set[w] && set[w]->keyAO == keyAO && set[w]->state == kStaticRecorded)
+                return set[w];
+        return nullptr;
+    }
+    StaticAtomicEntry *staticAllocate(uint32_t atomic, uint32_t ordinal, uint32_t pass)
+    {
+        if (g_staticTable.empty())
+            g_staticTable.assign(static_cast<size_t>(kStaticSets) * kStaticWays, nullptr);
+        const uint32_t keyAO = staticKeyAO(atomic, ordinal);
+        StaticAtomicEntry **set = &g_staticTable[staticSet(keyAO) * kStaticWays];
+        // Entries are allocated when first needed and live as long as their way does: the table is 8 KB of pointers,
+        // memory follows the number of atomics seen.
+        StaticAtomicEntry **victim = &set[0];
+        for (uint32_t w = 0u; w < kStaticWays; ++w)
+        {
+            if (!set[w])
+            {
+                victim = &set[w];
+                break;
+            }
+            if (set[w]->lastUse < (*victim)->lastUse)
+                victim = &set[w];
+        }
+        if (!*victim)
+        {
+            *victim = new StaticAtomicEntry();
+            ++g_static.entries;
+        }
+        else
+            **victim = StaticAtomicEntry{};
+        StaticAtomicEntry *e = *victim;
+        e->keyAO = keyAO;
+        e->atomic = atomic;
+        e->ordinal = ordinal;
+        e->pass = pass;
+        e->state = kStaticSeen;
+        e->lastUse = g_staticClock;
+        return e;
+    }
+    // How many times the atomic was drawn so far in this native frame (0 for the first). Entries are keyed by it: the
+    // game draws some atomics twice per frame with different material colours or states, and the two draws must not
+    // share (and keep overwriting) one record. A direct-mapped table; a collision only costs hits, never correctness.
+    struct StaticOrdinalSlot
+    {
+        uint32_t atomic = 0u;
+        uint32_t count = 0u;
+        uint64_t frame = ~uint64_t{0};
+    };
+    StaticOrdinalSlot g_staticOrdinals[2048];
+    uint64_t g_staticFrameEpoch = 0u; // bumped each time a native frame is ended (finishNativeFrame)
+    inline uint32_t staticNextOrdinal(uint32_t atomic)
+    {
+        StaticOrdinalSlot &slot = g_staticOrdinals[((atomic * 0x9E3779B1u) >> 21u) & 2047u];
+        if (slot.atomic != atomic || slot.frame != g_staticFrameEpoch)
+        {
+            slot.atomic = atomic;
+            slot.frame = g_staticFrameEpoch;
+            slot.count = 0u;
+        }
+        return slot.count++;
+    }
+
+    inline uint32_t staticLoad(const uint8_t *rdram, uint32_t addr)
+    {
+        uint32_t w;
+        std::memcpy(&w, rdram + addr, 4u);
+        return w;
+    }
+    inline bool staticDepsMatch(const uint8_t *rdram, const DepRecorder &d)
+    {
+        const StaticDep *f = d.full.data(), *fe = f + d.full.size();
+        for (; f + 4 <= fe; f += 4)
+        {
+            // four words per branch: the mismatch is the rare case
+            const uint32_t diff = (staticLoad(rdram, f[0].addr) ^ f[0].value) | (staticLoad(rdram, f[1].addr) ^ f[1].value) |
+                                  (staticLoad(rdram, f[2].addr) ^ f[2].value) | (staticLoad(rdram, f[3].addr) ^ f[3].value);
+            if (diff)
+                return false;
+        }
+        for (; f != fe; ++f)
+            if (staticLoad(rdram, f->addr) != f->value)
+                return false;
+        const StaticMDep *m = d.masked.data(), *me = m + d.masked.size();
+        for (; m != me; ++m)
+            if ((staticLoad(rdram, m->addr) & m->mask) != m->value)
+                return false;
+        return true;
+    }
+
+    // The host/RenderWare-global inputs of readNativeGlobalMeshState, reduced to the bits it uses and (for blend and
+    // fog) only when the enable flag makes it read them.
+    inline void staticReadGlobalKey(const uint8_t *rdram, StaticGlobalKey &k)
+    {
+        const auto ld = [&](uint32_t a) {
+            uint32_t v;
+            std::memcpy(&v, rdram + a, 4u);
+            return v;
+        };
+        k.w[0] = ld(kRwZbuf1 + 4u) & 1u;    // ZBUF.ZMSK
+        k.w[1] = ld(kRwTest1) & 0x63FFFu;   // ATE, ATST, AREF, AFAIL, ZTST
+        k.w[2] = ld(kRwCullMode);
+        k.w[3] = ld(kRwClamp1) & 0xFu;      // WMS, WMT
+        k.w[4] = ld(kRwTex1) & 0x20u;       // MMAG
+        const uint32_t flags = ld(kRwRenderFlags) & static_cast<uint32_t>(kGsPrimAlphaBlendEnable | kGsPrimGouraud | kGsPrimFogEnable);
+        k.w[5] = flags;
+        k.w[6] = k.w[7] = k.w[8] = k.w[9] = k.w[10] = k.w[11] = k.w[12] = k.w[13] = 0u;
+        if (flags & kGsPrimAlphaBlendEnable)
+        {
+            k.w[6] = ld(kRwSrcBlend);
+            k.w[7] = ld(kRwDstBlend);
+            k.w[8] = ld(kRwAlpha1) & 0xFFu;
+            k.w[9] = ld(kRwAlpha1 + 4u) & 0xFFu;
+        }
+        if (flags & kGsPrimFogEnable)
+        {
+            k.w[10] = ld(kRwFogCol) & 0xFFFFFFu;
+            const uint32_t camera = ld(kRwCurrentCamera);
+            k.w[11] = camera;
+            if (camera <= PS2_RAM_SIZE - (kCameraFogPlaneOffset + 4u))
+            {
+                k.w[12] = ld(camera + kCameraFogPlaneOffset);
+                k.w[13] = ld(camera + kCameraFarPlaneOffset);
+            }
+        }
+        k.w[14] = g_minAlphaVersion;
+        k.w[15] = 0u;
+    }
+    inline bool staticKeyEqual(const StaticGlobalKey &a, const StaticGlobalKey &b)
+    {
+        for (int i = 0; i < 16; ++i)
+            if (a.w[i] != b.w[i])
+                return false;
+        return true;
+    }
+    // staticReadGlobalKey + staticKeyEqual without the intermediate key: the same fields, compared as they are loaded
+    // (the blend and fog words are zero in a key whose flags do not enable them, so they are only read when enabled).
+    inline bool staticKeyMatches(const uint8_t *rdram, const StaticGlobalKey &k)
+    {
+        const uint32_t flags = staticLoad(rdram, kRwRenderFlags) & static_cast<uint32_t>(kGsPrimAlphaBlendEnable | kGsPrimGouraud | kGsPrimFogEnable);
+        uint32_t diff = (flags ^ k.w[5]) | ((staticLoad(rdram, kRwZbuf1 + 4u) & 1u) ^ k.w[0]) | ((staticLoad(rdram, kRwTest1) & 0x63FFFu) ^ k.w[1]) |
+                        (staticLoad(rdram, kRwCullMode) ^ k.w[2]) | ((staticLoad(rdram, kRwClamp1) & 0xFu) ^ k.w[3]) |
+                        ((staticLoad(rdram, kRwTex1) & 0x20u) ^ k.w[4]) | (g_minAlphaVersion ^ k.w[14]);
+        if (flags & kGsPrimAlphaBlendEnable)
+            diff |= (staticLoad(rdram, kRwSrcBlend) ^ k.w[6]) | (staticLoad(rdram, kRwDstBlend) ^ k.w[7]) |
+                    ((staticLoad(rdram, kRwAlpha1) & 0xFFu) ^ k.w[8]) | ((staticLoad(rdram, kRwAlpha1 + 4u) & 0xFFu) ^ k.w[9]);
+        if (flags & kGsPrimFogEnable)
+        {
+            const uint32_t camera = staticLoad(rdram, kRwCurrentCamera);
+            diff |= ((staticLoad(rdram, kRwFogCol) & 0xFFFFFFu) ^ k.w[10]) | (camera ^ k.w[11]);
+            if (camera <= PS2_RAM_SIZE - (kCameraFogPlaneOffset + 4u))
+                diff |= (staticLoad(rdram, camera + kCameraFogPlaneOffset) ^ k.w[12]) | (staticLoad(rdram, camera + kCameraFarPlaneOffset) ^ k.w[13]);
+            else
+                diff |= k.w[12] | k.w[13];
+        }
+        return diff == 0u;
+    }
+
+    bool staticRastersValid(StaticAtomicEntry &e)
+    {
+        const uint64_t epoch = p3fes_native_rasters::epoch();
+        if (e.rasterEpoch == epoch)
+            return true;
+        ++g_static.rasterRechecks;
+        for (const StaticRasterRef &ref : e.rasters)
+        {
+            const auto now = p3fes_native_rasters::version(ref.raster);
+            if (now.generation != ref.version.generation || now.revision != ref.version.revision)
+                return false;
+        }
+        e.rasterEpoch = epoch;
+        return true;
+    }
+
+    // Cache lines the validation is about to read: the dependency lists themselves and every guest word in them are
+    // loaded as plain independent loads, but the in-order-ish front end of the Vita's Cortex-A9 stalls on the first
+    // miss of a dependent chain (entry -> list -> word); a prefetch pass overlaps those misses (P3FES_STATIC_PREFETCH=0
+    // turns it off for A/B).
+    inline void staticPrefetch(const uint8_t *rdram, const StaticAtomicEntry &e)
+    {
+        const StaticDep *f = e.rest.full.data(), *fe = f + e.rest.full.size();
+        for (; f != fe; ++f)
+            __builtin_prefetch(rdram + f->addr);
+        const StaticMDep *m = e.rest.masked.data(), *me = m + e.rest.masked.size();
+        for (; m != me; ++m)
+            __builtin_prefetch(rdram + m->addr);
+        __builtin_prefetch(rdram + e.frame + kFrameLtmOffset);
+        __builtin_prefetch(rdram + e.frame + kFrameLtmOffset + 0x20u);
+        __builtin_prefetch(rdram + e.frame + 0xA0u);
+        for (const uint32_t address : e.colorAddr)
+            if (address)
+                __builtin_prefetch(rdram + address);
+    }
+
+    // The inspect-equivalent prefix: true when inspectAtomic would succeed and the atomic is renderable.
+    inline bool staticPrefixValid(const uint8_t *rdram, const StaticAtomicEntry &e) { return staticDepsMatch(rdram, e.prefix); }
+
+    // The frame's matrix: not dirty (the guest sync would have to run), and the LTM lanes the model is made of. A
+    // moved frame is not a miss: `model` is rebuilt from the lanes, exactly as readRwMatrix does.
+    inline bool staticModelValid(const uint8_t *rdram, StaticAtomicEntry &e)
+    {
+        if (staticLoad(rdram, e.frame + 0xA0u) != e.updateNode)
+            return false;
+        if (e.updateNodeValid && (rdram[e.updateNode + 3u] & 1u))
+            return false;
+        const uint8_t *ltm = rdram + e.frame + kFrameLtmOffset;
+        uint32_t diff = 0u;
+        for (uint32_t row = 0u; row < 4u; ++row)
+            diff |= (staticLoad(ltm, row * 16u + 0u) ^ e.ltm[row * 3u + 0u]) | (staticLoad(ltm, row * 16u + 4u) ^ e.ltm[row * 3u + 1u]) |
+                    (staticLoad(ltm, row * 16u + 8u) ^ e.ltm[row * 3u + 2u]);
+        if (diff != 0u)
+        {
+            uint32_t lanes[12];
+            for (uint32_t row = 0u; row < 4u; ++row)
+            {
+                lanes[row * 3u + 0u] = staticLoad(ltm, row * 16u + 0u);
+                lanes[row * 3u + 1u] = staticLoad(ltm, row * 16u + 4u);
+                lanes[row * 3u + 2u] = staticLoad(ltm, row * 16u + 8u);
+            }
+            std::memcpy(e.ltm, lanes, sizeof(lanes));
+            float f[12];
+            std::memcpy(f, lanes, sizeof(f));
+            e.model = {f[0], f[1], f[2], 0.0f, f[3], f[4], f[5], 0.0f, f[6], f[7], f[8], 0.0f, f[9], f[10], f[11], 1.0f};
+        }
+        return true;
+    }
+
+    // The rest of the test; why: 1 global key, 2 rasters, 3 dependency list, 5 matrix (dirty frame). `colors`
+    // receives the current colour word of each material and `colorsChanged` says whether any differs from the retained
+    // state's (then the draw carries them as an override).
+    inline bool staticRestValid(const uint8_t *rdram, StaticAtomicEntry &e, uint32_t &why, uint32_t *colors, bool &colorsChanged)
+    {
+        colorsChanged = false;
+        if (!staticKeyMatches(rdram, e.key))
+        {
+            why = 1u;
+            return false;
+        }
+        if (!staticRastersValid(e))
+        {
+            why = 2u;
+            return false;
+        }
+        if (!staticDepsMatch(rdram, e.rest))
+        {
+            why = 3u;
+            static const bool diag = [] { const char *v = std::getenv("P3FES_STATIC_DIAG"); return v && *v == '1'; }();
+            if (diag)
+            {
+                // which section moved: 0 matrix, 1 skin + materials, 2 lighting (first mismatch of each list)
+                for (size_t i = 0u; i < e.rest.masked.size(); ++i)
+                {
+                    uint32_t w;
+                    std::memcpy(&w, rdram + e.rest.masked[i].addr, 4u);
+                    if ((w & e.rest.masked[i].mask) != e.rest.masked[i].value)
+                    {
+                        ++g_static.sectionMiss[3u + (i < e.maskedEnd[0] ? 0u : i < e.maskedEnd[1] ? 1u : 2u)];
+                        break;
+                    }
+                }
+                for (size_t i = 0u; i < e.rest.full.size(); ++i)
+                    if (std::memcmp(rdram + e.rest.full[i].addr, &e.rest.full[i].value, 4u) != 0)
+                    {
+                        ++g_static.sectionMiss[i < e.fullEnd[0] ? 0u : i < e.fullEnd[1] ? 1u : 2u];
+                        break;
+                    }
+                // which word moved (first one in list order: skin, materials, then lighting)
+                for (size_t i = 0u; i < e.rest.full.size(); ++i)
+                {
+                    uint32_t w;
+                    std::memcpy(&w, rdram + e.rest.full[i].addr, 4u);
+                    if (w != e.rest.full[i].value)
+                    {
+                        StaticMissInfo &m = g_staticMiss[e.rest.full[i].addr];
+                        ++m.count;
+                        m.atomic = e.atomic;
+                        m.index = static_cast<uint32_t>(i);
+                        m.total = static_cast<uint32_t>(e.rest.full.size());
+                        m.mesh = e.meshId;
+                        m.oldValue = e.rest.full[i].value;
+                        m.newValue = w;
+                        m.ordinal = e.ordinal;
+                        break;
+                    }
+                }
+            }
+            return false;
+        }
+        if (!staticModelValid(rdram, e))
+        {
+            why = 5u;
+            return false;
+        }
+        const uint32_t n = static_cast<uint32_t>(e.colorAddr.size());
+        if (n != 0u)
+        {
+            uint32_t diff = 0u;
+            for (uint32_t i = 0u; i < n; ++i)
+            {
+                colors[i] = e.colorAddr[i] ? staticLoad(rdram, e.colorAddr[i]) : 0xFFFFFFFFu;
+                diff |= colors[i] ^ e.colorBase[i];
+            }
+            static const char *fault = std::getenv("P3FES_STATIC_FAULT");
+            colorsChanged = diff != 0u && !(fault && !std::strcmp(fault, "colors"));
+        }
+        return true;
+    }
+
+    // Builds the dependency lists and keeps a copy of the record. `lightRec` holds what readNativeLighting read (when
+    // the geometry is lit). False: this atomic cannot be cached (the reason is in `why`).
+    bool staticBuildRecord(uint8_t *rdram, StaticAtomicEntry &e, const AtomicSummary &summary, MeshId meshId,
+                           const Matrix4 &model, const MeshDrawState &state, const DepRecorder &lightRec, const char *&why)
+    {
+        why = nullptr;
+        if (lightRec.invalid)
+        {
+            why = "lighting-walk";
+            return false;
+        }
+        DepRecorder &p = e.prefix;
+        DepRecorder &r = e.rest;
+        p.clear();
+        r.clear();
+        e.rasters.clear();
+        e.colorAddr.clear();
+        const uint32_t atomic = summary.atomic, geometry = summary.geometry;
+
+        // inspect prefix
+        p.bits(rdram, atomic + kAtomicFlagsOffset, kAtomicRenderFlag);
+        p.word(rdram, atomic + kAtomicFrameOffset);
+        p.word(rdram, atomic + kAtomicGeometryOffset);
+        p.add(rdram, atomic + kAtomicCurrentMorphOffset, 2u);
+        p.word(rdram, geometry + kGeometryNumTrianglesOffset);
+        p.word(rdram, geometry + kGeometryNumVerticesOffset);
+        p.word(rdram, geometry + kGeometryNumMorphTargetsOffset);
+        p.word(rdram, geometry + kGeometryTrianglesOffset);
+        p.word(rdram, geometry + kGeometryMorphTargetsOffset);
+        if (summary.morphTargets > 0u)
+        {
+            uint32_t morphData = 0u;
+            readGuest(rdram, geometry + kGeometryMorphTargetsOffset, morphData);
+            p.word(rdram, morphData + kMorphVerticesOffset);
+        }
+        if (p.invalid)
+        {
+            why = "prefix";
+            return false;
+        }
+
+        // matrix: the frame must not need the guest sync, and the model must be what the LTM lanes give
+        const uint32_t frame = summary.frame;
+        e.frame = frame;
+        e.updateNode = 0u;
+        readGuest(rdram, frame + 0xA0u, e.updateNode);
+        e.updateNodeValid = guestPointer(e.updateNode, 4u);
+        if (e.updateNodeValid && (rdram[e.updateNode + 3u] & 1u))
+        {
+            why = "frame-dirty";
+            return false;
+        }
+        for (uint32_t row = 0u; row < 4u; ++row)
+            for (uint32_t lane = 0u; lane < 3u; ++lane)
+                std::memcpy(&e.ltm[row * 3u + lane], rdram + frame + kFrameLtmOffset + row * 16u + lane * 4u, 4u);
+        {
+            Matrix4 fromLtm{};
+            if (!readFrameMatrix(rdram, frame, fromLtm) || std::memcmp(fromLtm.data(), model.data(), sizeof(float) * 16u) != 0)
+            {
+                why = "model-differs";
+                return false;
+            }
+        }
+        e.fullEnd[0] = static_cast<uint32_t>(r.full.size());
+        e.maskedEnd[0] = static_cast<uint32_t>(r.masked.size());
+        // geometry flags (lighting) and skin
+        r.bits(rdram, geometry + kGeometryFlagsOffset, static_cast<uint8_t>(kGeometryLightingFlag));
+        {
+            uint32_t extensionOffset = 0u;
+            r.word(rdram, kSkinGeometryExtensionOffset);
+            if (readGuest(rdram, kSkinGeometryExtensionOffset, extensionOffset) && extensionOffset != 0u &&
+                guestPointer(geometry + extensionOffset, 4u))
+            {
+                uint32_t skin = 0u;
+                readGuest(rdram, geometry + extensionOffset, skin);
+                if (skin != 0u)
+                {
+                    why = "skinned";
+                    return false;
+                }
+                r.word(rdram, geometry + extensionOffset);
+            }
+        }
+
+        // materials
+        r.word(rdram, geometry + kGeometryMatListArrayOffset);
+        r.word(rdram, geometry + kGeometryMatListCountOffset);
+        {
+            uint32_t materialArray = 0u;
+            int32_t materialCount = 0;
+            if (readGuest(rdram, geometry + kGeometryMatListArrayOffset, materialArray) &&
+                readGuest(rdram, geometry + kGeometryMatListCountOffset, materialCount) &&
+                materialCount > 0 && materialCount <= 4096 &&
+                guestPointer(materialArray, static_cast<uint32_t>(materialCount) * 4u))
+            {
+                uint32_t pluginOffset = 0u;
+                r.word(rdram, kRwMatFxPluginOffset);
+                readGuest(rdram, kRwMatFxPluginOffset, pluginOffset);
+                const bool colorsApart = static_cast<uint32_t>(materialCount) <= kStaticMaxColors;
+                if (colorsApart)
+                {
+                    e.colorAddr.assign(static_cast<size_t>(materialCount), 0u);
+                    for (uint32_t c = 0u; c < kStaticMaxColors; ++c)
+                        e.colorBase[c] = 0xFFFFFFFFu;
+                }
+                for (int32_t i = 0; i < materialCount; ++i)
+                {
+                    uint32_t material = 0u;
+                    r.word(rdram, materialArray + static_cast<uint32_t>(i) * 4u);
+                    if (!readGuest(rdram, materialArray + static_cast<uint32_t>(i) * 4u, material) || !material ||
+                        !guestPointer(material, 8u))
+                        continue;
+                    if (colorsApart)
+                    {
+                        e.colorAddr[static_cast<size_t>(i)] = material + kMaterialColorOffset;
+                        readGuest(rdram, material + kMaterialColorOffset, e.colorBase[i]);
+                    }
+                    else
+                        r.word(rdram, material + kMaterialColorOffset);
+                    r.word(rdram, material + kMaterialTextureOffset);
+                    uint32_t texture = 0u;
+                    readGuest(rdram, material + kMaterialTextureOffset, texture);
+                    if (texture)
+                    {
+                        if (guestPointer(texture, kTextureFilterAddressOffset + 4u))
+                            r.add(rdram, texture + kTextureFilterAddressOffset, 2u); // filter, address U/V
+                        r.word(rdram, texture + kTextureRasterOffset);
+                        uint32_t raster = 0u;
+                        if (readGuest(rdram, texture + kTextureRasterOffset, raster) && raster)
+                        {
+                            if (isCameraTextureRaster(rdram, raster))
+                            {
+                                why = "camera-texture";
+                                return false;
+                            }
+                            if (!guestPointer(raster, 52u))
+                            {
+                                why = "raster-range";
+                                return false;
+                            }
+                            r.bits(rdram, raster + 32u, 0x07u);
+                            if (static_cast<size_t>(i) >= state.materialTextures.size() || state.materialTextures[static_cast<size_t>(i)].empty())
+                            {
+                                why = "texture-unresolved";
+                                return false;
+                            }
+                            bool known = false;
+                            for (const StaticRasterRef &ref : e.rasters)
+                                known |= ref.raster == raster;
+                            if (!known)
+                                e.rasters.push_back({raster, p3fes_native_rasters::version(raster)});
+                        }
+                    }
+                    if (pluginOffset != 0u && guestPointer(material + pluginOffset, 4u))
+                    {
+                        r.word(rdram, material + pluginOffset);
+                        uint32_t extension = 0u;
+                        if (readGuest(rdram, material + pluginOffset, extension) && extension &&
+                            guestPointer(extension, kMatFxEffectOffset + 4u))
+                        {
+                            r.word(rdram, extension + kMatFxEffectOffset);
+                            uint32_t effect = 0u;
+                            readGuest(rdram, extension + kMatFxEffectOffset, effect);
+                            if (effect >= kMatFxEnv && effect <= kMatFxDualUvTransform)
+                            {
+                                why = "matfx";
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        e.fullEnd[1] = static_cast<uint32_t>(r.full.size());
+        e.maskedEnd[1] = static_cast<uint32_t>(r.masked.size());
+        // lighting
+        // P3FES_STATIC_FAULT=lighting|materials|colors (verify-mode self-check only): leave that part of the dependency list
+        // out on purpose, to see that the verify run does find the stale records that follow.
+        static const char *fault = std::getenv("P3FES_STATIC_FAULT");
+        if (fault && !std::strcmp(fault, "materials"))
+        {
+            r.full.resize(e.fullEnd[0]);
+            r.masked.resize(e.maskedEnd[0]);
+            e.fullEnd[1] = e.fullEnd[0];
+            e.maskedEnd[1] = e.maskedEnd[0];
+        }
+        if ((summary.geometryFlags & kGeometryLightingFlag) != 0u && !(fault && !std::strcmp(fault, "lighting")))
+        {
+            r.full.insert(r.full.end(), lightRec.full.begin(), lightRec.full.end());
+            r.masked.insert(r.masked.end(), lightRec.masked.begin(), lightRec.masked.end());
+        }
+        if (r.invalid)
+        {
+            why = "rest";
+            return false;
+        }
+        if (r.full.size() + r.masked.size() > kStaticMaxDeps)
+        {
+            why = "too-many-deps";
+            return false;
+        }
+        staticReadGlobalKey(rdram, e.key);
+        e.rasterEpoch = p3fes_native_rasters::epoch();
+        e.meshId = meshId;
+        e.model = model;
+        e.record = p3fes_native_present::makeRetainedState(state);
+        g_static.recordWords += r.full.size() + r.masked.size();
+        return true;
+    }
+
+    // P3FES_STATIC_DIAG=1 / verify: the dependency list per stage, printed once, so a verify log says what it checked.
+    void staticDescribe()
+    {
+        std::fputs(
+            "[p3fes-static] what a retained draw record depends on (the cache re-submits it only while all of this still holds):\n"
+            "[p3fes-static]   prefix (inspectAtomic + render flag, tested before the frame is touched): atomic+2 bit 2, atomic+4 frame,\n"
+            "[p3fes-static]     atomic+0x18 geometry, atomic+0x50 current morph (16 bits); geometry+0x10 triangles, +0x14 vertices,\n"
+            "[p3fes-static]     +0x18 morph targets, +0x2C triangle data, +0x5C morph array and morph[0]+0x14 vertex data\n"
+            "[p3fes-static]   key (readNativeGlobalMeshState): ZBUF.ZMSK, TEST (ATE ATST AREF AFAIL ZTST), cull mode, CLAMP, TEX1.MMAG,\n"
+            "[p3fes-static]     render flags (blend, gouraud, fog), then only when enabled: src/dst blend + ALPHA_1 low/high byte, fog colour +\n"
+            "[p3fes-static]     camera pointer, fog plane and far plane; and the texture alpha-class version (g_minAlphaVersion)\n"
+            "[p3fes-static]   rasters: p3fes_native_rasters::epoch() (then each raster's generation and revision)\n"
+            "[p3fes-static]   list: skin plugin offset + geometry+offset (zero), MatFX plugin offset, geometry+8 lighting flag,\n"
+            "[p3fes-static]     geometry+0x20/0x24 material array and count; per material: array entry, colour (apart, see below), texture pointer;\n"
+            "[p3fes-static]     per texture: filter/address word (16 bits), raster pointer, raster type byte (3 bits); MatFX extension pointer and\n"
+            "[p3fes-static]     effect word; and, for lit geometry, every word readNativeLighting read: world pointer, the global light list\n"
+            "[p3fes-static]     (links, type+flags, colour, frame, direction row), the atomic's sector ties and each sector's light ties and\n"
+            "[p3fes-static]     lights (radius, cone, frame, direction and position rows, colour)\n"
+            "[p3fes-static]   matrix (not part of the retained state): frame+0xA0 update node and its dirty bit, the 12 LTM lanes (a moved\n"
+            "[p3fes-static]     frame rebuilds the model matrix, a dirty one goes to the full path); colours: one word per material (<= 8), sent\n"
+            "[p3fes-static]     with the draw as an override when they differ from the state's\n"
+            "[p3fes-static]   never cached: skinned or content-hashed geometry, MatFX effects 2..6, camera-texture rasters, an unresolved\n"
+            "[p3fes-static]     texture, a dirty frame, a lighting walk that left the expected structure, draws inside the colour-mask bracket\n"
+            "[p3fes-static]   keyed by atomic address, n-th draw of it in the frame, and the render-target raster being recorded\n",
+            stderr);
+    }
+
+    // P3FES_STATIC_POKE=light (verify-mode self-check only): every 997th atomic draw, toggles the red component of the
+    // first global light that affects atomics between two values, in guest memory, the way the game itself would change
+    // a light between two draws (the game rewrites its lights once per frame, so a change made at a frame boundary does
+    // not survive until the next draw). A verify run with the lighting dependencies left out (P3FES_STATIC_FAULT=lighting)
+    // must report mismatches for it, and one with them must not.
+    void staticPokeLight(uint8_t *rdram, uint64_t draw)
+    {
+        uint32_t world = 0u, link = 0u;
+        if (!readGuest(rdram, kRwCurrentWorld, world) || !guestPointer(world, kWorldGlobalLightsOffset + 8u) ||
+            !readGuest(rdram, world + kWorldGlobalLightsOffset, link))
+            return;
+        const uint32_t sentinel = world + kWorldGlobalLightsOffset;
+        for (uint32_t guard = 0u; link && link != sentinel && link >= kLightWorldLinkOffset && guard < 64u; ++guard)
+        {
+            const uint32_t light = link - kLightWorldLinkOffset;
+            uint8_t flags = 0u;
+            if (!guestPointer(light, kLightColorOffset + 12u) || !readGuest(rdram, light + kLightFlagsOffset, flags))
+                return;
+            if (flags & kLightAffectsAtomics)
+            {
+                float red = 0.0f;
+                readGuest(rdram, light + kLightColorOffset, red);
+                red = ((draw / 997u) & 1u) ? red + 0.25f : red - 0.25f;
+                std::memcpy(rdram + light + kLightColorOffset, &red, sizeof(red));
+                return;
+            }
+            if (!readGuest(rdram, link, link))
+                return;
+        }
+    }
+
+    // Memory the cache holds: the table itself, the dependency lists, the retained states (a MeshDrawState and the
+    // capacity of its vectors). Reported with the [p3fes-static] line.
+    size_t staticMemoryBytes(size_t &used)
+    {
+        size_t bytes = g_staticTable.capacity() * sizeof(StaticAtomicEntry *);
+        used = 0u;
+        for (const StaticAtomicEntry *entry : g_staticTable)
+        {
+            if (!entry || entry->state == kStaticFree)
+                continue;
+            const StaticAtomicEntry &e = *entry;
+            ++used;
+            bytes += sizeof(StaticAtomicEntry) + (e.prefix.full.capacity() + e.rest.full.capacity()) * sizeof(StaticDep) +
+                     (e.prefix.masked.capacity() + e.rest.masked.capacity()) * sizeof(StaticMDep) + e.colorAddr.capacity() * sizeof(uint32_t) +
+                     e.rasters.capacity() * sizeof(StaticRasterRef);
+            if (e.record)
+            {
+                const MeshDrawState &r = *e.record;
+                bytes += sizeof(MeshDrawState) + 32u + // + the shared_ptr control block and the plan header
+                         r.materialSamplers.capacity() * sizeof(MeshDrawState::SamplerState) + r.materialColors.capacity() * 4u +
+                         r.materialTextures.capacity() * sizeof(std::string) + r.materialUvTransforms.capacity() * sizeof(MeshDrawState::UvTransform) +
+                         r.materialDualPasses.capacity() * sizeof(MeshDrawState::DualPass) + r.materialEnvPasses.capacity() * sizeof(MeshDrawState::EnvPass) +
+                         r.materialBlends.capacity() * sizeof(MeshDrawState::BlendState) +
+                         r.directionalLights.capacity() * sizeof(MeshDrawState::DirectionalLight) +
+                         r.localLights.capacity() * sizeof(MeshDrawState::LocalLight);
+                for (const std::string &name : r.materialTextures)
+                    if (name.size() > 15u)
+                        bytes += name.capacity();
+            }
+        }
+        return bytes;
+    }
+
+    // Verify mode, once: DepRecorder's masks and the dedup of adjacent words against hand-computed cases (a wrong mask
+    // here would make every sub-word dependency wrong). Returns the number of failed cases.
+    int staticSelfTest()
+    {
+        uint8_t ram[64] = {};
+        for (int i = 0; i < 64; ++i)
+            ram[i] = static_cast<uint8_t>(0x10 + i);
+        int bad = 0;
+        const auto check = [&](bool ok, const char *what) {
+            if (!ok)
+            {
+                ++bad;
+                std::fprintf(stderr, "[p3fes-static-verify] SELFTEST FAILED: %s\n", what);
+            }
+        };
+        {
+            DepRecorder d;
+            d.add(ram, 5u, 2u); // bytes 5..6: one masked word at 4, mask 0x00FFFF00
+            check(d.masked.size() == 1u && d.full.empty() && d.masked[0].addr == 4u && d.masked[0].mask == 0x00FFFF00u &&
+                      d.masked[0].value == 0x00FFFF00u * 0u + ((0x15u << 8u) | (0x16u << 16u)), "two bytes inside a word");
+        }
+        {
+            DepRecorder d;
+            d.add(ram, 6u, 4u); // bytes 6..9: the high half of word 4 and the low half of word 8
+            check(d.masked.size() == 2u && d.masked[0].mask == 0xFFFF0000u && d.masked[1].mask == 0x0000FFFFu && d.masked[1].addr == 8u,
+                  "four bytes across two words");
+        }
+        {
+            DepRecorder d;
+            d.add(ram, 8u, 12u); // three whole words: 8, 12, 16
+            d.add(ram, 16u, 4u); // the same last word again, twice: no duplicate
+            d.add(ram, 16u, 4u);
+            d.add(ram, 20u, 4u); // the next one
+            check(d.full.size() == 4u && d.masked.empty() && d.full[0].addr == 8u && d.full[2].addr == 16u && d.full[3].addr == 20u,
+                  "whole words and the adjacent dedup");
+        }
+        {
+            DepRecorder d;
+            d.bits(ram, 3u, 0x04u);
+            check(d.masked.size() == 1u && d.masked[0].addr == 0u && d.masked[0].mask == 0x04000000u && d.masked[0].value == (0x13u << 24u & 0x04000000u),
+                  "one bit of a byte");
+        }
+        {
+            DepRecorder d;
+            d.add(ram, PS2_RAM_SIZE - 2u, 4u); // past the end of RAM
+            check(d.invalid, "a read past the end is not expressible");
+        }
+        return bad;
+    }
+
+    // Verify mode, on a mismatch: what the entry holds, to find the word the dependency list does not cover. Prints the
+    // identifying fields and the lists' sizes, then every recorded word with its current value (the first 64 of each
+    // list); a word that differs would have made the record stale, so what is missing is one that never shows here.
+    void staticDumpEntry(const uint8_t *rdram, const StaticAtomicEntry &e, const char *field)
+    {
+        std::fprintf(stderr,
+                     "[p3fes-static-verify] entry atomic=%08X ordinal=%u pass=%08X mesh=%llX field=%s frame=%08X updateNode=%08X(valid=%d) prefix=%u+%u rest=%u+%u colors=%u rasters=%u\n",
+                     e.atomic, e.ordinal, e.pass, static_cast<unsigned long long>(e.meshId), field, e.frame, e.updateNode, e.updateNodeValid ? 1 : 0,
+                     static_cast<unsigned>(e.prefix.full.size()), static_cast<unsigned>(e.prefix.masked.size()), static_cast<unsigned>(e.rest.full.size()),
+                     static_cast<unsigned>(e.rest.masked.size()), static_cast<unsigned>(e.colorAddr.size()), static_cast<unsigned>(e.rasters.size()));
+        const auto list = [&](const char *name, const DepRecorder &d) {
+            for (size_t i = 0u; i < d.full.size() && i < 64u; ++i)
+                std::fprintf(stderr, "[p3fes-static-verify]   %s full[%u] %08X recorded=%08X now=%08X\n", name, static_cast<unsigned>(i), d.full[i].addr, d.full[i].value,
+                             staticLoad(rdram, d.full[i].addr));
+            for (size_t i = 0u; i < d.masked.size() && i < 64u; ++i)
+                std::fprintf(stderr, "[p3fes-static-verify]   %s masked[%u] %08X mask=%08X recorded=%08X now=%08X\n", name, static_cast<unsigned>(i), d.masked[i].addr,
+                             d.masked[i].mask, d.masked[i].value, staticLoad(rdram, d.masked[i].addr) & d.masked[i].mask);
+        };
+        list("prefix", e.prefix);
+        list("rest", e.rest);
+        for (size_t i = 0u; i < e.colorAddr.size() && i < 8u; ++i)
+            std::fprintf(stderr, "[p3fes-static-verify]   color[%u] %08X recorded=%08X now=%08X\n", static_cast<unsigned>(i), e.colorAddr[i], e.colorBase[i],
+                         e.colorAddr[i] ? staticLoad(rdram, e.colorAddr[i]) : 0xFFFFFFFFu);
+    }
+
+    // Verify mode: compares what a retained record holds with the state the full path just built. Returns the name
+    // of the first differing field, or null.
+    const char *staticCompare(const MeshDrawState &a, const MeshDrawState &b)
+    {
+        const auto fbits = [](float x, float y) { return std::memcmp(&x, &y, sizeof(float)) == 0; };
+        const auto samplerSame = [](const MeshDrawState::SamplerState &x, const MeshDrawState::SamplerState &y) {
+            return x.valid == y.valid && x.u == y.u && x.v == y.v && x.linearFilter == y.linearFilter;
+        };
+        const auto uvSame = [&](const MeshDrawState::UvTransform &x, const MeshDrawState::UvTransform &y) {
+            return x.enabled == y.enabled && fbits(x.rightX, y.rightX) && fbits(x.rightY, y.rightY) && fbits(x.upX, y.upX) &&
+                   fbits(x.upY, y.upY) && fbits(x.posX, y.posX) && fbits(x.posY, y.posY);
+        };
+        if (a.depthTest != b.depthTest) return "depthTest";
+        if (a.depthWrite != b.depthWrite) return "depthWrite";
+        if (a.cullMode != b.cullMode) return "cullMode";
+        if (a.blendEnabled != b.blendEnabled) return "blendEnabled";
+        if (a.gouraudShading != b.gouraudShading) return "gouraudShading";
+        if (a.clampU != b.clampU || a.clampV != b.clampV) return "clamp";
+        if (a.linearFilter != b.linearFilter) return "linearFilter";
+        if (a.alphaTest.enabled != b.alphaTest.enabled || a.alphaTest.function != b.alphaTest.function ||
+            a.alphaTest.reference != b.alphaTest.reference)
+            return "alphaTest";
+        if (a.fog.enabled != b.fog.enabled || !fbits(a.fog.start, b.fog.start) || !fbits(a.fog.end, b.fog.end) || a.fog.color != b.fog.color)
+            return "fog";
+        if (a.materialSamplers.size() != b.materialSamplers.size()) return "materialSamplers.size";
+        for (size_t i = 0u; i < a.materialSamplers.size(); ++i)
+            if (!samplerSame(a.materialSamplers[i], b.materialSamplers[i])) return "materialSamplers";
+        if (a.materialTextures != b.materialTextures) return "materialTextures";
+        if (a.materialColors != b.materialColors) return "materialColors";
+        if (a.materialUvTransforms.size() != b.materialUvTransforms.size()) return "materialUvTransforms.size";
+        for (size_t i = 0u; i < a.materialUvTransforms.size(); ++i)
+            if (!uvSame(a.materialUvTransforms[i], b.materialUvTransforms[i])) return "materialUvTransforms";
+        if (a.materialDualPasses.size() != b.materialDualPasses.size()) return "materialDualPasses.size";
+        for (size_t i = 0u; i < a.materialDualPasses.size(); ++i)
+        {
+            const auto &x = a.materialDualPasses[i], &y = b.materialDualPasses[i];
+            if (x.enabled != y.enabled || x.textureName != y.textureName || !samplerSame(x.sampler, y.sampler) ||
+                !uvSame(x.uvTransform, y.uvTransform) || x.srcBlend != y.srcBlend || x.dstBlend != y.dstBlend)
+                return "materialDualPasses";
+        }
+        if (a.materialEnvPasses.size() != b.materialEnvPasses.size()) return "materialEnvPasses.size";
+        for (size_t i = 0u; i < a.materialEnvPasses.size(); ++i)
+        {
+            const auto &x = a.materialEnvPasses[i], &y = b.materialEnvPasses[i];
+            if (x.enabled != y.enabled || x.textureName != y.textureName || !samplerSame(x.sampler, y.sampler) ||
+                !fbits(x.coefficient, y.coefficient) || x.frameBufferAlpha != y.frameBufferAlpha ||
+                std::memcmp(x.frameRight.data(), y.frameRight.data(), 12u) != 0 || std::memcmp(x.frameUp.data(), y.frameUp.data(), 12u) != 0)
+                return "materialEnvPasses";
+        }
+        if (a.materialBlends.size() != b.materialBlends.size()) return "materialBlends.size";
+        for (size_t i = 0u; i < a.materialBlends.size(); ++i)
+            if (a.materialBlends[i].enabled != b.materialBlends[i].enabled || a.materialBlends[i].src != b.materialBlends[i].src ||
+                a.materialBlends[i].dst != b.materialBlends[i].dst || a.materialBlends[i].subtract != b.materialBlends[i].subtract)
+                return "materialBlends";
+        if (a.lightingEnabled != b.lightingEnabled) return "lightingEnabled";
+        if (std::memcmp(a.ambientLight.data(), b.ambientLight.data(), 12u) != 0) return "ambientLight";
+        if (a.directionalLights.size() != b.directionalLights.size()) return "directionalLights.size";
+        for (size_t i = 0u; i < a.directionalLights.size(); ++i)
+            if (std::memcmp(a.directionalLights[i].direction.data(), b.directionalLights[i].direction.data(), 12u) != 0 ||
+                std::memcmp(a.directionalLights[i].color.data(), b.directionalLights[i].color.data(), 12u) != 0)
+                return "directionalLights";
+        if (a.localLights.size() != b.localLights.size()) return "localLights.size";
+        for (size_t i = 0u; i < a.localLights.size(); ++i)
+        {
+            const auto &x = a.localLights[i], &y = b.localLights[i];
+            if (x.type != y.type || std::memcmp(x.position.data(), y.position.data(), 12u) != 0 ||
+                std::memcmp(x.direction.data(), y.direction.data(), 12u) != 0 || std::memcmp(x.color.data(), y.color.data(), 12u) != 0 ||
+                !fbits(x.radius, y.radius) || !fbits(x.minusCosAngle, y.minusCosAngle))
+                return "localLights";
+        }
+        if (a.skinPalette.size() != b.skinPalette.size()) return "skinPalette.size";
+        return nullptr;
+    }
+
     // P3FES_DIAG_SKIP=N (measurement only, the picture is wrong): drawNativeAtomic returns early at stage N to
     // measure what each stage costs on the game thread (PMU instructions per frame). 1 start, 2 after the summary,
     // frame/camera and mesh lookup, 3 after the model matrix (and its guest sync), 4 after the material and global
@@ -2672,24 +3712,41 @@ namespace
         return stage;
     }
 
+    // The switches drawNativeAtomic reads on every call, fixed at the first one (one guard check instead of one per switch).
+    struct AtomicHookCfg
+    {
+        int skipStage;
+        bool timed;
+        StaticMode staticMode;
+    };
+    const AtomicHookCfg &atomicHookCfg()
+    {
+        static const AtomicHookCfg cfg{diagSkipStage(), hookTimeEnabled(), staticAtomicMode()};
+        return cfg;
+    }
+
     bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic, R5900Context *ctx, PS2Runtime *runtime,
                           const MeshDrawState::BlendState *blendOverride = nullptr)
     {
-        const int skipStage = diagSkipStage();
+        const AtomicHookCfg &cfg = atomicHookCfg();
+        const int skipStage = cfg.skipStage;
         ++g_hookCounts.atomics;
-        const bool timed = hookTimeEnabled();
+        const bool timed = cfg.timed;
         HookStamp stampLast = timed ? hookNow() : HookStamp{};
+        bool hitMode = false; // the stamps go to the static-cache arrays (see HookStageTimes::hitIns)
         const auto stamp = [&](int stage) {
             if (!timed) return;
             const HookStamp now = hookNow();
             const HookStampCost cost = hookStampCost();
+            uint64_t *ins = hitMode ? g_hookTimes.hitIns : g_hookTimes.ns;
+            uint64_t *cyc = hitMode ? g_hookTimes.hitCyc : g_hookTimes.cyc;
             if (hookTimeMode() == 2)
             {
-                g_hookTimes.ns[stage] += static_cast<uint32_t>(now.value - stampLast.value) - cost.value;
-                g_hookTimes.cyc[stage] += static_cast<uint32_t>(now.cycles - stampLast.cycles) - cost.cycles;
+                ins[stage] += static_cast<uint32_t>(now.value - stampLast.value) - cost.value;
+                cyc[stage] += static_cast<uint32_t>(now.cycles - stampLast.cycles) - cost.cycles;
             }
             else
-                g_hookTimes.ns[stage] += now.value - stampLast.value - cost.value;
+                ins[stage] += now.value - stampLast.value - cost.value;
             stampLast = hookNow();
         };
         g_hookTimes.calls += timed;
@@ -2702,15 +3759,119 @@ namespace
             return true;
         }
         const bool diag = g_diagEnabled.load(std::memory_order_relaxed);
+        // Static atomic cache: the prefix list stands in for inspectAtomic (and the render flag test) when it matches.
+        const StaticMode staticMode = (diag || blendOverride || skipStage != 9 || !g_cutsOn || g_staticAltOff || atomic >= (1u << 28u)) ? StaticMode::Off : cfg.staticMode;
+        const bool staticOn = staticMode != StaticMode::Off;
+        StaticAtomicEntry *staticVerify = nullptr; // verify mode: a valid entry whose record is compared with the full path
+        uint32_t staticVerifyColors[kStaticMaxColors];
+        bool staticVerifyColorsChanged = false;
+        bool prefixOk = false;
+        const uint32_t staticOrdinal = staticOn ? staticNextOrdinal(atomic) : 0u;
+        const uint32_t staticKey = staticKeyAO(atomic, staticOrdinal);
+        StaticAtomicEntry *staticCand = nullptr; // a recorded entry whose prefix and whole dependency list match (pass not yet compared)
+        uint32_t staticColors[kStaticMaxColors];
+        bool staticColorsChanged = false;
+        if (staticOn)
+        {
+            ++g_staticClock;
+            if (g_staticClock == 1u)
+            {
+                static const bool describe = [] { const char *v = std::getenv("P3FES_STATIC_DIAG"); return v && *v; }();
+                if (describe || staticMode == StaticMode::Verify)
+                    staticDescribe();
+                if (staticMode == StaticMode::Verify)
+                    std::fprintf(stderr, "[p3fes-static-verify] self-test: %d failed case(s)\n", staticSelfTest());
+            }
+            {
+                static const bool poke = [] { const char *v = std::getenv("P3FES_STATIC_POKE"); return v && !std::strcmp(v, "light"); }();
+                if (poke && g_staticClock % 997u == 0u)
+                    staticPokeLight(rdram, g_staticClock);
+            }
+            StaticAtomicEntry *recorded = staticFindRecorded(staticKey);
+            static const bool prefetch = [] { const char *v = std::getenv("P3FES_STATIC_PREFETCH"); return v && *v == '1'; }();
+            if (recorded && prefetch)
+                staticPrefetch(rdram, *recorded);
+            prefixOk = recorded && staticPrefixValid(rdram, *recorded);
+            if (recorded && !prefixOk)
+            {
+                recorded->lastWhy = 4u;
+                ++g_static.whyMiss[4];
+            }
+            hitMode = prefixOk && staticMode == StaticMode::On;
+            if (prefixOk)
+            {
+                // Everything that can be tested without the frame is tested now (it reads guest memory and writes nothing
+                // but the entry's own matrix); the render-target pass is compared once the frame is open.
+                stamp(0);
+                uint32_t why = 0u;
+                if (staticRestValid(rdram, *recorded, why, staticColors, staticColorsChanged))
+                    staticCand = recorded;
+                else
+                {
+                    ++g_static.whyMiss[why];
+                    recorded->lastWhy = static_cast<uint8_t>(why);
+                }
+                stamp(3);
+            }
+        }
         AtomicSummary summary;
-        if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u)
+        if (!prefixOk && (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u))
             return false;
-        stamp(0);
+        if (!prefixOk)
+            stamp(0);
         if (!ensureNativeFrame(rdram))
             return false;
         stamp(1);
         captureNativeDrawCamera(rdram);
         stamp(2);
+        if (prefixOk)
+        {
+            StaticAtomicEntry *entry = staticCand;
+            if (entry && entry->pass != g_targetRaster)
+            {
+                // the same draw of this atomic, but in another render-target pass than the one recorded: that pass has its own
+                // entry (which still has to match)
+                entry = staticFindPass(staticKey, g_targetRaster);
+                if (entry && (entry->state != kStaticRecorded || !staticPrefixValid(rdram, *entry)))
+                    entry = nullptr;
+                uint32_t why = 0u;
+                if (entry && !staticRestValid(rdram, *entry, why, staticColors, staticColorsChanged))
+                    entry = nullptr;
+            }
+            if (entry)
+            {
+                if (staticMode == StaticMode::On)
+                {
+                    // The key, the rasters and the dependency list all match: the record is what the full path would build.
+                    ++g_static.hits;
+                    entry->lastUse = g_staticClock;
+                    entry->fails = 0u;
+                    p3fes_native_present::drawMeshShared(entry->meshId, entry->model, entry->record, staticColorsChanged ? staticColors : nullptr,
+                                                         staticColorsChanged ? static_cast<uint32_t>(entry->colorAddr.size()) : 0u);
+                    stamp(4);
+                    if (timed)
+                    {
+                        --g_hookTimes.calls;
+                        ++g_hookTimes.hitCalls;
+                    }
+                    return true;
+                }
+                staticVerify = entry;
+                std::memcpy(staticVerifyColors, staticColors, sizeof(staticColors));
+                staticVerifyColorsChanged = staticColorsChanged;
+                // the two ways of reading the global key must agree
+                StaticGlobalKey fresh;
+                staticReadGlobalKey(rdram, fresh);
+                if (!staticKeyEqual(fresh, entry->key))
+                {
+                    ++g_static.verifyBad;
+                    std::fprintf(stderr, "[p3fes-static-verify] MISMATCH atomic=%08X field=global-key (fused compare said equal)\n", atomic);
+                }
+            }
+            hitMode = false;
+            if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u)
+                return false;
+        }
 
         if (diag &&
             g_loggedAtomicCameras.size() < 16u && g_loggedAtomicCameras.insert(atomic).second)
@@ -2917,6 +4078,64 @@ namespace
         stamp(4);
         g_hookCounts.frameSyncs += frameSyncRequested;
         g_hookCounts.dynamicDraws += drawDynamic;
+        // Static atomic cache, miss side: which entry this draw updates and whether its record is built now.
+        StaticAtomicEntry *staticEntry = nullptr;
+        bool staticRecord = false;
+        static DepRecorder staticLightRec;
+        if (staticOn && !drawDynamic && !definedMesh->skinned && definedMesh->contentHash == 0u)
+        {
+            staticEntry = staticFindPass(staticKeyAO(atomic, staticOrdinal), g_targetRaster);
+            if (!staticEntry)
+            {
+                staticEntry = staticAllocate(atomic, staticOrdinal, g_targetRaster); // first sighting: nothing to compare with yet
+                ++g_static.fullFirst;
+            }
+            else if (staticEntry->state == kStaticVolatile)
+            {
+                if (g_nativeFrameNumber >= staticEntry->until)
+                {
+                    staticEntry->state = kStaticSeen;
+                    staticEntry->fails = 0u;
+                }
+                else
+                {
+                    staticEntry = nullptr;
+                    ++g_static.fullVolatile;
+                }
+            }
+            else if (staticEntry->state == kStaticSeen)
+                staticRecord = true;
+            else if (staticVerify)
+            {
+                // verify mode: the entry matched; its record is compared below, and rebuilt only if it was wrong
+                staticEntry->fails = 0u;
+            }
+            else
+            {
+                // A recorded entry that did not match: the atomic changed since it was recorded.
+                ++g_static.fullFailed;
+                if (++staticEntry->fails > kStaticMaxFails)
+                {
+                    static unsigned volLogs = 0u;
+                    static const bool volDiag = [] { const char *v = std::getenv("P3FES_STATIC_DIAG"); return v && *v == '1'; }();
+                    if (volDiag && volLogs++ < 200u)
+                        std::fprintf(stderr, "[p3fes-static] volatile atomic=%08X mesh=%llX last-miss=%u frame=%llu\n", atomic,
+                                     static_cast<unsigned long long>(meshId), staticEntry->lastWhy, static_cast<unsigned long long>(g_nativeFrameNumber));
+                    staticEntry->state = kStaticVolatile;
+                    staticEntry->until = g_nativeFrameNumber + kStaticVolatileFrames;
+                    staticEntry->record.reset();
+                    staticEntry = nullptr;
+                }
+                else
+                    staticRecord = true;
+            }
+            if (staticEntry)
+                staticEntry->lastUse = g_staticClock;
+            if (staticRecord)
+                staticLightRec.clear();
+        }
+        else if (staticOn && (definedMesh->skinned || definedMesh->contentHash != 0u))
+            ++g_static.uncacheable;
         if (diag)
         {
             const auto sample = g_skinDiagnosticSamples.find(meshId);
@@ -3015,7 +4234,7 @@ namespace
         if ((summary.geometryFlags & kGeometryLightingFlag) != 0u)
         {
             ++g_hookCounts.lit;
-            readNativeLighting(rdram, false, atomic, drawState);
+            readNativeLighting(rdram, false, atomic, drawState, staticRecord ? &staticLightRec : nullptr);
         }
         stamp(8);
         if (!prepareNativeSkinPalette(rdram, atomic, summary.geometry, ctx, runtime, drawState, definedMesh))
@@ -3153,6 +4372,58 @@ namespace
                 stateLoanOpen = false;
             }
             return true;
+        }
+        if (staticEntry && staticVerify == staticEntry)
+        {
+            // verify mode: the cache said "reuse"; the full path's result must be what it kept
+            ++g_static.verified;
+            MeshDrawState effective = *staticEntry->record; // what the host would draw: the state with this draw's colours
+            if (staticVerifyColorsChanged)
+                for (size_t i = 0u; i < staticEntry->colorAddr.size() && i < effective.materialColors.size(); ++i)
+                    std::memcpy(effective.materialColors[i].data(), &staticVerifyColors[i], 4u);
+            const char *field = staticCompare(effective, drawState);
+            if (!field && staticEntry->meshId != meshId)
+                field = "meshId";
+            if (!field && std::memcmp(staticEntry->model.data(), model.data(), sizeof(float) * 16u) != 0)
+                field = "model";
+            if (field)
+            {
+                ++g_static.verifyBad;
+                static unsigned badLogs = 0u;
+                if (badLogs++ < 60u)
+                {
+                    std::fprintf(stderr, "[p3fes-static-verify] MISMATCH atomic=%08X pass=%08X mesh=%llX field=%s frame=%llu\n", atomic,
+                                 g_targetRaster, static_cast<unsigned long long>(meshId), field,
+                                 static_cast<unsigned long long>(g_nativeFrameNumber));
+                    if (badLogs <= 3u)
+                        staticDumpEntry(rdram, *staticEntry, field);
+                }
+                staticRecord = true; // rebuild from what the full path produced
+            }
+        }
+        if (staticEntry && staticRecord)
+        {
+            const char *why = nullptr;
+            if (!drawDynamic && staticBuildRecord(rdram, *staticEntry, summary, meshId, model, drawState, staticLightRec, why))
+            {
+                staticEntry->state = kStaticRecorded;
+                ++g_static.recorded;
+            }
+            else
+            {
+                // Reasons that pass (the frame needs its guest sync now, a texture is not decoded yet) are tried again soon.
+                const bool transient = why && (!std::strcmp(why, "frame-dirty") || !std::strcmp(why, "texture-unresolved") ||
+                                               !std::strcmp(why, "model-differs"));
+                staticEntry->state = kStaticVolatile;
+                staticEntry->until = g_nativeFrameNumber + (transient ? kStaticVolatileFrames / 3u : kStaticNeverFrames);
+                staticEntry->record.reset();
+                ++g_static.uncacheable;
+                static unsigned whyLogs = 0u;
+                static const bool whyDiag = [] { const char *v = std::getenv("P3FES_STATIC_DIAG"); return v && *v == '1'; }();
+                if (whyDiag && whyLogs++ < 200u)
+                    std::fprintf(stderr, "[p3fes-static] not cacheable atomic=%08X mesh=%llX: %s\n", atomic,
+                                 static_cast<unsigned long long>(meshId), why ? why : "?");
+            }
         }
         if (drawDynamic)
         {
@@ -4546,6 +5817,23 @@ namespace
         if (!g_nativeFrameActive)
             return;
         {
+            // P3FES_STATIC_ALTERNATE=<seconds> (measurement only): turns just the static-atomic cache off and on every
+            // <seconds> (starting on), leaving every other cut as configured, for an A/B inside one run.
+            static const int staticAlternate = [] { const char *v = std::getenv("P3FES_STATIC_ALTERNATE"); return v ? std::atoi(v) : 0; }();
+            if (staticAlternate > 0)
+            {
+                static const auto start = std::chrono::steady_clock::now();
+                const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+                const bool off = ((seconds / staticAlternate) & 1) != 0;
+                if (off != g_staticAltOff)
+                {
+                    g_staticAltOff = off;
+                    std::fprintf(stderr, "[p3fes-altcuts] %s at frame %llu (%llds after the first frame) (static atomic cache only)\n", off ? "off" : "on",
+                                 static_cast<unsigned long long>(g_nativeFrameNumber), static_cast<long long>(seconds));
+                }
+            }
+        }
+        {
             static const int alternate = [] { const char *v = std::getenv("P3FES_CUT_ALTERNATE"); return v ? std::atoi(v) : 0; }();
             if (alternate > 0)
             {
@@ -4571,6 +5859,7 @@ namespace
         g_targetRaster = 0u; // endFrame closes an open bracket
         p3fes_native_present::endFrame();
         g_nativeFrameActive = false;
+        ++g_staticFrameEpoch;
         static const bool resourceDiag = [] {
             const char *value = std::getenv("P3FES_RESOURCE_DIAG");
             return value && *value == '1';
@@ -4624,7 +5913,63 @@ namespace
                                                static_cast<unsigned long long>(hookStampCost().value), static_cast<unsigned long long>(hookStampCost().cycles));
                             std::fputs(line, stderr);
                         }
+                        if (g_hookTimes.hitCalls)
+                        {
+                            static const char *hitNames[HookStageTimes::kHitStages] = {"prefix", "ensure", "camera", "validate", "submit"};
+                            n = std::snprintf(line, sizeof(line), "[p3fes-hooktime] %s/static-hit:", pmu ? "instr" : "ns");
+                            uint64_t hitTotal = 0u, hitCycles = 0u;
+                            for (int i = 0; i < HookStageTimes::kHitStages; ++i)
+                            {
+                                n += std::snprintf(line + n, sizeof(line) - n, " %s=%.0f/%.0fc", hitNames[i], double(g_hookTimes.hitIns[i]) / g_hookTimes.hitCalls,
+                                                   double(g_hookTimes.hitCyc[i]) / g_hookTimes.hitCalls);
+                                hitTotal += g_hookTimes.hitIns[i];
+                                hitCycles += g_hookTimes.hitCyc[i];
+                            }
+                            n += std::snprintf(line + n, sizeof(line) - n, " total=%.0f cyc=%.0f hits/frame=%.1f\n", double(hitTotal) / g_hookTimes.hitCalls,
+                                               double(hitCycles) / g_hookTimes.hitCalls, double(g_hookTimes.hitCalls) / frames);
+                            std::fputs(line, stderr);
+                        }
                         g_hookTimes = {};
+                    }
+                    if (staticAtomicMode() != StaticMode::Off)
+                    {
+                        const StaticStats &c = g_static;
+                        const StaticStats &w = g_staticWindow;
+                        std::fprintf(stderr,
+                            "[p3fes-static] mode=%s per frame: hit=%.1f first=%.1f failed=%.1f volatile=%.1f uncacheable=%.1f recorded=%.1f | "
+                            "miss-why key=%llu raster=%llu deps=%llu prefix=%llu dirty=%llu rechecks=%llu | entries=%u avg-deps=%.0f | verified=%llu bad=%llu\n",
+                            staticAtomicMode() == StaticMode::Verify ? "verify" : "on", double(c.hits - w.hits) / frames,
+                            double(c.fullFirst - w.fullFirst) / frames, double(c.fullFailed - w.fullFailed) / frames,
+                            double(c.fullVolatile - w.fullVolatile) / frames, double(c.uncacheable - w.uncacheable) / frames,
+                            double(c.recorded - w.recorded) / frames, static_cast<unsigned long long>(c.whyMiss[1]),
+                            static_cast<unsigned long long>(c.whyMiss[2]), static_cast<unsigned long long>(c.whyMiss[3]),
+                            static_cast<unsigned long long>(c.whyMiss[4]), static_cast<unsigned long long>(c.whyMiss[5]), static_cast<unsigned long long>(c.rasterRechecks), c.entries,
+                            c.recorded ? double(c.recordWords) / double(c.recorded) : 0.0, static_cast<unsigned long long>(c.verified),
+                            static_cast<unsigned long long>(c.verifyBad));
+                        {
+                            size_t used = 0u;
+                            const size_t bytes = staticMemoryBytes(used);
+                            std::fprintf(stderr, "[p3fes-static] memory: %u KB for %u live entries (%u bytes per entry, entry struct %u bytes)\n",
+                                         static_cast<unsigned>(bytes / 1024u), static_cast<unsigned>(used), static_cast<unsigned>(used ? bytes / used : 0u),
+                                         static_cast<unsigned>(sizeof(StaticAtomicEntry)));
+                        }
+                        if (c.sectionMiss[0] + c.sectionMiss[1] + c.sectionMiss[2] + c.sectionMiss[3] + c.sectionMiss[4] + c.sectionMiss[5])
+                            std::fprintf(stderr, "[p3fes-static] stale sections (cumulative) full: matrix=%llu materials=%llu lighting=%llu | masked: matrix=%llu materials=%llu lighting=%llu\n",
+                                         static_cast<unsigned long long>(c.sectionMiss[0]), static_cast<unsigned long long>(c.sectionMiss[1]),
+                                         static_cast<unsigned long long>(c.sectionMiss[2]), static_cast<unsigned long long>(c.sectionMiss[3]),
+                                         static_cast<unsigned long long>(c.sectionMiss[4]), static_cast<unsigned long long>(c.sectionMiss[5]));
+                        g_staticWindow = g_static;
+                        if (!g_staticMiss.empty())
+                        {
+                            std::vector<std::pair<uint32_t, StaticMissInfo>> top(g_staticMiss.begin(), g_staticMiss.end());
+                            std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second.count > b.second.count; });
+                            for (size_t i = 0u; i < top.size() && i < 12u; ++i)
+                                std::fprintf(stderr, "[p3fes-static] stale-word addr=%08X x%llu (atomic %08X#%u mesh %llX dep %u/%u) %08X -> %08X\n", top[i].first,
+                                             static_cast<unsigned long long>(top[i].second.count), top[i].second.atomic, top[i].second.ordinal,
+                                             static_cast<unsigned long long>(top[i].second.mesh), top[i].second.index, top[i].second.total,
+                                             top[i].second.oldValue, top[i].second.newValue);
+                            g_staticMiss.clear();
+                        }
                     }
                 }
                 std::fprintf(stderr, "[p3fes-textures] prepared=%llu live=%u fields=%llu\n",
@@ -4651,9 +5996,11 @@ namespace
         if (ctx && ctx->pc == kRpAtomicRender)
         {
             const uint32_t atomic = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[4]));
-            logAtomicPipeline(rdram, ctx, atomic);
             AtomicSummary summary;
-            if (inspectAtomic(rdram, atomic, summary) && g_diagEnabled.load(std::memory_order_relaxed) &&
+            // Everything here is diagnostics: with them off (the normal case) it must cost nothing, inspectAtomic included.
+            if (g_diagEnabled.load(std::memory_order_relaxed))
+                logAtomicPipeline(rdram, ctx, atomic);
+            if (g_diagEnabled.load(std::memory_order_relaxed) && inspectAtomic(rdram, atomic, summary) &&
                 !g_diagPrinted.exchange(true, std::memory_order_relaxed))
             {
                 std::fprintf(stderr,
