@@ -1,12 +1,18 @@
 #include <utility>
 #include <string>
 #include "runtime/ee_scheduler.h"
+#include "ee_clock_duration.h"
 
 #include "ps2_log.h"
 #include "runtime/ps2_perf.h"
 #include "ps2_runtime_macros.h"
+#if defined(PS2X_P3FES_FRAME_TRACE)
+#include "../game_overrides/p3fes_frame_trace.h"
+#endif
 
 #include <algorithm>
+#include <chrono>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +22,306 @@
 #include <unordered_map>
 #include <vector>
 
+
+extern std::atomic<uint32_t> g_ps2EeSampleCurrent;
+
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
+
+// PS2X_FRAME_HIST=1: per game frame (the main-loop counter at 0x7CE10C), wall time against the thread's own
+// CPU time and the time it sat in the scheduler's waits, summed per 5 s as a histogram by field count
+// ([fhist] lines). Timestamps use sceKernelGetProcessTimeWide on the Vita (steady_clock costs ~6 us there).
+namespace
+{
+    bool frameHistOn()
+    {
+        static const bool on = [] { const char *v = std::getenv("PS2X_FRAME_HIST"); return v && *v == '1'; }();
+        return on;
+    }
+    uint64_t fhNowUs()
+    {
+#if defined(__vita__)
+        return sceKernelGetProcessTimeWide();
+#else
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+    }
+    uint64_t fhRunUs()
+    {
+#if defined(__vita__)
+        SceKernelThreadInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) >= 0)
+            return info.runClocks;
+#endif
+        return 0u;
+    }
+    // Wall time inside the scheduler's blocking waits, by kind (executor thread only).
+    uint64_t g_fhPacingUs = 0u, g_fhEventUs = 0u, g_fhPacingCount = 0u, g_fhEventCount = 0u;
+    uint64_t g_fhCapFields = 0u;
+    // Host-thread hand-off waits (p3fes_native_present producer side), added through ps2xFrameHistAddLock.
+    uint64_t g_fhLockUs = 0u, g_fhIoUs = 0u, g_fhIoCount = 0u, g_fhIoBytes = 0u, g_fhLastIo = 0u;
+    struct FhBucket { unsigned n = 0; double wall = 0, cpu = 0, pace = 0, evt = 0, lock = 0, io = 0; unsigned cap = 0; };
+    constexpr int kFhBuckets = 7; // 1..6 fields, 7 = more
+    FhBucket g_fhBuckets[kFhBuckets];
+    // PS2X_VSYNC_SLIP=1: a game frame that has already run past its two-field budget does not wait for the next
+    // vblank (see waitForEvent). Host time of the last frame-counter advance, the frame it belongs to, and counters.
+    std::chrono::steady_clock::time_point g_slipFrameStart{};
+    uint64_t g_slipFrameId = 0u, g_slipDoneFrameId = 0u, g_slipCount = 0u, g_slipSavedUs = 0u;
+    bool vsyncSlipOn()
+    {
+        static const bool on = [] { const char *v = std::getenv("PS2X_VSYNC_SLIP"); return v && *v == '1'; }();
+        return on;
+    }
+    uint64_t g_fhLastWall = 0u, g_fhLastRun = 0u, g_fhLastTick = 0u, g_fhWindowStart = 0u;
+    uint64_t g_fhLastPace = 0u, g_fhLastEvt = 0u, g_fhLastLock = 0u, g_fhLastCap = 0u;
+    double g_fhWorstWall = 0.0, g_fhWorstCpu = 0.0, g_fhPrintMs = 0.0;
+
+    std::atomic<int> g_stallTag{0}; // what the executor is doing: 0 guest code, 1 pacing wait, 2 event wait
+    bool stallDiagOn()
+    {
+        static const bool on = [] { const char *v = std::getenv("PS2X_STALL_DIAG"); return v && *v == '1'; }();
+        return on;
+    }
+    struct FhScopedWait
+    {
+        uint64_t &sink; uint64_t &count; uint64_t start; bool on; bool tag;
+        FhScopedWait(uint64_t &s, uint64_t &c) : sink(s), count(c), start(0u), on(frameHistOn()), tag(stallDiagOn())
+        {
+            if (on) start = fhNowUs();
+            if (tag) g_stallTag.store(&s == &g_fhPacingUs ? 1 : 2, std::memory_order_relaxed);
+        }
+        ~FhScopedWait()
+        {
+            if (on) { sink += fhNowUs() - start; ++count; }
+            if (tag) g_stallTag.store(0, std::memory_order_relaxed);
+        }
+    };
+
+    void frameHistFrame(uint64_t tick, bool capped)
+    {
+        const uint64_t wall = fhNowUs(), run = fhRunUs();
+        if (g_fhLastWall != 0u)
+        {
+            const double wallMs = (wall - g_fhLastWall) / 1000.0, cpuMs = (run - g_fhLastRun) / 1000.0;
+            const double fields = wallMs / 16.683;
+            int k = static_cast<int>(fields + 0.5);
+            k = k < 1 ? 1 : (k > kFhBuckets ? kFhBuckets : k);
+            FhBucket &b = g_fhBuckets[k - 1];
+            ++b.n;
+            b.wall += wallMs;
+            b.cpu += cpuMs;
+            b.pace += (g_fhPacingUs - g_fhLastPace) / 1000.0;
+            b.evt += (g_fhEventUs - g_fhLastEvt) / 1000.0;
+            b.lock += (g_fhLockUs - g_fhLastLock) / 1000.0;
+            b.io += (g_fhIoUs - g_fhLastIo) / 1000.0;
+            b.cap += static_cast<unsigned>(g_fhCapFields - g_fhLastCap);
+            g_fhWorstWall = std::max(g_fhWorstWall, wallMs);
+            g_fhWorstCpu = std::max(g_fhWorstCpu, cpuMs);
+        }
+        (void)tick; (void)capped;
+        g_fhLastWall = wall; g_fhLastRun = run; g_fhLastTick = tick;
+        g_fhLastPace = g_fhPacingUs; g_fhLastEvt = g_fhEventUs; g_fhLastLock = g_fhLockUs; g_fhLastCap = g_fhCapFields; g_fhLastIo = g_fhIoUs;
+        if (g_fhWindowStart == 0u) g_fhWindowStart = wall;
+        static const uint64_t windowUs = [] {
+            const char *v = std::getenv("PS2X_FRAME_HIST_SECONDS");
+            const long n = v ? std::strtol(v, nullptr, 10) : 5;
+            return static_cast<uint64_t>(n < 1 ? 5 : (n > 600 ? 600 : n)) * 1000000u;
+        }();
+        if (wall - g_fhWindowStart >= windowUs)
+        {
+            const uint64_t printStart = fhNowUs();
+            unsigned total = 0; double wsum = 0, csum = 0, psum = 0, esum = 0, lsum = 0;
+            for (const FhBucket &b : g_fhBuckets) { total += b.n; wsum += b.wall; csum += b.cpu; psum += b.pace; esum += b.evt; lsum += b.lock; }
+            std::fprintf(stderr, "[fhist] t=%.2f %.1fs frames=%u fps=%.2f wall=%.2f cpu=%.2f (%.0f%%) pace-wait=%.2f event-wait=%.2f lock=%.2f other-off-cpu=%.2f ms/frame worst wall=%.1f cpu=%.1f\n",
+                         wall / 1e6, (wall - g_fhWindowStart) / 1e6, total, total * 1e6 / double(wall - g_fhWindowStart), total ? wsum / total : 0.0, total ? csum / total : 0.0,
+                         wsum > 0 ? csum * 100.0 / wsum : 0.0, total ? psum / total : 0.0, total ? esum / total : 0.0, total ? lsum / total : 0.0,
+                         total ? (wsum - csum - psum - esum - lsum) / total : 0.0, g_fhWorstWall, g_fhWorstCpu);
+            for (int i = 0; i < kFhBuckets; ++i)
+            {
+                const FhBucket &b = g_fhBuckets[i];
+                if (!b.n) continue;
+                std::fprintf(stderr, "[fhist]   %d field%s%s: n=%u wall=%.1f cpu=%.1f pace=%.1f event=%.1f lock=%.1f io=%.1f capsleep=%.2f\n", i + 1, i ? "s" : "", i + 1 == kFhBuckets ? "+" : "",
+                             b.n, b.wall / b.n, b.cpu / b.n, b.pace / b.n, b.evt / b.n, b.lock / b.n, b.io / b.n, double(b.cap) / b.n);
+            }
+            if (vsyncSlipOn())
+            {
+                static uint64_t lastCount = 0u, lastSaved = 0u;
+                std::fprintf(stderr, "[fhist]   vsync-slip: %llu frames released early, %.1f ms saved\n",
+                             static_cast<unsigned long long>(g_slipCount - lastCount), (g_slipSavedUs - lastSaved) / 1000.0);
+                lastCount = g_slipCount; lastSaved = g_slipSavedUs;
+            }
+            std::fprintf(stderr, "[fhist]   previous report took %.1f ms to print\n", g_fhPrintMs);
+            g_fhPrintMs = (fhNowUs() - printStart) / 1000.0;
+            for (FhBucket &b : g_fhBuckets) b = FhBucket{};
+            g_fhWorstWall = g_fhWorstCpu = 0.0;
+            g_fhWindowStart = wall;
+        }
+    }
+}
+
+#if defined(__vita__)
+// PS2X_STALL_DIAG=1 (Vita): a sampler thread looks at the game thread every millisecond and logs each
+// stretch (>= 20 ms) in which it consumed no CPU: what the kernel says it waits on (status, wait type,
+// object), what the scheduler was doing (tag), how often it was preempted, and which threads held its core.
+namespace
+{
+    struct StallOccupant { SceUID tid; int pid; int pri; unsigned count; };
+    int stallSamplerEntry(SceSize, void *arg)
+    {
+        const SceUID game = *static_cast<SceUID *>(arg);
+        uint64_t lastRun = 0u, lastWall = 0u, epStart = 0u;
+        uint32_t epPreempt0 = 0u, epIntr0 = 0u;
+        bool inEp = false;
+        unsigned epSamples = 0u, epTag[3] = {0, 0, 0}, epStatus[3] = {0, 0, 0};
+        uint32_t epWaitType = 0u; SceUID epWaitId = 0; unsigned epWaitCount = 0u;
+        StallOccupant occ[12];
+        unsigned occCount = 0u, lines = 0u;
+        for (;;)
+        {
+            sceKernelDelayThread(1000);
+            SceKernelThreadInfo info{};
+            info.size = sizeof(info);
+            if (sceKernelGetThreadInfo(game, &info) < 0)
+                continue;
+            const uint64_t now = sceKernelGetProcessTimeWide();
+            const bool idle = lastWall != 0u && (info.runClocks - lastRun) < 100u && now - lastWall >= 500u;
+            lastRun = info.runClocks;
+            lastWall = now;
+            if (idle)
+            {
+                if (!inEp)
+                {
+                    inEp = true; epStart = now; epSamples = 0u; epWaitCount = 0u; occCount = 0u;
+                    epTag[0] = epTag[1] = epTag[2] = 0u; epStatus[0] = epStatus[1] = epStatus[2] = 0u;
+                    epPreempt0 = info.threadPreemptCount; epIntr0 = info.intrPreemptCount;
+                }
+                ++epSamples;
+                ++epTag[g_stallTag.load(std::memory_order_relaxed) % 3];
+                ++epStatus[(info.status & SCE_THREAD_RUNNING) ? 0 : ((info.status & SCE_THREAD_READY) ? 1 : 2)];
+                if ((info.status & SCE_THREAD_WAITING) && (epWaitCount == 0u || epWaitId == info.waitId))
+                { epWaitType = info.waitType; epWaitId = info.waitId; ++epWaitCount; }
+                SceKernelThreadRunStatus rs{};
+                rs.size = sizeof(rs);
+                if (sceKernelGetThreadRunStatus(game, &rs) >= 0 && info.lastExecutedCpuId >= 0 && info.lastExecutedCpuId < 4)
+                {
+                    const auto &c = rs.cpuInfo[info.lastExecutedCpuId];
+                    unsigned i = 0u;
+                    for (; i < occCount; ++i) if (occ[i].tid == c.threadId) break;
+                    if (i == occCount && occCount < 12u) occ[occCount++] = {c.threadId, c.processId, c.priority, 0u};
+                    if (i < occCount) ++occ[i].count;
+                }
+            }
+            else if (inEp)
+            {
+                inEp = false;
+                const double ms = (now - epStart) / 1000.0;
+                if (ms >= 20.0 && lines < 400u)
+                {
+                    ++lines;
+                    char occText[256]; occText[0] = 0;
+                    for (unsigned i = 0u; i < occCount; ++i)
+                    {
+                        SceKernelThreadInfo oi{}; oi.size = sizeof(oi);
+                        const bool known = sceKernelGetThreadInfo(occ[i].tid, &oi) >= 0;
+                        std::snprintf(occText + std::strlen(occText), sizeof(occText) - std::strlen(occText), " %s/p%d x%u",
+                                      known ? oi.name : "foreign", occ[i].pri, occ[i].count);
+                    }
+                    std::fprintf(stderr, "[stall] t=%.2f dur=%.0f ms tag(run/pace/event)=%u/%u/%u status(run/ready/wait)=%u/%u/%u wait=0x%X/0x%X x%u preempt=+%u intr=+%u core-held-by:%s\n",
+                                 now / 1e6, ms, epTag[0], epTag[1], epTag[2], epStatus[0], epStatus[1], epStatus[2],
+                                 static_cast<unsigned>(epWaitType), static_cast<unsigned>(epWaitId), epWaitCount,
+                                 static_cast<unsigned>(info.threadPreemptCount - epPreempt0), static_cast<unsigned>(info.intrPreemptCount - epIntr0), occText);
+                }
+            }
+        }
+        return 0;
+    }
+    void startStallSampler()
+    {
+        static SceUID gameId = 0;
+        static bool started = false;
+        if (started || !stallDiagOn()) return;
+        started = true;
+        gameId = sceKernelGetThreadId();
+        const SceUID t = sceKernelCreateThread("p3fes-stall", stallSamplerEntry, 0x30, 0x4000, 0, 0, nullptr);
+        if (t >= 0) sceKernelStartThread(t, sizeof(gameId), &gameId);
+    }
+}
+#else
+namespace { inline void startStallSampler() {} }
+#endif
+extern "C" void ps2xFrameHistAddLock(uint64_t us) { g_fhLockUs += us; }
+extern "C" uint64_t ps2xFrameHistNowUs() { return (frameHistOn() || stallDiagOn()) ? fhNowUs() : 0u; }
+// Host file reads (ps2_iop_host.cpp): summed per frame; one slower than 20 ms is logged with its size.
+extern "C" void ps2xFrameHistNoteRead(uint64_t startUs, size_t bytes)
+{
+    if (startUs == 0u) return;
+    const uint64_t us = fhNowUs() - startUs;
+    g_fhIoUs += us;
+    ++g_fhIoCount;
+    g_fhIoBytes += bytes;
+    if (us >= 20000u)
+        std::fprintf(stderr, "[io-slow] t=%.2f read of %u bytes took %.1f ms\n", fhNowUs() / 1e6, static_cast<unsigned>(bytes), us / 1000.0);
+}
+extern "C" int ps2xFrameHistEnabled() { return frameHistOn() ? 1 : 0; }
+
+namespace
+{
+    // PS2X_EE_THROW_DIAG=1: how often a guest thread leaves through the
+    // dispatcher exception and how long each throw-to-catch takes. A C++
+    // throw unwinds every generated frame on the host stack; on ARMv7 that is
+    // a table search per frame through a very large executable.
+    bool transferDiagEnabled()
+    {
+        static const bool enabled = []()
+        {
+            const char *env = std::getenv("PS2X_EE_THROW_DIAG");
+            return env && *env == '1';
+        }();
+        return enabled;
+    }
+    uint64_t g_transferThrownAt = 0u;
+    uint64_t g_transferCount = 0u, g_transferNanos = 0u, g_transferMaxNanos = 0u, g_transferWindowStart = 0u;
+
+    uint64_t transferNow()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+
+    void noteTransferThrow()
+    {
+        if (transferDiagEnabled())
+            g_transferThrownAt = transferNow();
+    }
+
+    void noteTransferCatch()
+    {
+        if (!transferDiagEnabled() || g_transferThrownAt == 0u)
+            return;
+        const uint64_t now = transferNow();
+        const uint64_t elapsed = now - g_transferThrownAt;
+        g_transferThrownAt = 0u;
+        ++g_transferCount;
+        g_transferNanos += elapsed;
+        g_transferMaxNanos = std::max(g_transferMaxNanos, elapsed);
+        if (g_transferWindowStart == 0u)
+            g_transferWindowStart = now;
+        if (now - g_transferWindowStart >= 5000000000ull)
+        {
+            std::fprintf(stderr, "[ee-throw] window=%.2fs throws=%llu total_ms=%.1f avg_us=%.1f max_us=%.1f\n",
+                         (now - g_transferWindowStart) / 1e9, static_cast<unsigned long long>(g_transferCount),
+                         g_transferNanos / 1e6, g_transferCount ? g_transferNanos / 1e3 / g_transferCount : 0.0,
+                         g_transferMaxNanos / 1e3);
+            g_transferCount = g_transferNanos = g_transferMaxNanos = 0u;
+            g_transferWindowStart = now;
+        }
+    }
+}
 
 namespace
 {
@@ -90,13 +396,22 @@ namespace
         return (microseconds * EeScheduler::kEeClockHz + 999999ull) / 1000000ull;
     }
 
-    std::chrono::nanoseconds eeCyclesToHostDuration(uint64_t cycles)
+    [[gnu::noinline]] std::chrono::nanoseconds eeCyclesToHostDurationGeneric(uint64_t cycles)
     {
         constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
         const uint64_t wholeSeconds = cycles / EeScheduler::kEeClockHz;
         const uint64_t remainingCycles = cycles % EeScheduler::kEeClockHz;
         const uint64_t remainingNanoseconds = (remainingCycles * kNanosecondsPerSecond + EeScheduler::kEeClockHz - 1u) / EeScheduler::kEeClockHz;
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
+    }
+
+    std::chrono::nanoseconds eeCyclesToHostDuration(uint64_t cycles)
+    {
+        static_assert(EeScheduler::kEeClockHz == 294912000u);
+        uint64_t nanoseconds = 0u;
+        if (ps2x::ee_clock::tryNanoseconds(cycles, nanoseconds))
+            return std::chrono::nanoseconds(nanoseconds);
+        return eeCyclesToHostDurationGeneric(cycles);
     }
 
     constexpr uint64_t kVBlankPeriodCycles = EeScheduler::kEeClockHz * 1001ull / 60000ull; // one NTSC field
@@ -220,6 +535,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 
 void EeScheduler::run()
 {
+    startStallSampler();
     ps2_perf::Scope perf(ps2_perf::Bucket::Ee); // exclusive executor times.
     assertExecutor();
     m_running.store(true, std::memory_order_release);
@@ -308,6 +624,7 @@ void EeScheduler::run()
             }
             catch (const EeDispatcherTransfer &)
             {
+                noteTransferCatch();
             }
             if (m_currentThreadId == 0)
             {
@@ -359,6 +676,7 @@ void EeScheduler::run()
                     }
                     catch (const EeDispatcherTransfer &)
                     {
+                        noteTransferCatch();
                     }
                 }
                 continue;
@@ -441,15 +759,52 @@ void EeScheduler::run()
                     std::fflush(stderr);
                 }
             }
+            {
+                // PS2X_DISPATCH_DIAG=1: how often guest code is (re)entered from this loop, and at which PCs. Every
+                // entry here means the host stack was empty: a yield, a block, or a guest transfer that the generated
+                // code could not follow with a host call/return.
+                static const bool dispatchDiag = std::getenv("PS2X_DISPATCH_DIAG") != nullptr;
+                if (dispatchDiag)
+                {
+                    static std::unordered_map<uint32_t, uint32_t> s_pcs;
+                    static uint64_t s_total = 0u;
+                    static auto s_start = std::chrono::steady_clock::now();
+                    ++s_pcs[context.pc];
+                    if ((++s_total % 200000u) == 0u)
+                    {
+                        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count();
+                        std::vector<std::pair<uint32_t, uint32_t>> top(s_pcs.begin(), s_pcs.end());
+                        std::sort(top.begin(), top.end(), [](const auto &l, const auto &r) { return l.second > r.second; });
+                        std::fprintf(stderr, "[dispatch-diag] 200000 dispatches in %.2f s, %zu distinct pcs; top:", seconds, top.size());
+                        for (size_t i = 0u; i < top.size() && i < 24u; ++i)
+                            std::fprintf(stderr, " %08X=%u", top[i].first, top[i].second);
+                        std::fprintf(stderr, "\n");
+                        s_pcs.clear();
+                        s_start = std::chrono::steady_clock::now();
+                    }
+                }
+            }
             ps2_perf::guestEntry(context.pc);
+            // The EE sampler's "current function" word is not unwound when a
+            // thread leaves through a scheduler transfer; every dispatch
+            // starts from the function that is actually (re)entered.
+            g_ps2EeSampleCurrent.store(context.pc, std::memory_order_relaxed);
             loadSharedVu0Random(context);
+#if defined(PS2X_P3FES_FRAME_TRACE)
+            {
+                p3fes_frame_trace::GuestScope frameTraceScope(context.pc, 0u, true);
+                function(m_rdram, &context, &m_runtime);
+            }
+#else
             function(m_rdram, &context, &m_runtime);
+#endif
             saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            noteTransferCatch();
             saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
@@ -562,6 +917,9 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return static_cast<uint32_t>(n < 1 ? 1 : (n > 64 ? 64 : n));
     }();
     cycles *= cycleScale;
+#if defined(PS2X_P3FES_FRAME_TRACE)
+    p3fes_frame_trace::noteCheckpoint(cycles);
+#endif
     g_busyCyclesThisField += cycles; // charged by guest code (generated back edges, dispatches)
     accountCycles(cycles);
 
@@ -573,6 +931,12 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         if (count != cap.lastCount)
         {
             const uint64_t tick = m_vsyncTick;
+            if (frameHistOn()) frameHistFrame(tick, false);
+            if (vsyncSlipOn())
+            {
+                g_slipFrameStart = std::chrono::steady_clock::now();
+                ++g_slipFrameId;
+            }
             if (g_ps2xIpuActivity != g_frameCapIpuSeen)
             {
                 g_frameCapIpuSeen = g_ps2xIpuActivity;
@@ -586,6 +950,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
                 // The dispatch loop puts this thread to sleep until the next vblank (its vblank wait then lands one
                 // field later).
                 g_frameCapThread = running->id;
+                g_fhCapFields += 1u;
                 g_frameCapAfterTick = tick;
                 cap.lastTick = tick + 1u;
                 cap.lastCount = count;
@@ -601,13 +966,15 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         }
     }
 
-    if (m_checkpointPending.load(std::memory_order_acquire) ||
-        m_stopRequested.load(std::memory_order_acquire))
+    // These are scalar hints/state only; event payloads are published under m_eventMutex,
+    // and the deadline is an executor-owned scalar, so no acquire payload is consumed here.
+    if (m_checkpointPending.load(std::memory_order_relaxed) ||
+        m_stopRequested.load(std::memory_order_relaxed))
     {
         return true;
     }
 
-    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_relaxed);
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
         m_checkpointPending.store(true, std::memory_order_release);
@@ -807,6 +1174,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
+    noteTransferThrow();
     throw EeDispatcherTransfer{};
 }
 
@@ -1132,6 +1500,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
+    noteTransferThrow();
     throw EeDispatcherTransfer{};
 }
 
@@ -1436,6 +1805,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     owner->invocations.push_back(std::move(invocation));
     logHandoff("invoke", owner);
     publishSnapshot();
+    noteTransferThrow();
     throw EeDispatcherTransfer{};
 }
 
@@ -1456,6 +1826,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     }
     logHandoff("invoke-seq", owner);
     publishSnapshot();
+    noteTransferThrow();
     throw EeDispatcherTransfer{};
 }
 
@@ -1801,14 +2172,33 @@ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
     }
 }
 
+namespace
+{
+    // The snapshot is a debugging view (debug panel, hang reports). Building it copies and sorts every thread,
+    // semaphore and event flag, and it used to be rebuilt on every thread state change: several times per vblank,
+    // 3% of the game thread in the dorm scene. It is now rebuilt when a reader has asked since the last one, and
+    // otherwise at most four times per emulated second so a hang report is never far behind.
+    std::atomic<bool> g_snapshotWanted{true};
+    uint64_t g_snapshotLastCycle = 0u;
+    constexpr uint64_t kSnapshotIdleCycles = 294912000ull / 4u;
+}
+
 EeKernelSnapshot EeScheduler::snapshot() const
 {
+    g_snapshotWanted.store(true, std::memory_order_relaxed);
     std::lock_guard lock(m_snapshotMutex);
     return m_snapshot;
 }
 
 void EeScheduler::publishSnapshot()
 {
+    if (!g_snapshotWanted.load(std::memory_order_relaxed) && m_eeCycle - g_snapshotLastCycle < kSnapshotIdleCycles &&
+        m_eeCycle >= g_snapshotLastCycle && m_running.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+    g_snapshotWanted.store(false, std::memory_order_relaxed);
+    g_snapshotLastCycle = m_eeCycle;
     EeKernelSnapshot next{};
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;
@@ -2016,6 +2406,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     logHandoff("block", self);
     m_currentThreadId = 0;
     publishSnapshot();
+    noteTransferThrow();
     throw EeDispatcherTransfer{};
 }
 
@@ -2177,6 +2568,7 @@ void EeScheduler::processDueDeadlines()
             if (now < pacingDeadline)
             {
                 ++g_dbgPacingWaits;
+                FhScopedWait fhWait(g_fhPacingUs, g_fhPacingCount);
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
@@ -2246,7 +2638,48 @@ void EeScheduler::processDueDeadlines()
                 // (loading, a heavy scene), restart the schedule from now instead of running fields back to back.
                 auto hostBase = scheduled.hostDeadline;
                 const auto hostNow = std::chrono::steady_clock::now();
-                if (hostBase + 2 * kVBlankPeriod < hostNow)
+                // PS2X_PACE_DIAG=1: every 300 fields, how often the schedule was restarted, the host time
+                // given up by it, and the longest gap between two consecutive fields.
+                {
+                    static const bool paceDiag = [] { const char *v = std::getenv("PS2X_PACE_DIAG"); return v && *v == '1'; }();
+                    static unsigned fields = 0u, resets = 0u, lateFields = 0u;
+                    static double lostMs = 0.0, worstGapMs = 0.0, worstLateMs = 0.0;
+                    static std::chrono::steady_clock::time_point previous{};
+                    if (paceDiag)
+                    {
+                        const double lateMs = std::chrono::duration<double, std::milli>(hostNow - hostBase).count();
+                        if (previous.time_since_epoch().count() != 0)
+                            worstGapMs = std::max(worstGapMs, std::chrono::duration<double, std::milli>(hostNow - previous).count());
+                        previous = hostNow;
+                        worstLateMs = std::max(worstLateMs, lateMs);
+                        if (lateMs > 1.0) ++lateFields;
+                        if (hostBase + 15 * kVBlankPeriod < hostNow)
+                        {
+                            ++resets;
+                            lostMs += lateMs;
+                        }
+                        if (++fields >= 300u)
+                        {
+                            std::fprintf(stderr, "[pace] 300 fields: late=%u resets=%u lost=%.0f ms worst-late=%.1f ms worst-gap=%.1f ms\n",
+                                         lateFields, resets, lostMs, worstLateMs, worstGapMs);
+                            fields = resets = lateFields = 0u;
+                            lostMs = worstGapMs = worstLateMs = 0.0;
+                        }
+                    }
+                }
+                // How far behind the schedule may fall before it is restarted. Two fields (the old rule)
+                // made every hiccup longer than 33 ms a permanent loss: on the Vita the game thread is
+                // stalled for 90-190 ms a couple of times every few seconds (log writes to the memory
+                // card and the like), which cost 4-7 % of game speed with the thread only 80 % busy. Up to
+                // a quarter of a second is now recovered by running fields back to back with the spare
+                // CPU; longer stretches (loading) still restart. PS2X_PACE_CATCHUP_FIELDS overrides (2 =
+                // old behaviour).
+                static const int catchUpFields = [] {
+                    const char *v = std::getenv("PS2X_PACE_CATCHUP_FIELDS");
+                    const int parsed = v && *v ? std::atoi(v) : 15;
+                    return parsed >= 1 && parsed <= 600 ? parsed : 15;
+                }();
+                if (hostBase + catchUpFields * kVBlankPeriod < hostNow)
                     hostBase = hostNow;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               hostBase + kVBlankDuration,
@@ -2439,11 +2872,39 @@ void EeScheduler::waitForEvent()
     {
         return;
     }
+    if (vsyncSlipOn() && g_slipFrameId != g_slipDoneFrameId && g_slipFrameStart != std::chrono::steady_clock::time_point{})
+    {
+        // The frame has used up its field budget (PS2X_FRAME_CAP_FIELDS fields since the frame counter last
+        // advanced) and every guest thread is blocked: the wait for the next vblank would only round the frame up
+        // to a whole number of fields (a 36 ms frame costs 50 ms). Slide the whole host schedule earlier so that
+        // vblank is due now; the schedule then continues from here. Not during movies (their decode is paced by
+        // the vblank clock).
+        const auto now = std::chrono::steady_clock::now();
+        const uint32_t fields = frameCap().fields;
+        const bool moviePlaying = g_frameCapIpuTick != 0u && m_vsyncTick - g_frameCapIpuTick < 30u;
+        if (!moviePlaying && now - g_slipFrameStart >= fields * kVBlankPeriod - std::chrono::microseconds(500))
+        {
+            const ScheduledEvent *vblank = nullptr;
+            for (const ScheduledEvent &item : m_deadlines)
+                if (item.event.type == EeEventType::VBlankStart && (!vblank || item.deadlineCycle < vblank->deadlineCycle))
+                    vblank = &item;
+            if (vblank && vblank->hostDeadline > now)
+            {
+                const auto delta = vblank->hostDeadline - now;
+                for (ScheduledEvent &item : m_deadlines)
+                    item.hostDeadline -= delta;
+                ++g_slipCount;
+                g_slipSavedUs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(delta).count());
+            }
+            g_slipDoneFrameId = g_slipFrameId;
+        }
+    }
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
         ++g_dbgWaitForever;
+        FhScopedWait fhWait(g_fhEventUs, g_fhEventCount);
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
         return;
@@ -2467,7 +2928,17 @@ void EeScheduler::waitForEvent()
     }
     if (hasTimerDeadline)
     {
-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+        // Host time of the timer interrupt. Measured back from the next scheduled event (in practice
+        // the vblank, whose host deadline follows the frame schedule) rather than forward from now:
+        // when the frame's work ran past a vblank, "now + duration" made every timer tick of the
+        // idle remainder wait its full real-time length, so the lateness was never recovered. With
+        // the game's sound drivers loaded (EE timer ticks all through the frame) that held the game
+        // at 93 % speed with the thread only 81 % busy. PS2X_TIMER_PACE=now restores the old rule.
+        static const bool paceFromNow = [] { const char *v = std::getenv("PS2X_TIMER_PACE"); return v && std::strcmp(v, "now") == 0; }();
+        auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+        const uint64_t timerCycle = m_eeCycle + timerCycles;
+        if (!paceFromNow && hostDeadline != std::chrono::steady_clock::time_point::max() && timerCycle < deadlineCycle)
+            timerHostDeadline = std::min(timerHostDeadline, hostDeadline - eeCyclesToHostDuration(deadlineCycle - timerCycle));
         if (timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
@@ -2475,6 +2946,7 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    FhScopedWait fhWait(g_fhEventUs, g_fhEventCount);
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2500,6 +2972,27 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
 {
     {
         std::lock_guard lock(m_eventMutex);
+        // One clock for every paced event. Callers give "now + the event's duration", which is only
+        // right while the host keeps up: when a frame's work has run past a vblank, emulated time is
+        // behind the host and an alarm or thread delay scheduled then would wait its full real
+        // length on top of that lateness (with the game's sound drivers loaded this held the game at
+        // 93 % speed with the thread 82 % busy). The pending vblank carries the frame schedule's
+        // mapping from emulated cycles to host time; no other event may be later than that mapping
+        // puts it. PS2X_TIMER_PACE=now restores the callers' deadlines.
+        static const bool paceFromNow = [] { const char *v = std::getenv("PS2X_TIMER_PACE"); return v && std::strcmp(v, "now") == 0; }();
+        if (!paceFromNow && event.type != EeEventType::VBlankStart && event.type != EeEventType::VBlankEnd)
+        {
+            for (const ScheduledEvent &item : m_deadlines)
+            {
+                if (item.event.type != EeEventType::VBlankStart)
+                    continue;
+                const auto scheduled = deadlineCycle <= item.deadlineCycle
+                    ? item.hostDeadline - eeCyclesToHostDuration(item.deadlineCycle - deadlineCycle)
+                    : item.hostDeadline + eeCyclesToHostDuration(deadlineCycle - item.deadlineCycle);
+                hostDeadline = std::min(hostDeadline, scheduled);
+                break;
+            }
+        }
         m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
         updateNextDeadline();
     }

@@ -345,6 +345,9 @@ bool PS2IopHostAdapter::hostFileSize(uint64_t handle, uint64_t &size) const
     return true;
 }
 
+extern "C" uint64_t ps2xFrameHistNowUs();                   // EeScheduler.cpp
+extern "C" void ps2xFrameHistNoteRead(uint64_t startUs, size_t bytes); // EeScheduler.cpp
+
 bool PS2IopHostAdapter::readHostFile(uint64_t handle,
                                      uint64_t offset,
                                      void *destination,
@@ -375,9 +378,11 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
         return false;
     }
 
+    const uint64_t ioStart = ps2xFrameHistNowUs(); // PS2X_FRAME_HIST / PS2X_STALL_DIAG: time and size of host file reads
     bytesRead = size == 0u
                     ? 0u
                     : std::fread(destination, 1u, size, it->second.stream);
+    ps2xFrameHistNoteRead(ioStart, size);
     if (bytesRead < size && std::ferror(it->second.stream))
     {
         std::clearerr(it->second.stream);
