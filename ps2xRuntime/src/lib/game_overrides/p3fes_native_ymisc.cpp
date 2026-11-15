@@ -1,4 +1,5 @@
 #include "p3fes_native_ymisc.h"
+#include "p3fes_native_effects.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -1096,6 +1097,7 @@ namespace p3fes_native_ymisc
 
     bool install(PS2Runtime &runtime)
     {
+        p3fes_native_effects::install(runtime); // TEMPORARY unity build: p3fes_native_effects.cpp is included at the end of this file
         const char *value = std::getenv("P3FES_NATIVE_YMISC");
         const char *diag = std::getenv("P3FES_RESOURCE_DIAG");
         g_diag = diag && *diag == '1';

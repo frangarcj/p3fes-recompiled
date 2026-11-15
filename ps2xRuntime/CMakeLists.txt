@@ -474,6 +474,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
     src/lib/game_overrides/p3fes_native_frame_cuts.cpp
     src/lib/game_overrides/p3fes_native_dialogue.cpp
     src/lib/game_overrides/p3fes_native_ymisc.cpp
+    src/lib/game_overrides/p3fes_native_effects.cpp
     src/lib/game_overrides/p3fes_debug_warp.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
