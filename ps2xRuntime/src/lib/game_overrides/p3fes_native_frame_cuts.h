@@ -18,6 +18,21 @@ class PS2Runtime;
 //   P3FES_CUT_CRI_TRACE=1 diagnostic call counters of the CRI entry points (P3FES_RESOURCE_DIAG=1 prints them)
 //   P3FES_CUT_RWALLOC    RwMalloc/RwFree/RwCalloc         (0x104140/0x104280/0x104040)
 //   P3FES_CUT_DBPRT      H_Dbprt_Main                     (0x104420)
+//   P3FES_CUT_RS         _rwSkySetRenderState repeat gate (0x4D6B90); "verify" checks every dropped call
+//   P3FES_CUT_RS_EXACT   0 = off: the blend states (10, 11) are dropped when they would store what the driver's ALPHA
+//                        shadow already holds (reads the words themselves; the repeat gate cannot tell)
+//   P3FES_CUT_RS_TEX     RenderState(TEXTURERASTER, raster) answered natively when it needs no GS packet (texture path
+//                        of the native renderer); "verify" (every P3FES_CUT_RS_TEX_EVERY-th call) runs both on a copy
+//                        of RAM and compares
+//   P3FES_CUT_MAESTRO    h_maestro_001127d0 (the generic 2-D sprite/panel drawer) in C++ (p3fes_native_ui.cpp);
+//                        "verify" (every P3FES_CUT_MAESTRO_VERIFY_EVERY-th call) compares RAM, registers and the whole
+//                        sequence of render-state / Im2D calls with the guest function; P3FES_CUT_MAESTRO_RPSET=0 keeps
+//                        its RpSkyRenderStateSet(2|3) calls even when they would store what is already there
+//   P3FES_CUT_IM2D       quad fast path of the Im2D hook (p3fes_renderware.cpp); "verify" compares its draw record with
+//                        the generic path's on every call
+//   P3FES_CUT_FONT       frFontRaster (p3fes_native_dialogue.cpp); P3FES_CUT_FONT_DIRECT=0: through guest vertices
+//   P3FES_UI_PROF=1|2    per-category cost of the 2-D path (ns on the Mac, PMU instructions on the Vita)
+//   P3FES_UI_ALTERNATE=<s>  turns the native paths of the 2-D path off and on every <s> seconds (A/B inside one run)
 // "verify" is accepted by SHADOWMAP, RWALLOC, ADXT_IDLE and CRI_IDLE: the guest function runs and the
 // native result is compared against it (diagnostic only).
 namespace p3fes_native_frame_cuts

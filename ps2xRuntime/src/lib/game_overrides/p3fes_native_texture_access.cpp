@@ -1,5 +1,6 @@
 #include "p3fes_native_texture_access.h"
 #include "p3fes_native_texture_access_internal.h"
+#include "p3fes_native_raster_lifecycle.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -34,6 +35,9 @@ namespace p3fes_native_texture_access
         detail::RasterSet g_nativeRasters;
         // Hooks, lifecycle operations and diagnostics all run on the EE worker.
         Counters g_counters{};
+        // accessRasterNative's memo of the last raster it prepared (see there)
+        uint32_t g_memoRaster = 0u;
+        uint64_t g_memoEpoch = 0u;
 
         bool readGuestU32(const uint8_t *rdram, uint32_t address, uint32_t &value)
         {
@@ -101,6 +105,7 @@ namespace p3fes_native_texture_access
             }
 
             g_nativeRasters.forget(raster);
+            g_memoRaster = 0u;
             ++g_counters.accessFallback;
             invokeOriginal(kRpSkyTexCacheAccessRaster, rdram, ctx, runtime);
         }
@@ -121,6 +126,7 @@ namespace p3fes_native_texture_access
             }
 
             g_nativeRasters.forget(raster);
+            g_memoRaster = 0u;
             ++g_counters.speculateFallback;
             invokeOriginal(kRpSkyTexCacheAccessSpeculate, rdram, ctx, runtime);
         }
@@ -230,8 +236,39 @@ namespace p3fes_native_texture_access
         return allInstalled;
     }
 
+    bool accessRasterNative(uint8_t *rdram, uint32_t raster, uint32_t accessFlags)
+    {
+        // The last raster prepared and marked, and the raster lifecycle epoch it was valid at: preparing it again
+        // (descriptor check, host texture lookup, marking) can only repeat the same answer while no raster has been
+        // modified, retired or reset (epoch(), the same rule the draw path's name cache relies on).
+        uint32_t &memoRaster = g_memoRaster;
+        uint64_t &memoEpoch = g_memoEpoch;
+        const uint64_t epoch = p3fes_native_rasters::epoch();
+        if (raster != memoRaster || epoch != memoEpoch)
+        {
+            if (!prepareCpuRaster(rdram, raster))
+            {
+                g_nativeRasters.forget(raster);
+                memoRaster = 0u;
+                return false;
+            }
+            g_nativeRasters.mark(raster);
+            memoRaster = raster;
+            memoEpoch = epoch;
+        }
+        writeGuestU32(rdram, kRwCurrentRaster, raster);
+        writeGuestU32(rdram, kRwCurrentRasterFlags, accessFlags);
+        writeGuestU32(rdram, kSkyCurrentRaster, raster);
+        writeGuestU32(rdram, kSkyCurrentRasterFlags, accessFlags);
+        ++g_counters.speculateNative;
+        ++g_counters.accessNative;
+        return true;
+    }
+
     void forgetRaster(uint32_t raster)
     {
+        if (raster == g_memoRaster)
+            g_memoRaster = 0u;
         g_nativeRasters.forget(raster);
     }
 

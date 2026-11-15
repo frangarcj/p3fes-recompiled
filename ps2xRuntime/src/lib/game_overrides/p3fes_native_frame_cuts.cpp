@@ -1,5 +1,7 @@
 #include "p3fes_native_frame_cuts.h"
 #include "p3fes_native_dialogue.h"
+#include "p3fes_native_ui.h"
+#include "p3fes_native_texture_access.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -499,7 +501,190 @@ namespace p3fes_native_frame_cuts
         bool g_rsKnown[64] = {};
         uint64_t g_rsDroppable = 0u; // bit per state, filled from the verify results (see install)
         unsigned g_rsChangeLogs = 0u;
+        bool g_rsGatedNow = false; // set by renderStateBody: the call was answered by the gate (probes only)
+
+        // Exact no-op test for the two blend states. Both only store a RenderWare blend factor (as 0..5, [gp-0x4F28]
+        // = source, [gp-0x4F24] = destination), look the pair up in a 6x6 table (0x77EF80, 24 bytes per destination
+        // row), store the entry sign-extended in the ALPHA shadow ([gp-0x4288]; |0x80<<32 for ONE/ONE... both 1) and
+        // emit one GS packet. The game sets the same pair around every sprite, but its sprite drawer also writes the
+        // ALPHA shadow directly (RpSkyRenderStateSet 2), so the repeat gate above cannot tell whether the next call
+        // changes anything. This reads the words themselves: when the call would store what is already there it only
+        // emits a packet (dead in the native renderer), as the dropped repeats of the other states do.
+        // P3FES_CUT_RS_EXACT=0 turns it off; P3FES_CUT_RS=verify checks every such call against the guest function.
+        bool g_rsExact = true;
+        uint64_t g_rsExactNoop = 0u, g_rsExactChanged = 0u;
+        constexpr uint32_t kRsBlendSrc = kRwGpAddress - 0x4F28u, kRsBlendDst = kRwGpAddress - 0x4F24u, kRsAlphaShadow = kRwGpAddress - 0x4288u;
+        constexpr uint32_t kRsBlendTable = 0x00780000u - 0x1080u;
+        inline int rsBlendIndex(uint32_t value) // RwBlendFunction -> the driver's 0..5 (-1: the guest function returns 0 and stores nothing)
+        {
+            switch (value)
+            {
+            case 1u: return 0;
+            case 2u: return 1;
+            case 5u: return 2;
+            case 6u: return 3;
+            case 7u: return 4;
+            case 8u: return 5;
+            default: return -1;
+            }
+        }
+        inline bool rsBlendNoop(const uint8_t *rdram, uint32_t state, uint32_t value)
+        {
+            const int index = rsBlendIndex(value);
+            if (index < 0)
+                return false;
+            const uint32_t src = state == 10u ? static_cast<uint32_t>(index) : r32(rdram, kRsBlendSrc);
+            const uint32_t dst = state == 10u ? r32(rdram, kRsBlendDst) : static_cast<uint32_t>(index);
+            if (r32(rdram, state == 10u ? kRsBlendSrc : kRsBlendDst) != static_cast<uint32_t>(index) || src > 5u || dst > 5u)
+                return false;
+            const int32_t entry = static_cast<int32_t>(r32(rdram, kRsBlendTable + dst * 24u + src * 4u));
+            if (entry < 0)
+                return false;
+            uint64_t expected = static_cast<uint64_t>(static_cast<int64_t>(entry));
+            if (src == 1u && dst == 1u)
+                expected |= 0x80ull << 32;
+            uint64_t shadow;
+            std::memcpy(&shadow, rdram + kRsAlphaShadow, sizeof(shadow));
+            return shadow == expected;
+        }
+        // ---- state 1, TEXTURERASTER (RenderState(1, raster)), ~2200 host instructions in the guest function ---------
+        //
+        // For a raster the native texture path handles, the guest function is: [gp-0x4234] = raster; the two texture-
+        // cache hooks (prepare the host texture, bind it as RenderWare's and the Sky cache's current raster); flags word
+        // [gp-0x4F30] |= 0x10; [gp-0x4238] = (raster format != 6); flags |= 0x40 when [gp-0x423C] != 0 or that is set,
+        // else &= ~0x40; and the GS TEST shadow's ATE bit ([gp-0x42B0] bit 0) is made to follow "format != 6", with a GS
+        // packet when it flips. RenderState(1, 0) (untextured) is the same without the hooks: current raster 0, flags
+        // &= ~0x10, [gp-0x4238] = 0, ATE cleared (packet when it was set). The shortcut does exactly those writes when no
+        // packet is needed and the hook prepares the raster; every other case (ATE flips, a raster the native path
+        // does not handle) is decided from reads alone and left to the guest function.
+        // P3FES_CUT_RS_TEX=0 turns it off; =verify runs every Nth call on a copy of RAM both ways and compares.
+        enum class TexMode : uint8_t { Off, On, Verify };
+        TexMode g_rsTexMode = TexMode::On;
+        int g_rsTexEvery = 53;
+        uint64_t g_rsTexTick = 0u, g_rsTexNative = 0u, g_rsTexLeft = 0u, g_rsTexVerifyOk = 0u, g_rsTexVerifyBad = 0u, g_rsTexVerifyUnwound = 0u;
+        constexpr uint32_t kRsFlagsWord = kRwGpAddress - 0x4F30u, kRsCurrentRaster = kRwGpAddress - 0x4234u, kRsTexOpaque = kRwGpAddress - 0x4238u,
+                           kRsTexAux = kRwGpAddress - 0x423Cu, kRsTestShadow = kRwGpAddress - 0x42B0u;
+        // true: the call is done (state words written, raster bound); false: nothing was changed
+        inline bool rsTextureNative(uint8_t *rdram, uint32_t raster)
+        {
+            uint64_t flags, test;
+            std::memcpy(&flags, rdram + kRsFlagsWord, 8u);
+            std::memcpy(&test, rdram + kRsTestShadow, 8u);
+            const bool aux = r32(rdram, kRsTexAux) != 0u;
+            bool textured = false;
+            if (raster != 0u)
+            {
+                if (raster < 0x100000u || static_cast<uint64_t>(raster) + 0x24u > PS2_RAM_SIZE)
+                    return false;
+                textured = (r8(rdram, raster + 0x23u) & 0x0Fu) != 6u;
+            }
+            if (textured != ((test & 1u) != 0u))
+                return false; // the ATE bit flips: the guest function emits a GS packet for it
+            if (raster != 0u)
+            {
+                if (!p3fes_native_texture_access::accessRasterNative(rdram, raster, 0u))
+                    return false;
+                flags |= 0x10u;
+            }
+            else
+            {
+                w32(rdram, kRsCurrentRaster, 0u);
+                flags &= ~0x10ull;
+            }
+            w32(rdram, kRsTexOpaque, textured ? 1u : 0u);
+            flags = (aux || textured) ? (flags | 0x40ull) : (flags & ~0x40ull);
+            std::memcpy(rdram + kRsFlagsWord, &flags, 8u);
+            return true;
+        }
+
+        void renderStateBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+        // Runs one RenderState(1, raster) both ways (native first, for real; then the guest function on the restored
+        // state) and compares RAM and registers. True: the call was fully handled here (state is the guest function's).
+        bool rsTextureVerify(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t raster)
+        {
+            static std::vector<uint8_t> before, afterNative;
+            before.resize(PS2_RAM_SIZE);
+            afterNative.resize(PS2_RAM_SIZE);
+            const uint32_t ra = getRegU32(ctx, 31), sp = getRegU32(ctx, 29);
+            const R5900Context ctxBefore = *ctx;
+            uint8_t cache[kRenderStateCacheBytes];
+            saveRenderStateCache(cache);
+            std::memcpy(before.data(), rdram, PS2_RAM_SIZE);
+            if (!rsTextureNative(rdram, raster))
+                return false; // a case the shortcut leaves to the guest function: nothing changed
+            std::memcpy(afterNative.data(), rdram, PS2_RAM_SIZE);
+            std::memcpy(rdram, before.data(), PS2_RAM_SIZE);
+            restoreRenderStateCache(cache);
+            *ctx = ctxBefore;
+            g_rsOriginal(rdram, ctx, runtime);
+            for (uint32_t resume = 0u; resume < 100000u && ctx->pc != ra; ++resume)
+            {
+                if (runtime->isStopRequested() || ctx->pc == 0u || !runtime->hasFunction(ctx->pc))
+                    break;
+                runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+            }
+            if (ctx->pc != ra)
+            {
+                ++g_rsTexVerifyUnwound;
+                return true;
+            }
+            const uint32_t deadLo = sp - 0x400u, deadHi = sp;
+            bool ramOk = true;
+            uint32_t badAddr = 0u;
+            for (uint32_t a = 0u; a < PS2_RAM_SIZE; a += 16u)
+            {
+                if (a >= deadLo && a < deadHi)
+                    continue;
+                if (std::memcmp(rdram + a, afterNative.data() + a, 16u) != 0)
+                {
+                    ramOk = false;
+                    badAddr = a;
+                    break;
+                }
+            }
+            const bool regsOk = getRegU32(ctx, 2) == 1u && getRegU32(ctx, 29) == sp && getRegU32(ctx, 31) == ra && GPR_U64(ctx, 16) == GPR_U64(&ctxBefore, 16) &&
+                                GPR_U64(ctx, 17) == GPR_U64(&ctxBefore, 17);
+            if (ramOk && regsOk)
+            {
+                ++g_rsTexVerifyOk;
+                return true;
+            }
+            if (g_rsTexVerifyBad++ < 12u)
+            {
+                uint32_t o = 0u, n = 0u, b = 0u;
+                std::memcpy(&o, rdram + badAddr, 4);
+                std::memcpy(&n, afterNative.data() + badAddr, 4);
+                std::memcpy(&b, before.data() + badAddr, 4);
+                std::fprintf(stderr, "[p3fes-cuts] render-state(1) verify MISMATCH raster=%08X ram=%d regs=%d v0=%08X ram[%06X was=%08X orig=%08X native=%08X]\n",
+                             raster, ramOk ? 1 : 0, regsOk ? 1 : 0, getRegU32(ctx, 2), badAddr, b, o, n);
+            }
+            return true;
+        }
+
         void renderStateHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (__builtin_expect(p3fes_native_ui::g_prof.mode != 0, 0))
+            {
+                const uint32_t begin = p3fes_native_ui::stamp();
+                const uint32_t state = getRegU32(ctx, 4), retPc = getRegU32(ctx, 31);
+                g_rsGatedNow = false;
+                renderStateBody(rdram, ctx, runtime);
+                p3fes_native_ui::note(g_rsGatedNow ? p3fes_native_ui::RsGated : p3fes_native_ui::RsOriginal, begin);
+                const uint32_t spent = static_cast<uint32_t>(p3fes_native_ui::stamp() - begin) - p3fes_native_ui::g_prof.stampCost;
+                p3fes_native_ui::Stat &st = (g_rsGatedNow ? p3fes_native_ui::g_prof.rsGate : p3fes_native_ui::g_prof.rsState)[state & 63u];
+                ++st.calls;
+                st.sum += spent;
+                if (p3fes_native_ui::g_prof.ctx == p3fes_native_ui::CtxOther)
+                {
+                    p3fes_native_ui::Stat &c = p3fes_native_ui::g_prof.callerRs[retPc];
+                    ++c.calls;
+                    c.sum += spent;
+                }
+                return;
+            }
+            renderStateBody(rdram, ctx, runtime);
+        }
+        void renderStateBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             const uint32_t state = getRegU32(ctx, 4), value = getRegU32(ctx, 5);
             if (state >= 64u)
@@ -511,15 +696,39 @@ namespace p3fes_native_frame_cuts
             const bool same = g_rsKnown[state] && g_rsLast[state] == value;
             g_rsKnown[state] = true;
             g_rsLast[state] = value;
-            if (!same)
+            if (state == 1u && g_rsTexMode != TexMode::Off && p3fes_native_ui::g_cutsOn)
+            {
+                if (g_rsTexMode == TexMode::Verify)
+                {
+                    if ((++g_rsTexTick % static_cast<uint64_t>(g_rsTexEvery)) == 0u && rsTextureVerify(rdram, ctx, runtime, value))
+                        return;
+                }
+                else if (rsTextureNative(rdram, value))
+                {
+                    ++g_rsTexNative;
+                    g_rsGatedNow = true;
+                    setReturnS32(ctx, 1);
+                    returnToCaller(ctx);
+                    return;
+                }
+                ++g_rsTexLeft;
+                g_rsOriginal(rdram, ctx, runtime);
+                return;
+            }
+            const bool exact = g_rsExact && p3fes_native_ui::g_cutsOn && (state == 10u || state == 11u) && rsBlendNoop(rdram, state, value);
+            if (!same && !exact)
             {
                 g_rsOriginal(rdram, ctx, runtime);
                 return;
             }
-            ++g_rsSame[state];
-            if (g_rsMode == Mode::On && ((g_rsDroppable >> state) & 1u) != 0u)
+            if (same)
+                ++g_rsSame[state];
+            if (g_rsMode == Mode::On && (exact || ((g_rsDroppable >> state) & 1u) != 0u))
             {
                 ++g_rsDropped;
+                if (exact)
+                    ++g_rsExactNoop;
+                g_rsGatedNow = true;
                 setReturnS32(ctx, 1);
                 returnToCaller(ctx);
                 return;
@@ -529,6 +738,8 @@ namespace p3fes_native_frame_cuts
                 g_rsOriginal(rdram, ctx, runtime);
                 return;
             }
+            if (exact)
+                ++g_rsExactNoop;
             static uint8_t before[kRsBlockSize];
             std::memcpy(before, rdram + kRsBlockStart, kRsBlockSize);
             const uint32_t returnPc = getRegU32(ctx, 31);
@@ -546,11 +757,14 @@ namespace p3fes_native_frame_cuts
             }
             if (std::memcmp(before, rdram + kRsBlockStart, kRsBlockSize) == 0)
                 return;
-            ++g_rsSameChanged[state];
+            if (exact)
+                ++g_rsExactChanged;
+            else
+                ++g_rsSameChanged[state];
             if (g_rsChangeLogs < 40u)
             {
                 ++g_rsChangeLogs;
-                std::fprintf(stderr, "[p3fes-cuts] render-state repeat changed state: state=%u value=%08X:", state, value);
+                std::fprintf(stderr, "[p3fes-cuts] render-state %s changed state: state=%u value=%08X:", exact ? "exact-no-op" : "repeat", state, value);
                 unsigned shown = 0u;
                 for (uint32_t k = 0u; k + 4u <= kRsBlockSize && shown < 6u; k += 4u)
                     if (std::memcmp(before + k, rdram + kRsBlockStart + k, 4u) != 0)
@@ -562,6 +776,232 @@ namespace p3fes_native_frame_cuts
                         ++shown;
                     }
                 std::fprintf(stderr, "\n");
+            }
+        }
+
+        // ---- GS packet room (0x4D59D0): librwcore_palquant_004d59d0(flags, qwords) ----------------------------------
+        //
+        // Every state emission of _rwSkySetRenderState / RpSkyRenderStateSet first asks this function whether the open
+        // GIF packet has room for `qwords` more quadwords (plus a tag). In the common case (a packet is open, 0x1101,
+        // the data fits the 8 KiB chunk and the buffer's limit) it only stores one bookkeeping word, [gp-0x4320] =
+        // [gp-0x42E8] + 16 * (qwords + 4 [+ 1]) + ([gp-0x42FC] - [gp-0x42E4]), and returns 1; every other case flushes,
+        // starts a packet or kicks a DMA. ~450 host instructions in the guest function. The hook does exactly that
+        // store for the common case (decided from reads alone, before anything is written) and runs the guest function
+        // otherwise. P3FES_CUT_PKT=0 turns it off, =verify compares the two on a copy of RAM every
+        // P3FES_CUT_PKT_EVERY-th call.
+        constexpr uint32_t kPacketRoom = 0x004D59D0u;
+        GuestFunction g_packetOriginal = nullptr;
+        Mode g_packetMode = Mode::Off;
+        int g_packetEvery = 211;
+        uint64_t g_packetTick = 0u, g_packetNative = 0u, g_packetGuest = 0u, g_packetVerifyOk = 0u, g_packetVerifyBad = 0u, g_packetUnwound = 0u;
+        // true: the call is answered (the bookkeeping word is written); false: nothing was changed
+        inline bool packetRoomNative(uint8_t *rdram, uint32_t flags, uint32_t qwords)
+        {
+            constexpr uint32_t kState = kRwGpAddress - 0x433Cu, kBase = kRwGpAddress - 0x42E4u, kCursor = kRwGpAddress - 0x42FCu,
+                               kLimit2 = kRwGpAddress - 0x42E8u, kLimit = kRwGpAddress - 0x431Cu, kNeed = kRwGpAddress - 0x4320u;
+            const uint32_t state = r32(rdram, kState);
+            if (state == 0u || (state & 0x7FFFFFFFu) != 0x1101u)
+                return false;
+            const uint32_t extra = (flags & ~state & 0x80000000u) != 0u ? 5u : 4u;
+            const uint32_t need = (qwords + extra) << 4;
+            const uint32_t base = r32(rdram, kBase), cursor = r32(rdram, kCursor), limit2 = r32(rdram, kLimit2), limit = r32(rdram, kLimit);
+            const uint32_t used = cursor - base;
+            // sltu on sign-extended 32-bit results
+            const uint32_t end = limit2 + used + need;
+            if (!(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(end))) < static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(limit)))))
+                return false;
+            if (!(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(need + used))) < 0x2001ull))
+                return false;
+            if ((state & 0x80000000u) != flags)
+                return false;
+            w32(rdram, kNeed, limit2 + need + cursor - base);
+            return true;
+        }
+        void packetRoomHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (ctx->pc != kPacketRoom || !p3fes_native_ui::g_cutsOn)
+            {
+                g_packetOriginal(rdram, ctx, runtime);
+                return;
+            }
+            const uint32_t flags = getRegU32(ctx, 4), qwords = getRegU32(ctx, 5);
+            // every caller asks with `lui a0, 0x8000` (sign-extended) and a small count
+            if (GPR_U64(ctx, 4) != 0xFFFFFFFF80000000ull || GPR_U64(ctx, 5) > 64u)
+            {
+                ++g_packetGuest;
+                g_packetOriginal(rdram, ctx, runtime);
+                return;
+            }
+            if (g_packetMode == Mode::Verify && (++g_packetTick % static_cast<uint64_t>(g_packetEvery)) == 0u)
+            {
+                static std::vector<uint8_t> before, afterNative;
+                before.resize(PS2_RAM_SIZE);
+                afterNative.resize(PS2_RAM_SIZE);
+                const R5900Context ctxBefore = *ctx;
+                const uint32_t ra = getRegU32(ctx, 31), sp = getRegU32(ctx, 29);
+                std::memcpy(before.data(), rdram, PS2_RAM_SIZE);
+                if (packetRoomNative(rdram, flags, qwords))
+                {
+                    std::memcpy(afterNative.data(), rdram, PS2_RAM_SIZE);
+                    std::memcpy(rdram, before.data(), PS2_RAM_SIZE);
+                    *ctx = ctxBefore;
+                    g_packetOriginal(rdram, ctx, runtime);
+                    if (ctx->pc != ra)
+                    {
+                        ++g_packetUnwound;
+                        return;
+                    }
+                    bool ramOk = true;
+                    uint32_t bad = 0u;
+                    for (uint32_t a = 0u; a < PS2_RAM_SIZE; a += 16u)
+                    {
+                        if (a >= sp - 0x200u && a < sp)
+                            continue;
+                        if (std::memcmp(rdram + a, afterNative.data() + a, 16u) != 0)
+                        {
+                            ramOk = false;
+                            bad = a;
+                            break;
+                        }
+                    }
+                    const bool regsOk = getRegU32(ctx, 2) == 1u && getRegU32(ctx, 29) == sp && getRegU32(ctx, 31) == ra &&
+                                        GPR_U64(ctx, 16) == GPR_U64(&ctxBefore, 16) && GPR_U64(ctx, 17) == GPR_U64(&ctxBefore, 17);
+                    if (ramOk && regsOk)
+                        ++g_packetVerifyOk;
+                    else if (g_packetVerifyBad++ < 8u)
+                        std::fprintf(stderr, "[p3fes-cuts] packet-room verify MISMATCH flags=%08X qwords=%u ram=%d regs=%d v0=%08X ram[%06X was=%08X orig=%08X native=%08X]\n",
+                                     flags, qwords, ramOk ? 1 : 0, regsOk ? 1 : 0, getRegU32(ctx, 2), bad, r32(before.data(), bad), r32(rdram, bad),
+                                     r32(afterNative.data(), bad));
+                    return;
+                }
+            }
+            else if (packetRoomNative(rdram, flags, qwords))
+            {
+                ++g_packetNative;
+                setReturnS32(ctx, 1);
+                returnToCaller(ctx);
+                return;
+            }
+            ++g_packetGuest;
+            g_packetOriginal(rdram, ctx, runtime);
+        }
+
+        // The sprite drawer sets the same nine states before every sprite: when the gate would drop each of them (the
+        // value is what the state already has, or the exact blend test holds) the whole list is skipped at once.
+        bool uiRenderStatesDropped(const uint8_t *rdram, const uint8_t (*pairs)[2], uint32_t count)
+        {
+            if (g_rsMode != Mode::On || !p3fes_native_ui::g_cutsOn)
+                return false;
+            bool exactUsed[16] = {};
+            if (count > 16u)
+                return false;
+            for (uint32_t i = 0u; i < count; ++i)
+            {
+                const uint32_t state = pairs[i][0], value = pairs[i][1];
+                if (state >= 64u)
+                    return false;
+                const bool same = g_rsKnown[state] && g_rsLast[state] == value;
+                if (state == 10u || state == 11u)
+                {
+                    if (!g_rsExact || !rsBlendNoop(rdram, state, value))
+                        return false;
+                    exactUsed[i] = true;
+                }
+                else if (!same || ((g_rsDroppable >> state) & 1u) == 0u)
+                    return false;
+            }
+            for (uint32_t i = 0u; i < count; ++i)
+            {
+                const uint32_t state = pairs[i][0], value = pairs[i][1];
+                ++g_rsCalls[state];
+                if (g_rsKnown[state] && g_rsLast[state] == value)
+                    ++g_rsSame[state];
+                g_rsKnown[state] = true;
+                g_rsLast[state] = value;
+                ++g_rsDropped;
+                if (exactUsed[i])
+                    ++g_rsExactNoop;
+            }
+            return true;
+        }
+
+        // The native sprite drawer's RenderState call: what the dispatcher would have done (set the argument registers,
+        // enter the hook) without the dispatch. A call the gate drops costs a few loads and compares; one that goes
+        // through runs the guest function to completion on the caller's context (the drawer itself never suspends).
+        void uiRenderStateSink(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t state, uint32_t value)
+        {
+            constexpr uint32_t kSentinel = 0xFFFFFFFCu;
+            const bool probe = p3fes_native_ui::g_prof.mode != 0;
+            const uint32_t begin = probe ? p3fes_native_ui::stamp() : 0u;
+            bool noted = false;
+            if (g_rsMode == Mode::On && state < 64u && !(state == 1u && g_rsTexMode == TexMode::Verify))
+            {
+                // the gate of renderStateBody, same bookkeeping
+                ++g_rsCalls[state];
+                const bool same = g_rsKnown[state] && g_rsLast[state] == value;
+                g_rsKnown[state] = true;
+                g_rsLast[state] = value;
+                if (state == 1u && g_rsTexMode == TexMode::On && p3fes_native_ui::g_cutsOn && rsTextureNative(rdram, value))
+                {
+                    ++g_rsTexNative;
+                    if (probe)
+                    {
+                        p3fes_native_ui::note(p3fes_native_ui::RsGated, begin);
+                        p3fes_native_ui::Stat &st = p3fes_native_ui::g_prof.rsGate[1];
+                        ++st.calls;
+                        st.sum += static_cast<uint32_t>(p3fes_native_ui::stamp() - begin) - p3fes_native_ui::g_prof.stampCost;
+                    }
+                    return;
+                }
+                if (state == 1u && g_rsTexMode == TexMode::On)
+                    ++g_rsTexLeft;
+                const bool exact = g_rsExact && p3fes_native_ui::g_cutsOn && (state == 10u || state == 11u) && rsBlendNoop(rdram, state, value);
+                if (same || exact)
+                {
+                    if (same)
+                        ++g_rsSame[state];
+                    if (exact || ((g_rsDroppable >> state) & 1u) != 0u)
+                    {
+                        ++g_rsDropped;
+                        if (exact)
+                            ++g_rsExactNoop;
+                        if (probe)
+                        {
+                            p3fes_native_ui::note(p3fes_native_ui::RsGated, begin);
+                            p3fes_native_ui::Stat &st = p3fes_native_ui::g_prof.rsGate[state];
+                            ++st.calls;
+                            st.sum += static_cast<uint32_t>(p3fes_native_ui::stamp() - begin) - p3fes_native_ui::g_prof.stampCost;
+                        }
+                        return;
+                    }
+                }
+                ctx->pc = kSkySetRenderState;
+                ctx->r[4] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(state)));
+                ctx->r[5] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(value)));
+                ctx->r[31] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(kSentinel)));
+                g_rsOriginal(rdram, ctx, runtime);
+            }
+            else
+            {
+                ctx->pc = kSkySetRenderState;
+                ctx->r[4] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(state)));
+                ctx->r[5] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(value)));
+                ctx->r[31] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(kSentinel)));
+                renderStateHook(rdram, ctx, runtime);
+                noted = probe; // renderStateHook noted itself
+            }
+            for (uint32_t resume = 0u; resume < 100000u && ctx->pc != kSentinel; ++resume)
+            {
+                if (runtime->isStopRequested() || ctx->pc == 0u || !runtime->hasFunction(ctx->pc))
+                    break;
+                runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+            }
+            if (probe && !noted)
+            {
+                p3fes_native_ui::note(p3fes_native_ui::RsOriginal, begin);
+                p3fes_native_ui::Stat &st = p3fes_native_ui::g_prof.rsState[state & 63u];
+                ++st.calls;
+                st.sum += static_cast<uint32_t>(p3fes_native_ui::stamp() - begin) - p3fes_native_ui::g_prof.stampCost;
             }
         }
 
@@ -2286,6 +2726,20 @@ namespace p3fes_native_frame_cuts
             original = current;
             return runtime.replaceFunction(address, hook);
         }
+
+        // ---- probes: the generic sprite/panel drawer, timed with its nested hooks attributed to it -------------
+        constexpr uint32_t kMaestroDraw = 0x001127D0u;
+        GuestFunction g_maestroOriginal = nullptr;
+        void maestroProbeHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (ctx->pc != kMaestroDraw)
+            {
+                g_maestroOriginal(rdram, ctx, runtime); // resumed in the middle (after a checkpoint): untimed
+                return;
+            }
+            p3fes_native_ui::CtxScope scope(p3fes_native_ui::CtxMaestro);
+            g_maestroOriginal(rdram, ctx, runtime);
+        }
     }
 
     bool install(PS2Runtime &runtime)
@@ -2325,6 +2779,12 @@ namespace p3fes_native_frame_cuts
             // repeats do change driver state.
             g_rsMode = !value || !*value ? Mode::On
                      : std::strcmp(value, "verify") == 0 ? Mode::Verify : (std::strcmp(value, "log") == 0 ? Mode::Log : Mode::On);
+            if (const char *exact = std::getenv("P3FES_CUT_RS_EXACT"); exact && exact[0] == '0' && !exact[1])
+                g_rsExact = false;
+            if (const char *tex = std::getenv("P3FES_CUT_RS_TEX"); tex && *tex)
+                g_rsTexMode = tex[0] == '0' && !tex[1] ? TexMode::Off : (std::strcmp(tex, "verify") == 0 ? TexMode::Verify : TexMode::On);
+            if (const char *every = std::getenv("P3FES_CUT_RS_TEX_EVERY"); every && *every)
+                g_rsTexEvery = std::max(1, std::atoi(every));
             const char *list = std::getenv("P3FES_CUT_RS_STATES");
             if (!list)
                 list = "2,6,7,8,9,12,14,15,16,20";
@@ -2337,6 +2797,11 @@ namespace p3fes_native_frame_cuts
                 cursor = *end == ',' ? end + 1 : end;
             }
             const bool installed = installOne(runtime, kSkySetRenderState, &renderStateHook, g_rsOriginal);
+            if (installed)
+            {
+                p3fes_native_ui::g_sinks.renderState = &uiRenderStateSink;
+                p3fes_native_ui::g_sinks.renderStatesDropped = &uiRenderStatesDropped;
+            }
             std::fprintf(stderr, "[p3fes-native] render-state repeat gate hook=%u mode=%s droppable=%llX\n", installed ? 1u : 0u,
                          value && *value ? value : "on", static_cast<unsigned long long>(g_rsDroppable));
         }
@@ -2424,6 +2889,24 @@ namespace p3fes_native_frame_cuts
         std::fprintf(stderr, "[p3fes-native] cut debug text overlay hook=%u\n", dbprt ? 1u : 0u);
         any |= dbprt;
         any |= p3fes_native_dialogue::install(runtime);
+        {
+            const char *v = std::getenv("P3FES_CUT_PKT");
+            g_packetMode = !v || !*v ? Mode::On : (std::strcmp(v, "verify") == 0 ? Mode::Verify : (v[0] == '0' && !v[1] ? Mode::Off : Mode::On));
+            if (const char *e = std::getenv("P3FES_CUT_PKT_EVERY"); e && *e)
+                g_packetEvery = std::max(1, std::atoi(e));
+            if (g_packetMode != Mode::Off)
+            {
+                const bool ok = installOne(runtime, kPacketRoom, &packetRoomHook, g_packetOriginal);
+                std::fprintf(stderr, "[p3fes-native] cut GS packet room hook=%u mode=%s\n", ok ? 1u : 0u, g_packetMode == Mode::Verify ? "verify" : "on");
+                if (!ok)
+                    g_packetMode = Mode::Off;
+                any |= ok;
+            }
+        }
+        // the sprite/panel drawer (needs the render-state hook above and the Im2D hook of p3fes_renderware.cpp)
+        any |= p3fes_native_ui::installMaestro(runtime);
+        if (p3fes_native_ui::profInit())
+            any |= installOne(runtime, kMaestroDraw, &maestroProbeHook, g_maestroOriginal);
         return any;
     }
 
@@ -2444,6 +2927,7 @@ namespace p3fes_native_frame_cuts
     void logCounters()
     {
         p3fes_native_dialogue::logCounters();
+        p3fes_native_ui::logMaestroCounters();
         const Counters &c = g_counters;
         if (g_rsOriginal)
         {
@@ -2454,6 +2938,15 @@ namespace p3fes_native_frame_cuts
                     std::fprintf(stderr, " %u:%llu(%llu/%llu)", i, static_cast<unsigned long long>(g_rsCalls[i]),
                                  static_cast<unsigned long long>(g_rsSame[i]), static_cast<unsigned long long>(g_rsSameChanged[i]));
             std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "[p3fes-cuts] packet-room native=%llu guest=%llu verify ok=%llu bad=%llu unwound=%llu\n",
+                         static_cast<unsigned long long>(g_packetNative), static_cast<unsigned long long>(g_packetGuest),
+                         static_cast<unsigned long long>(g_packetVerifyOk), static_cast<unsigned long long>(g_packetVerifyBad),
+                         static_cast<unsigned long long>(g_packetUnwound));
+            std::fprintf(stderr, "[p3fes-cuts] render-state exact blend no-ops=%llu (verify: changed=%llu) | texture raster native=%llu guest=%llu verify ok=%llu bad=%llu unwound=%llu\n",
+                         static_cast<unsigned long long>(g_rsExactNoop), static_cast<unsigned long long>(g_rsExactChanged),
+                         static_cast<unsigned long long>(g_rsTexNative), static_cast<unsigned long long>(g_rsTexLeft),
+                         static_cast<unsigned long long>(g_rsTexVerifyOk), static_cast<unsigned long long>(g_rsTexVerifyBad),
+                         static_cast<unsigned long long>(g_rsTexVerifyUnwound));
             for (unsigned i = 0; i < 64u; ++i) g_rsCalls[i] = g_rsSame[i] = g_rsSameChanged[i] = 0u;
         }
         std::fprintf(stderr, "[p3fes-cuts] sfd-spr skipped=%llu run=%llu | mc-free hits=%llu counts=%llu\n",

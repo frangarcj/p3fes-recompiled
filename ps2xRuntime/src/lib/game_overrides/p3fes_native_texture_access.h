@@ -31,6 +31,12 @@ namespace p3fes_native_texture_access
     // Unsupported/GS-resident rasters continue through the original routines.
     bool install(PS2Runtime &runtime, PrepareRaster prepareRaster);
 
+    // The native branch of the RpSkyTexCacheAccessSpeculate + RpSkyTexCacheAccessRaster pair for a caller that is not
+    // guest code (the render-state shortcut of p3fes_native_frame_cuts.cpp): prepares the host texture, marks the raster
+    // as native and binds it (RenderWare's and the Sky cache's current raster and access flags), exactly what the two
+    // hooks do for a raster they handle. False: the guest functions must run (nothing has been bound).
+    bool accessRasterNative(uint8_t *rdram, uint32_t raster, uint32_t accessFlags);
+
     // Drop the no-GS-cache marker before the guest frees or reuses this raster.
     void forgetRaster(uint32_t raster);
 

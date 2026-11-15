@@ -23,6 +23,7 @@
 #include "p3fes_native_rw_math.h"
 #include "p3fes_native_hanim.h"
 #include "p3fes_native_frame_cuts.h"
+#include "p3fes_native_ui.h"
 #include "p3fes_native_ymisc.h"
 #include "p3fes_debug_warp.h"
 #include "p3fes_im2d_depth.h"
@@ -5178,6 +5179,29 @@ namespace
         return prepareNativeRasterTexture(rdram, raster, textureName);
     }
 
+    // What a screen-space triangle draw hands to the present layer. P3FES_CUT_IM2D=verify captures the record of the
+    // generic path and of the quad fast path and compares them before the first one is submitted.
+    struct Im2DRecord
+    {
+        std::vector<ScreenVertex> vertices;
+        std::string textureName;
+        ScreenDrawState state;
+        bool valid = false;
+    };
+    Im2DRecord *g_im2dCapture = nullptr;
+    inline void submitIm2DTriangles(std::vector<ScreenVertex> &&vertices, std::string &&textureName, const ScreenDrawState &state)
+    {
+        if (__builtin_expect(g_im2dCapture != nullptr, 0))
+        {
+            g_im2dCapture->vertices = std::move(vertices);
+            g_im2dCapture->textureName = std::move(textureName);
+            g_im2dCapture->state = state;
+            g_im2dCapture->valid = true;
+            return;
+        }
+        p3fes_native_present::drawScreenTriangles(std::move(vertices), kRwScreenWidth, kRwScreenHeight, std::move(textureName), state);
+    }
+
     bool drawNativeIm2DTriangles(uint8_t *rdram, uint32_t vertices, uint32_t vertexCount,
                                  const std::vector<uint16_t> &triangles)
     {
@@ -5214,9 +5238,12 @@ namespace
         if (vertexCount == 0u || vertexCount > 65535u || triangles.empty())
             return false;
         std::string textureName;
+        uint32_t probeT0 = p3fes_native_ui::g_prof.mode ? p3fes_native_ui::stamp() : 0u;
         if (nativeIm2DTextured(rdram) && !prepareNativeIm2DTexture(rdram, textureName))
             return false;
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dTexture, probeT0); probeT0 = p3fes_native_ui::stamp(); }
         const auto drawState = nativeIm2DState(rdram);
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dState, probeT0); probeT0 = p3fes_native_ui::stamp(); }
         uint64_t zbuf = 0;
         readGuest(rdram, kRwZbuf1, zbuf);
         {
@@ -5261,6 +5288,7 @@ namespace
                 out.push_back(v);
             }
         }
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dVertices, probeT0); probeT0 = p3fes_native_ui::stamp(); }
         if (!ensureNativeFrame(rdram))
             return false;
         // P3FES_SCREEN_STATE_DIAG=1: raw GS state words of Im2D draws that touch the date HUD's sun/moon
@@ -5338,8 +5366,177 @@ namespace
             for (const ScreenVertex &v : out)
                 std::fprintf(stderr, "[p3fes-shadow]   xy=%.1f,%.1f z=%.4f rgba=%u,%u,%u,%u\n", v.x, v.y, v.z, v.color[0],
                              v.color[1], v.color[2], v.color[3]);
-        p3fes_native_present::drawScreenTriangles(std::move(out), kRwScreenWidth, kRwScreenHeight,
-                                                  std::move(textureName), drawState);
+        submitIm2DTriangles(std::move(out), std::move(textureName), drawState);
+        if (p3fes_native_ui::g_prof.mode)
+            p3fes_native_ui::note(p3fes_native_ui::Im2dSubmit, probeT0);
+        return true;
+    }
+
+    // ---- quad fast path ------------------------------------------------------------------------------------------
+    // RwIm2DRenderPrimitive(TRISTRIP, v, 4) is nearly every 2-D draw (glyphs, sprites, panels). The generic path above
+    // builds an index list, reads six vertices (the strip shares two), decodes the whole GS state again and expands
+    // the state's flags per call: ~4 K instructions on the Vita. This path reads the four vertices once, keeps the
+    // decoded state while the words it is decoded from are unchanged, and submits the same record.
+    // P3FES_CUT_IM2D=0 turns it off, =verify compares it with the generic path on every call.
+    enum class Im2DFastMode : uint8_t { Off, On, Verify };
+    Im2DFastMode g_im2dFastMode = Im2DFastMode::On;
+    struct Im2DFastCounters { uint64_t fast = 0u, declined = 0u, stateHits = 0u, verifyOk = 0u, verifyBad = 0u; } g_im2dFast;
+
+    // The decoded state with the words it was decoded from (everything nativeIm2DState reads unless fog is on)
+    struct Im2DStateCache
+    {
+        bool valid = false;
+        uint64_t words[6] = {};
+        bool masked = false;
+        ScreenDrawState state;
+    } g_im2dStateCache;
+
+    inline void im2dStateFor(const uint8_t *rdram, uint64_t flags, ScreenDrawState &out)
+    {
+        uint64_t w[6];
+        w[0] = flags;
+        std::memcpy(&w[1], rdram + kRwAlpha1, 8u);
+        std::memcpy(&w[2], rdram + kRwClamp1, 8u);
+        std::memcpy(&w[3], rdram + kRwTex1, 8u);
+        std::memcpy(&w[4], rdram + kRwTest1, 8u);
+        std::memcpy(&w[5], rdram + kRwZbuf1, 8u);
+        Im2DStateCache &c = g_im2dStateCache;
+        if (c.valid && c.masked == g_gsColorMasked && std::memcmp(c.words, w, sizeof(w)) == 0)
+        {
+            ++g_im2dFast.stateHits;
+            out = c.state;
+            return;
+        }
+        out = nativeIm2DState(rdram);
+        // the fog colour and planes are read from other words: only an unfogged state is cached
+        if ((flags & kGsPrimFogEnable) == 0u)
+        {
+            std::memcpy(c.words, w, sizeof(w));
+            c.masked = g_gsColorMasked;
+            c.state = out;
+            c.valid = true;
+        }
+    }
+
+    inline bool sameScreenState(const ScreenDrawState &a, const ScreenDrawState &b)
+    {
+        return a.blend == b.blend && a.depthTest == b.depthTest && a.depthWrite == b.depthWrite && a.depthFunction == b.depthFunction &&
+               a.alphaFailAction == b.alphaFailAction && a.gouraudShading == b.gouraudShading && a.clampU == b.clampU &&
+               a.clampV == b.clampV && a.linearFilter == b.linearFilter && a.alphaTest.enabled == b.alphaTest.enabled &&
+               a.alphaTest.function == b.alphaTest.function && a.alphaTest.reference == b.alphaTest.reference &&
+               a.fog.enabled == b.fog.enabled && a.fog.start == b.fog.start && a.fog.end == b.fog.end && a.fog.color == b.fog.color &&
+               a.destinationAlphaTest == b.destinationAlphaTest && a.alphaOnlyWrite == b.alphaOnlyWrite;
+    }
+
+    // False: not handled here, nothing was submitted (the generic path decides what happens).
+    bool im2dQuadCore(uint8_t *rdram, const p3fes_native_ui::Im2DVertexF (&in)[4])
+    {
+        static const bool anyDiag = [] {
+            const char *mask = std::getenv("P3FES_MASK_DIAG");
+            const char *screen = std::getenv("P3FES_SCREEN_STATE_DIAG");
+            const char *glow = std::getenv("P3FES_DEBUG_GLOW_ALPHA");
+            return (mask && std::atoi(mask) >= 2) || (screen && *screen == '1') || (glow && std::atoi(glow) >= 0);
+        }();
+        if (anyDiag || g_diagEnabled.load(std::memory_order_relaxed) || g_targetRaster)
+            return false;
+        if (g_gsColorMasked && g_maskDropIm2d)
+        {
+            ++g_maskDropped[2];
+            return true;
+        }
+        for (const auto &p : in)
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+                return false;
+        uint32_t probeT = p3fes_native_ui::g_prof.mode ? p3fes_native_ui::stamp() : 0u;
+        uint64_t flags = 0u, zbuf = 0u;
+        std::memcpy(&flags, rdram + kRwRenderFlags, 8u);
+        std::memcpy(&zbuf, rdram + kRwZbuf1, 8u);
+        std::string textureName;
+        if ((flags & kGsPrimTextureEnable) != 0u)
+        {
+            uint32_t raster = 0u;
+            std::memcpy(&raster, rdram + kRwCurrentRaster, 4u);
+            if (!raster || !prepareNativeRasterTexture(rdram, raster, textureName))
+                return false;
+        }
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dTexture, probeT); probeT = p3fes_native_ui::stamp(); }
+        ScreenDrawState drawState;
+        im2dStateFor(rdram, flags, drawState);
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dState, probeT); probeT = p3fes_native_ui::stamp(); }
+        const float inverseDepth = p3fes_im2d::inverseDepthRange(zbuf);
+        ScreenVertex quad[4];
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            const auto &p = in[i];
+            ScreenVertex &v = quad[i];
+            v.x = p.x;
+            v.y = p.y;
+            v.z = p3fes_im2d::normalizedDepth(p.z, inverseDepth);
+            v.u = std::isfinite(p.u) ? p.u : 0.0f;
+            v.v = std::isfinite(p.v) ? p.v : 0.0f;
+            v.color = {colorByte(p.r), colorByte(p.g), colorByte(p.b), colorByte(p.a)};
+        }
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dVertices, probeT); probeT = p3fes_native_ui::stamp(); }
+        if (!ensureNativeFrame(rdram))
+            return false;
+        // TRISTRIP(4): the triangles (0,1,2) (2,1,3)
+        const ScreenVertex tris[6] = {quad[0], quad[1], quad[2], quad[2], quad[1], quad[3]};
+        submitIm2DTriangles(std::vector<ScreenVertex>(tris, tris + 6), std::move(textureName), drawState);
+        if (p3fes_native_ui::g_prof.mode)
+            p3fes_native_ui::note(p3fes_native_ui::Im2dSubmit, probeT);
+        return true;
+    }
+
+    // The maestro drawer's draw: same record, vertices from C++ (see p3fes_native_ui.cpp)
+    bool im2dQuadSink(uint8_t *rdram, const p3fes_native_ui::Im2DVertexF (&in)[4])
+    {
+        const uint32_t probeBegin = p3fes_native_ui::g_prof.mode ? p3fes_native_ui::stamp() : 0u;
+        const bool done = g_im2dFastMode != Im2DFastMode::Off && p3fes_native_ui::g_cutsOn && im2dQuadCore(rdram, in);
+        if (done && p3fes_native_ui::g_prof.mode)
+            p3fes_native_ui::note(p3fes_native_ui::Im2dTotal, probeBegin);
+        return done;
+    }
+
+    // The guest entry's quad: vertices read from guest memory once
+    inline bool im2dQuadFromGuest(uint8_t *rdram, uint32_t verts)
+    {
+        if (g_im2dFastMode == Im2DFastMode::Off || !p3fes_native_ui::g_cutsOn || static_cast<uint64_t>(verts) + 4u * sizeof(RwIm2DVertex) > 0x02000000ull)
+            return false;
+        p3fes_native_ui::Im2DVertexF q[4];
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            RwIm2DVertex raw;
+            std::memcpy(&raw, rdram + verts + i * sizeof(RwIm2DVertex), sizeof(raw));
+            q[i] = {raw.x, raw.y, raw.z, raw.u, raw.v, raw.r, raw.g, raw.b, raw.a};
+        }
+        if (g_im2dFastMode == Im2DFastMode::Verify)
+        {
+            Im2DRecord a, b;
+            g_im2dCapture = &a;
+            static const std::vector<uint16_t> kQuadTriangles = {0u, 1u, 2u, 2u, 1u, 3u};
+            drawNativeIm2DTriangles(rdram, verts, 4u, kQuadTriangles);
+            g_im2dCapture = &b;
+            const bool handled = im2dQuadCore(rdram, q);
+            g_im2dCapture = nullptr;
+            const bool same = handled ? (a.valid && b.valid && a.vertices.size() == b.vertices.size() &&
+                                         std::memcmp(a.vertices.data(), b.vertices.data(), a.vertices.size() * sizeof(ScreenVertex)) == 0 &&
+                                         a.textureName == b.textureName && sameScreenState(a.state, b.state))
+                                      : true; // declined: the generic record stands
+            if (same)
+                ++g_im2dFast.verifyOk;
+            else if (g_im2dFast.verifyBad++ < 12u)
+                std::fprintf(stderr, "[p3fes-im2d] fast path MISMATCH tex=%s/%s verts=%zu/%zu\n", a.textureName.c_str(), b.textureName.c_str(),
+                             a.vertices.size(), b.vertices.size());
+            if (a.valid)
+                submitIm2DTriangles(std::move(a.vertices), std::move(a.textureName), a.state);
+            return true;
+        }
+        if (!im2dQuadCore(rdram, q))
+        {
+            ++g_im2dFast.declined;
+            return false;
+        }
+        ++g_im2dFast.fast;
         return true;
     }
 
@@ -5774,6 +5971,22 @@ namespace
         if (!ctx)
             return;
         const uint32_t primitive = reg32(ctx, 4u), verts = reg32(ctx, 5u), count = reg32(ctx, 6u);
+        const uint32_t probeBegin = p3fes_native_ui::g_prof.mode ? p3fes_native_ui::stamp() : 0u;
+        if (primitive == 4u && count == 4u && g_im2dDiagPrinted.load(std::memory_order_relaxed) && im2dQuadFromGuest(rdram, verts))
+        {
+            if (p3fes_native_ui::g_prof.mode)
+            {
+                p3fes_native_ui::note(p3fes_native_ui::Im2dTotal, probeBegin);
+                if (p3fes_native_ui::g_prof.ctx == p3fes_native_ui::CtxOther)
+                {
+                    p3fes_native_ui::Stat &c = p3fes_native_ui::g_prof.callerIm2d[reg32(ctx, 31u)];
+                    ++c.calls;
+                    c.sum += static_cast<uint32_t>(p3fes_native_ui::stamp() - probeBegin);
+                }
+            }
+            nativeIm2DResult(ctx);
+            return;
+        }
         if (!g_im2dDiagPrinted.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "[p3fes-native] first Im2D call: primitive=%u vertices=%u textured=%u\n",
                          primitive, count, nativeIm2DTextured(rdram) ? 1u : 0u);
@@ -5781,6 +5994,16 @@ namespace
             drawNativeIm2DLines(rdram, verts, count, im2dLineList(primitive, count));
         else
             drawNativeIm2DTriangles(rdram, verts, count, im2dTriangleList(primitive, count));
+        if (p3fes_native_ui::g_prof.mode)
+        {
+            p3fes_native_ui::note(p3fes_native_ui::Im2dTotal, probeBegin);
+            if (p3fes_native_ui::g_prof.ctx == p3fes_native_ui::CtxOther)
+            {
+                p3fes_native_ui::Stat &c = p3fes_native_ui::g_prof.callerIm2d[reg32(ctx, 31u)];
+                ++c.calls;
+                c.sum += static_cast<uint32_t>(p3fes_native_ui::stamp() - probeBegin);
+            }
+        }
         nativeIm2DResult(ctx);
     }
 
@@ -5888,6 +6111,11 @@ namespace
                         static_cast<unsigned long long>(h.verifyMismatches));
                     g_hookCounts = {};
                     reportProfFuncs(frames);
+                    p3fes_native_ui::profReport(frames);
+                    std::fprintf(stderr, "[p3fes-im2d] quad fast path mode=%d fast=%llu declined=%llu state-cache-hits=%llu verify ok=%llu bad=%llu\n",
+                                 static_cast<int>(g_im2dFastMode), static_cast<unsigned long long>(g_im2dFast.fast),
+                                 static_cast<unsigned long long>(g_im2dFast.declined), static_cast<unsigned long long>(g_im2dFast.stateHits),
+                                 static_cast<unsigned long long>(g_im2dFast.verifyOk), static_cast<unsigned long long>(g_im2dFast.verifyBad));
                     if (g_hookTimes.calls)
                     {
                         static const char *names[HookStageTimes::kStages] = {"inspect", "ensure", "camera", "mesh", "matrix", "acquire", "materials", "gsstate", "lighting", "skin", "handoff"};
@@ -7019,7 +7247,16 @@ namespace
             }
             const bool im2dLine = installNativeOnlyHook(runtime, kSkyIm2DRenderLine, &p3fesSkyIm2DRenderLine);
             const bool im2dTri = installNativeOnlyHook(runtime, kSkyIm2DRenderTriangle, &p3fesSkyIm2DRenderTriangle);
+            {
+                const char *fast = std::getenv("P3FES_CUT_IM2D");
+                g_im2dFastMode = fast && fast[0] == '0' && !fast[1] ? Im2DFastMode::Off
+                               : (fast && std::strcmp(fast, "verify") == 0 ? Im2DFastMode::Verify : Im2DFastMode::On);
+                g_im2dFast = {};
+                g_im2dStateCache = {};
+            }
             const bool im2dPrim = installNativeOnlyHook(runtime, kSkyIm2DRenderPrimitive, &p3fesSkyIm2DRenderPrimitive);
+            if (im2dPrim)
+                p3fes_native_ui::g_sinks.im2dQuad = &im2dQuadSink;
             const bool im2dIndexed = installNativeOnlyHook(runtime, kSkyIm2DRenderIndexedPrimitive, &p3fesSkyIm2DRenderIndexedPrimitive);
             // Strict native mode: never let the host GS consumer paint an
             // interlaced fallback over the HLE framebuffer, even before the

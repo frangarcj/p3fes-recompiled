@@ -98,6 +98,13 @@ struct ScreenDraw
     std::string textureName;
     ScreenDrawState state{};
     bool lines = false;
+
+    ScreenDraw() = default;
+    // built in place in the frame's draw list (one move of the vertices and the name instead of two)
+    ScreenDraw(std::vector<ScreenVertex> &&v, float width, float height, std::string &&name, const ScreenDrawState &drawState, bool asLines)
+        : vertices(std::move(v)), sourceWidth(width), sourceHeight(height), textureName(std::move(name)), state(drawState), lines(asLines)
+    {
+    }
 };
 
 struct ClearDraw
@@ -1499,8 +1506,8 @@ void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, 
             sourceWidth = g_targetWidth;
             sourceHeight = g_targetHeight;
         }
-        g_building.draws.emplace_back(ScreenDraw{std::move(vertices), sourceWidth, sourceHeight,
-                                                std::move(textureName), state, false});
+        g_building.draws.emplace_back(std::in_place_type<ScreenDraw>, std::move(vertices), sourceWidth, sourceHeight,
+                                      std::move(textureName), state, false);
     }
 }
 
@@ -1525,8 +1532,8 @@ void drawScreenLines(std::vector<ScreenVertex> vertices, float sourceWidth, floa
             sourceWidth = g_targetWidth;
             sourceHeight = g_targetHeight;
         }
-        g_building.draws.emplace_back(ScreenDraw{std::move(vertices), sourceWidth, sourceHeight,
-                                                std::move(textureName), state, true});
+        g_building.draws.emplace_back(std::in_place_type<ScreenDraw>, std::move(vertices), sourceWidth, sourceHeight,
+                                      std::move(textureName), state, true);
     }
 }
 

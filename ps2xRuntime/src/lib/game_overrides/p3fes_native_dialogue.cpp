@@ -1,5 +1,6 @@
 #include "p3fes_native_dialogue.h"
 #include "p3fes_native_frame_cuts.h"
+#include "p3fes_native_ui.h"
 
 // What a dialogue scene costs on top of the plain lounge (Mac, deterministic probes, P3FES_DIALOGUE_DIAG=1, per game
 // frame at 30 fps): the message-window update itfMesManager_003a84c0 (0x3A84C0, one call per frame, 9 windows) takes
@@ -149,6 +150,8 @@ namespace p3fes_native_dialogue
         constexpr uint32_t kUnitUvTable = 0x006A28D0u; // 4 x (u, v)
         constexpr uint32_t kVertexBytes = 64u;
         constexpr uint32_t kSentinel = 0xFFFFFFFCu;
+        constexpr uint32_t kRsEntryPc = 0x004D6B90u, kIm2dEntryPc = 0x004EDBA0u;
+        bool g_fontDirect = true; // P3FES_CUT_FONT_DIRECT=0: the glyph goes through guest vertices and the two pointer targets
 
         GuestFunction g_rasterOriginal = nullptr;
 
@@ -207,6 +210,10 @@ namespace p3fes_native_dialogue
         // when it draws); keep the emulated EE clock close to that. eeTryChargeCall never enters the scheduler.
         void chargeCycles(PS2Runtime *runtime, uint32_t cycles)
         {
+            // one charge when the budget allows (the same total as the 32-cycle steps), the steps otherwise
+            const uint32_t whole = cycles / 32u * 32u;
+            if (runtime->eeTryChargeCall(whole))
+                return;
             for (uint32_t n = 0u; n < cycles / 32u; ++n)
                 if (!runtime->eeTryChargeCall(32u))
                     break;
@@ -289,6 +296,35 @@ namespace p3fes_native_dialogue
             // the original builds the vertices at (its own sp = entry sp - 0x1C0) + 0xC0: dead stack
             const uint32_t verts = sp - 0x1C0u + 0xC0u;
             const float px[4] = {x, x1, x, x1}, py[4] = {y, y, y1, y1};
+            // Straight to the native hooks' bodies (no guest vertices, no dispatch) when the two function pointers are
+            // the standard targets and nothing is being verified against the recorded guest calls
+            if (g_fontMode != FontMode::Verify && g_fontDirect && p3fes_native_ui::g_cutsOn && p3fes_native_ui::g_sinks.renderState && p3fes_native_ui::g_sinks.im2dQuad &&
+                rsFn == kRsEntryPc && im2dFn == kIm2dEntryPc)
+            {
+                p3fes_native_ui::Im2DVertexF quad[4];
+                for (uint32_t i = 0u; i < 4u; ++i)
+                    quad[i] = {px[i], py[i], z, rf(rdram, kUnitUvTable + i * 8u), rf(rdram, kUnitUvTable + i * 8u + 4u), rgba[0], rgba[1], rgba[2], rgba[3]};
+                chargeCycles(runtime, 120u);
+                const uint64_t savedRa = GPR_U64(ctx, 31);
+                p3fes_native_ui::g_sinks.renderState(rdram, ctx, runtime, 1u, raster);
+                if (!p3fes_native_ui::g_sinks.im2dQuad(rdram, quad))
+                {
+                    // declined (diagnostics on): the hook reads the vertices from guest memory
+                    for (uint32_t i = 0u; i < 4u; ++i)
+                    {
+                        float f[16] = {};
+                        f[0] = quad[i].x; f[1] = quad[i].y; f[2] = quad[i].z; f[4] = quad[i].u; f[5] = quad[i].v;
+                        f[8] = quad[i].r; f[9] = quad[i].g; f[10] = quad[i].b; f[11] = quad[i].a;
+                        std::memcpy(rdram + ((sp - 0x1C0u + 0xC0u + i * kVertexBytes) & PS2_RAM_MASK), f, kVertexBytes);
+                    }
+                    callGuest(rdram, runtime, ctx, im2dFn, 4u, sp - 0x1C0u + 0xC0u, 4u);
+                }
+                ctx->r[29] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(sp)));
+                ctx->r[31] = _mm_set_epi64x(0, static_cast<int64_t>(savedRa));
+                setReturnS32(ctx, 0);
+                ctx->pc = ra;
+                return true;
+            }
             for (uint32_t i = 0u; i < 4u; ++i)
             {
                 uint8_t *v = rdram + verts + i * kVertexBytes;
@@ -485,7 +521,18 @@ namespace p3fes_native_dialogue
             ++g_fc.verifyBad;
         }
 
+        void rasterHookBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
         void rasterHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (__builtin_expect(p3fes_native_ui::g_prof.mode != 0, 0))
+            {
+                p3fes_native_ui::CtxScope scope(p3fes_native_ui::CtxGlyph);
+                rasterHookBody(rdram, ctx, runtime);
+                return;
+            }
+            rasterHookBody(rdram, ctx, runtime);
+        }
+        void rasterHookBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             if (g_fontMode == FontMode::Verify && (++g_verifyTick % static_cast<uint64_t>(g_verifyEvery)) == 0u)
             {
@@ -517,6 +564,8 @@ namespace p3fes_native_dialogue
         {
             const char *v = std::getenv("P3FES_CUT_FONT");
             g_fontMode = !v || !*v ? FontMode::On : (std::strcmp(v, "verify") == 0 ? FontMode::Verify : (v[0] == '0' ? FontMode::Off : FontMode::On));
+            if (const char *d = std::getenv("P3FES_CUT_FONT_DIRECT"); d && d[0] == '0' && !d[1])
+                g_fontDirect = false;
             if (const char *e = std::getenv("P3FES_CUT_FONT_VERIFY_EVERY"); e && *e)
                 g_verifyEvery = std::max(1, std::atoi(e));
             if (g_fontMode != FontMode::Off)
