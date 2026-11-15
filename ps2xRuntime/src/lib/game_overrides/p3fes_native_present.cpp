@@ -1739,7 +1739,15 @@ bool renderHostFrame()
     // The run of mesh draws that follows the menu camera (the polygon backdrop): slots [backdropFrom, backdropTo).
     size_t backdropFrom = 0u, backdropTo = 0u;
     // P3FES_WS_BACKDROP_EDGES=0: the polygon backdrop is drawn over the whole framebuffer (stretched) as before.
-    static const bool g_menuBackdropEdges = [] { const char *v = std::getenv("P3FES_WS_BACKDROP_EDGES"); return !v || *v != '0'; }();
+    // On the Vita it is off until it has been seen on the console (=1 enables it there).
+    static const bool g_menuBackdropEdges = [] {
+        const char *v = std::getenv("P3FES_WS_BACKDROP_EDGES");
+#if defined(PLATFORM_VITA)
+        return v && *v == '1';
+#else
+        return !v || *v != '0';
+#endif
+    }();
     if (widescreen == 2)
     {
         drawLayer.assign(frame.draws.size(), -1);
