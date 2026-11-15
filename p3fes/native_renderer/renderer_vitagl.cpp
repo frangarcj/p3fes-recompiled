@@ -1243,7 +1243,14 @@ public:
             else if (blend && blend->enabled)
             {
                 glEnable(GL_BLEND);
-                glBlendFunc(rwBlendFactor(blend->src), rwBlendFactor(blend->dst));
+                if (blend->subtract)
+                {
+                    // Cd - Cs * As; alpha keeps As. The equation is put back to ADD by the next part / pass.
+                    glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+                    glBlendFuncSeparate(rwBlendFactor(blend->src), rwBlendFactor(blend->dst), GL_ONE, GL_ZERO);
+                }
+                else
+                    glBlendFunc(rwBlendFactor(blend->src), rwBlendFactor(blend->dst));
             }
             else
             {
@@ -1587,7 +1594,14 @@ public:
         else if (!state.materialBlends.empty() && state.materialBlends[0].enabled)
         {
             glEnable(GL_BLEND);
-            glBlendFunc(rwBlendFactor(state.materialBlends[0].src), rwBlendFactor(state.materialBlends[0].dst));
+            if (state.materialBlends[0].subtract)
+            {
+                glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+                glBlendFuncSeparate(rwBlendFactor(state.materialBlends[0].src), rwBlendFactor(state.materialBlends[0].dst),
+                                    GL_ONE, GL_ZERO);
+            }
+            else
+                glBlendFunc(rwBlendFactor(state.materialBlends[0].src), rwBlendFactor(state.materialBlends[0].dst));
         }
         else
         {
@@ -2177,7 +2191,11 @@ private:
         applyAlphaTest(state.alphaTest);
         applyFog(state.fog);
         applyShadeMode(state.gouraudShading);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        // FBMSK = 0x00FFFFFF: alpha-only write (see ScreenDrawState::alphaOnlyWrite). One state call per draw, as before.
+        if (state.alphaOnlyWrite)
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+        else
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         if (state.depthTest)
             glEnable(GL_DEPTH_TEST);
         else
@@ -2243,6 +2261,11 @@ private:
             glEnable(GL_BLEND);
             glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
             glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE, GL_ONE, GL_ZERO);
+            break;
+        case ScreenBlend::DestinationAlpha:
+            glEnable(GL_BLEND);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA, GL_ONE, GL_ZERO);
             break;
         default:
             glEnable(GL_BLEND);
@@ -2325,7 +2348,7 @@ private:
                     glDepthMask(GL_TRUE);
                     break;
                 case ScreenAlphaFailAction::RgbOnly:
-                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+                    glColorMask(!state.alphaOnlyWrite, !state.alphaOnlyWrite, !state.alphaOnlyWrite, GL_FALSE);
                     glDepthMask(GL_FALSE);
                     break;
                 case ScreenAlphaFailAction::Keep:

@@ -224,6 +224,15 @@ namespace
     constexpr uint32_t kGsColorMaskOn = 0x003294D0u;
     constexpr uint32_t kGsColorMaskOff = 0x00329550u;
     bool g_gsColorMasked = false;
+    // P3FES_GS_ALPHA_DECODE=0: only the ALPHA_1 equations decoded before the battle-effect work (0x44/0x48/0x42/0x6A/0x58 for Im2D,
+    // 0x44/0x48 for meshes), everything else plain alpha blending. A/B switch.
+    bool fullGsAlphaDecode()
+    {
+        static const bool full = [] { const char *v = std::getenv("P3FES_GS_ALPHA_DECODE"); return !v || *v != '0'; }();
+        return full;
+    }
+    // P3FES_GS_COLOR_MASK=drop: masked Im2D draws are discarded (the previous behaviour) instead of drawn alpha-only.
+    bool g_maskDropIm2d = false;
     // P3FES_MASK_DIAG=1: log every masked bracket (guest caller of the "on" call, what it dropped: atomic, sector, im2d, im3d)
     uint32_t g_maskDropped[4] = {0u, 0u, 0u, 0u};
     uint32_t g_maskOnRa = 0u;
@@ -436,6 +445,10 @@ namespace
         bool skinned = false;
         uint32_t boneCount = 0u;
         uint32_t usedBones[8]{}; // bit b: some vertex weights bone b
+        // Effect geometry the game rewrites in place (slash arcs, burst rays): the native mesh is a snapshot, so
+        // once a change is seen the draw is rebuilt and sent as a transient mesh every time.
+        mutable uint64_t contentHash = 0u; // 0: not tracked (large, lit or skinned geometry)
+        mutable bool dynamic = false;
     };
     std::unordered_map<MeshId, DefinedMeshInfo> g_definedMeshes;
     struct DefinedMeshSlot
@@ -462,6 +475,33 @@ namespace
                     info.usedBones[bone >> 5u] |= 1u << (bone & 31u);
             }
         return info;
+    }
+    // P3FES_DYNAMIC_GEOMETRY=0 turns the tracking off (the cached first decode is drawn forever, as before).
+    constexpr uint32_t kDynamicGeometryMaxVertices = 320u;
+    bool dynamicGeometryEnabled()
+    {
+        static const bool enabled = [] { const char *v = std::getenv("P3FES_DYNAMIC_GEOMETRY"); return !v || *v != '0'; }();
+        return enabled;
+    }
+    // Hash of what changes in the geometry the game animates in place (positions, prelight), as it is now. 32-bit words,
+    // no multiply: this runs once per draw of every small unlit geometry.
+    uint64_t geometryContentHash(const uint8_t *rdram, uint32_t vertexData, uint32_t prelitData, uint32_t vertices)
+    {
+        uint32_t h = 2166136261u, h2 = 0x9E3779B9u;
+        const auto mix = [&](const uint8_t *data, uint32_t bytes) {
+            for (uint32_t i = 0u; i + 4u <= bytes; i += 4u)
+            {
+                uint32_t w;
+                std::memcpy(&w, data + i, 4u);
+                h = ((h << 5u) | (h >> 27u)) ^ w;
+                h2 += w;
+            }
+        };
+        if (vertexData && guestPointer(vertexData, vertices * 12u))
+            mix(rdram + vertexData, vertices * 12u);
+        if (prelitData && guestPointer(prelitData, vertices * 4u))
+            mix(rdram + prelitData, vertices * 4u);
+        return (static_cast<uint64_t>(h) << 32u) | h2 | 1u;
     }
     struct SkinDiagnosticSample
     {
@@ -636,6 +676,7 @@ namespace
         uint64_t zbuf = 0u, test = 0u, clamp = 0u, tex1 = 0u;
         uint64_t renderFlags = 0u;
         uint32_t cull = 2u, srcBlend = 5u, dstBlend = 6u;
+        bool meshSubtract = false;
         if (readGuest(rdram, kRwZbuf1, zbuf))
             state.depthWrite = ((zbuf >> 32u) & 1u) == 0u; // GS ZBUF.ZMSK: 1 disables writes.
         if (readGuest(rdram, kRwTest1, test))
@@ -734,13 +775,30 @@ namespace
             {
                 // Anything else falls back to plain alpha blending rather than to the bogus pair.
                 srcBlend = 5u;
-                dstBlend = (gsAlpha & 0xFFu) == 0x48u ? 2u : 6u; // 0x48: Cs * As + Cd, 0x44: (Cs - Cd) * As + Cd
+                dstBlend = 6u; // 0x44: (Cs - Cd) * As + Cd, also the fallback for the equations not listed here
+                switch (fullGsAlphaDecode() ? gsAlpha & 0xFFu : (gsAlpha & 0xFFu) == 0x48u ? 0x48u : 0x44u)
+                {
+                case 0x48u: dstBlend = 2u; break;                         // Cs * As + Cd
+                case 0x42u: dstBlend = 2u; meshSubtract = true; break;    // Cd - Cs * As (the enemy ring)
+                case 0x54u: srcBlend = 7u; dstBlend = 8u; break;          // (Cs - Cd) * Ad + Cd
+                case 0x58u: srcBlend = 7u; dstBlend = 2u; break;          // Cs * Ad + Cd
+                case 0x6Au: srcBlend = 1u; dstBlend = 2u; break;          // Cd
+                case 0x64u:                                                // (Cs - Cd) * FIX + Cd, FIX = 0: Cd
+                    if (((gsAlpha >> 32u) & 0xFFu) == 0u)
+                    {
+                        srcBlend = 1u;
+                        dstBlend = 2u;
+                    }
+                    break;
+                default: break;
+                }
             }
             const std::size_t materialCount = std::max<std::size_t>(state.materialColors.size(), 1u);
             MeshDrawState::BlendState blend;
             blend.enabled = true;
             blend.src = static_cast<uint8_t>(srcBlend);
             blend.dst = static_cast<uint8_t>(dstBlend);
+            blend.subtract = meshSubtract;
             state.materialBlends.assign(materialCount, blend);
         }
     }
@@ -965,9 +1023,19 @@ namespace
 
     bool readMaterialDualPass(const uint8_t *rdram, uint32_t material, MeshDrawState::DualPass &out)
     {
+        static const bool off = [] { const char *v = std::getenv("P3FES_DEBUG_NO_MATFX"); return v && std::strchr(v, 'd'); }();
+        if (off)
+            return false;
         uint32_t extension = 0u, effect = 0u;
         if (!readMaterialMatFx(rdram, material, extension, effect) ||
             (effect != kMatFxDual && effect != kMatFxDualUvTransform))
+            return false;
+        // Plain dual (effect 4, no UV transform) is only used by the battle arena floor (the lounge, Tartarus, shop,
+        // dialogue, camp and save scenes only have effect 6). The GS picture of that floor has the brightness of the
+        // first pass alone (mean luma of a floor patch: GS 192.7, first pass only 194.5, with this overlay 179.8): the
+        // overlay is drawn at ~12% of its strength there, so it is skipped. P3FES_DUAL_PLAIN=1 draws it again.
+        static const bool plainDual = [] { const char *v = std::getenv("P3FES_DUAL_PLAIN"); return v && *v == '1'; }();
+        if (effect == kMatFxDual && !plainDual)
             return false;
 
         const uint32_t dualSlot = findMatFxSlot(rdram, extension, kMatFxSlotDual);
@@ -989,6 +1057,13 @@ namespace
         readTextureSampler(rdram, texture, out.sampler);
         out.srcBlend = static_cast<uint8_t>(srcBlend);
         out.dstBlend = static_cast<uint8_t>(dstBlend);
+        {
+            // P3FES_DUAL_DIAG=1: every distinct (effect, src, dst) of dual passes, once
+            static const bool dualDiag = [] { const char *v = std::getenv("P3FES_DUAL_DIAG"); return v && *v == '1'; }();
+            static std::set<uint32_t> seen;
+            if (dualDiag && seen.insert((static_cast<uint32_t>(effect) << 16u) | (srcBlend << 8u) | dstBlend).second)
+                std::fprintf(stderr, "[p3fes-dual] effect=%u src=%u dst=%u texture=%s\n", static_cast<unsigned>(effect), srcBlend, dstBlend, out.textureName.c_str());
+        }
         if (effect == kMatFxDualUvTransform)
         {
             const uint32_t uvSlot = findMatFxSlot(rdram, extension, kMatFxSlotUv);
@@ -1001,6 +1076,9 @@ namespace
 
     bool readMaterialEnvPass(const uint8_t *rdram, uint32_t material, MeshDrawState::EnvPass &out)
     {
+        static const bool off = [] { const char *v = std::getenv("P3FES_DEBUG_NO_MATFX"); return v && std::strchr(v, 'e'); }();
+        if (off)
+            return false;
         uint32_t extension = 0u, effect = 0u;
         if (!readMaterialMatFx(rdram, material, extension, effect) ||
             (effect != kMatFxEnv && effect != kMatFxBumpEnv))
@@ -2432,6 +2510,42 @@ namespace
                     current.projection[10], current.projection[11], current.projection[14]);
         }
 
+        {
+            // P3FES_MESH_DYN_DIAG=1: geometry that the game rewrites in place after the first draw (the native mesh is decoded once)
+            static const bool dynDiag = [] { const char *v = std::getenv("P3FES_MESH_DYN_DIAG"); return v && *v == '1'; }();
+            if (dynDiag && summary.vertices <= 2000u)
+            {
+                static std::unordered_map<uint32_t, std::array<uint64_t, 4>> lastHash; // geometry -> pos, prelit, uv, changes
+                uint64_t hp = 1469598103934665603ull, hc = hp, hu = hp;
+                const auto mix = [](uint64_t h, const uint8_t *data, uint32_t bytes) {
+                    for (uint32_t i = 0u; i + 8u <= bytes; i += 8u)
+                    {
+                        uint64_t w;
+                        std::memcpy(&w, data + i, 8u);
+                        h = (h ^ w) * 1099511628211ull;
+                    }
+                    return h;
+                };
+                if (summary.vertexData && guestPointer(summary.vertexData, summary.vertices * 12u))
+                    hp = mix(hp, rdram + summary.vertexData, summary.vertices * 12u);
+                if (summary.prelitData && guestPointer(summary.prelitData, summary.vertices * 4u))
+                    hc = mix(hc, rdram + summary.prelitData, summary.vertices * 4u);
+                if (summary.uv0Data && guestPointer(summary.uv0Data, summary.vertices * 8u))
+                    hu = mix(hu, rdram + summary.uv0Data, summary.vertices * 8u);
+                hp |= 1u;
+                auto &last = lastHash[summary.geometry];
+                static unsigned dynLogs = 0u;
+                if ((last[0] != hp || last[1] != hc || last[2] != hu) && last[0] != 0u)
+                {
+                    ++last[3];
+                    if (dynLogs++ < 300u)
+                        std::fprintf(stderr, "[p3fes-dyn] frame=%llu geometry=%08X verts=%u tris=%u pos=%d color=%d uv=%d changes=%llu gflags=%X\n",
+                                     static_cast<unsigned long long>(g_nativeFrameNumber), summary.geometry, summary.vertices, summary.triangles,
+                                     last[0] != hp, last[1] != hc, last[2] != hu, static_cast<unsigned long long>(last[3]), summary.geometryFlags);
+                }
+                last[0] = hp; last[1] = hc; last[2] = hu;
+            }
+        }
         MeshId meshId = 0u;
         const int16_t morph = [&] { int16_t value = 0; readGuest(rdram, atomic + kAtomicCurrentMorphOffset, value); return value; }();
         const uint32_t morphIndex = morph >= 0 && static_cast<uint32_t>(morph) < summary.morphTargets ? static_cast<uint32_t>(morph) : 0u;
@@ -2511,8 +2625,25 @@ namespace
             }
             p3fes_native_present::defineMesh(meshId, mesh);
             definedMesh = &g_definedMeshes.emplace(meshId, describeMesh(mesh)).first->second;
+            if (dynamicGeometryEnabled() && !mesh.skinned && summary.vertices <= kDynamicGeometryMaxVertices &&
+                (summary.geometryFlags & kGeometryLightingFlag) == 0u)
+                definedMesh->contentHash = geometryContentHash(rdram, summary.vertexData, summary.prelitData, summary.vertices);
         }
         definedSlot = {meshId, definedMesh};
+        // Geometry the game rewrites in place after it was defined: rebuilt from guest memory at every draw.
+        MeshData dynamicMesh;
+        bool drawDynamic = false;
+        if (definedMesh->contentHash != 0u)
+        {
+            if (!definedMesh->dynamic &&
+                geometryContentHash(rdram, summary.vertexData, summary.prelitData, summary.vertices) != definedMesh->contentHash)
+                definedMesh->dynamic = true;
+            if (definedMesh->dynamic)
+            {
+                MeshId dynamicId = 0u;
+                drawDynamic = decodeNativeMesh(rdram, summary, dynamicMesh, dynamicId) && dynamicId == meshId;
+            }
+        }
 
         Matrix4 model{};
         Matrix4 rawModel{};
@@ -2626,7 +2757,7 @@ namespace
         {
             static const bool meshDiag = [] { const char *v = std::getenv("P3FES_MESH_DIAG"); return v && *v == '1'; }();
             static unsigned meshDiagLines = 0u;
-            if (meshDiag && meshDiagLines < 12u && !drawState.lightingEnabled && g_nativeFrameNumber > 600u)
+            if (meshDiag && meshDiagLines < 400u && !drawState.lightingEnabled && g_nativeFrameNumber > 600u)
             {
                 bool textured = false;
                 for (const auto &name : drawState.materialTextures)
@@ -2668,7 +2799,38 @@ namespace
                 std::fprintf(stderr, " %u,%u,%u,%u", c[0], c[1], c[2], c[3]);
             std::fprintf(stderr, "\n");
         }
-        p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
+        {
+            // P3FES_MESH_COLOR_DIAG=1: every atomic draw whose material colours changed since its last log
+            static const bool colorDiag = [] { const char *v = std::getenv("P3FES_MESH_COLOR_DIAG"); return v && *v == '1'; }();
+            if (colorDiag)
+            {
+                static std::unordered_map<MeshId, std::vector<std::array<uint8_t, 4>>> lastColors;
+                static unsigned colorLogs = 0u;
+                auto &last = lastColors[meshId];
+                uint64_t diagAlpha = 0u, diagTest = 0u;
+                readGuest(rdram, kRwAlpha1, diagAlpha);
+                readGuest(rdram, kRwTest1, diagTest);
+                const bool odd = (diagAlpha & 0xFFu) != 0x44u && (diagAlpha & 0xFFu) != 0x48u;
+                if (odd && colorLogs++ < 4000u && (last != drawState.materialColors || last.empty()))
+                {
+                    last = drawState.materialColors;
+                    if (last.empty())
+                        last.push_back({0u, 0u, 0u, 0u});
+                    std::fprintf(stderr, "[p3fes-mesh-color] frame=%llu mesh=%llX alpha1=%llX test1=%llX lit=%d blend=%d tex=%s colors:",
+                                 static_cast<unsigned long long>(g_nativeFrameNumber), static_cast<unsigned long long>(meshId),
+                                 static_cast<unsigned long long>(diagAlpha), static_cast<unsigned long long>(diagTest),
+                                 drawState.lightingEnabled ? 1 : 0, drawState.blendEnabled ? 1 : 0,
+                                 drawState.materialTextures.empty() ? "-" : drawState.materialTextures[0].c_str());
+                    for (const auto &c : drawState.materialColors)
+                        std::fprintf(stderr, " %u,%u,%u,%u", c[0], c[1], c[2], c[3]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
+        if (drawDynamic)
+            p3fes_native_present::drawTransientMesh(std::move(dynamicMesh), model, std::move(drawState));
+        else
+            p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
         return true;
     }
 
@@ -2861,9 +3023,14 @@ namespace
             case 0x42u: state.blend = ScreenBlend::Subtractive; break; // Cd - Cs * As
             case 0x6Au: state.blend = ScreenBlend::DestinationOnly; break; // Cd
             case 0x58u: state.blend = ScreenBlend::DestinationAlphaAdditive; break; // Cs * Ad + Cd
+            case 0x54u: state.blend = fullGsAlphaDecode() ? ScreenBlend::DestinationAlpha : ScreenBlend::Alpha; break; // (Cs - Cd) * Ad + Cd
+            case 0x64u: // (Cs - Cd) * FIX + Cd; FIX = 0 leaves the colour alone (the draw only writes Z / alpha)
+                state.blend = fullGsAlphaDecode() && ((alpha >> 32u) & 0xFFu) == 0u ? ScreenBlend::DestinationOnly : ScreenBlend::Alpha;
+                break;
             default: state.blend = ScreenBlend::Alpha; break;
             }
         }
+        state.alphaOnlyWrite = g_gsColorMasked; // inside the FBMSK bracket: alpha-only write
         const uint32_t wms = static_cast<uint32_t>(clamp & 0x3u);
         const uint32_t wmt = static_cast<uint32_t>((clamp >> 2u) & 0x3u);
         state.clampU = wms == 1u || wms == 2u;
@@ -3398,9 +3565,34 @@ namespace
     bool drawNativeIm2DTriangles(uint8_t *rdram, uint32_t vertices, uint32_t vertexCount,
                                  const std::vector<uint16_t> &triangles)
     {
-        if (g_gsColorMasked)
+        if (g_gsColorMasked && g_maskDropIm2d)
         {
             ++g_maskDropped[2];
+            static const int maskDiagLevel = [] { const char *v = std::getenv("P3FES_MASK_DIAG"); return v ? std::atoi(v) : 0; }();
+            if (maskDiagLevel >= 2 && vertexCount > 0u && vertexCount <= 65535u && !triangles.empty())
+            {
+                // P3FES_MASK_DIAG=2: what each dropped masked fill looks like (bbox, colour, raw GS words)
+                float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+                ScreenVertex first{};
+                bool have = false;
+                for (uint16_t index : triangles)
+                {
+                    ScreenVertex v;
+                    if (index >= vertexCount || !readIm2DVertex(rdram, vertices, index, v))
+                        continue;
+                    if (!have) { first = v; have = true; }
+                    minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
+                    minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+                }
+                uint64_t flags = 0u, alpha = 0u, test = 0u;
+                readGuest(rdram, kRwRenderFlags, flags);
+                readGuest(rdram, kRwAlpha1, alpha);
+                readGuest(rdram, kRwTest1, test);
+                std::fprintf(stderr, "[p3fes-mask]   im2d on-ra=%08X xy=%.0f,%.0f..%.0f,%.0f rgba=%u,%u,%u,%u flags=%llX alpha1=%llX test1=%llX tex=%d\n",
+                             g_maskOnRa, minX, minY, maxX, maxY, first.color[0], first.color[1], first.color[2], first.color[3],
+                             static_cast<unsigned long long>(flags), static_cast<unsigned long long>(alpha),
+                             static_cast<unsigned long long>(test), nativeIm2DTextured(rdram) ? 1 : 0);
+            }
             return true;
         }
         if (vertexCount == 0u || vertexCount > 65535u || triangles.empty())
@@ -3411,6 +3603,23 @@ namespace
         const auto drawState = nativeIm2DState(rdram);
         uint64_t zbuf = 0;
         readGuest(rdram, kRwZbuf1, zbuf);
+        {
+            // P3FES_MASK_DIAG=3: every unmasked Im2D draw with its raw GS words (log is huge: use a short run)
+            static const int diagLevel = [] { const char *v = std::getenv("P3FES_MASK_DIAG"); return v ? std::atoi(v) : 0; }();
+            if (diagLevel >= 3)
+            {
+                uint64_t flags = 0u, alpha = 0u, test = 0u;
+                readGuest(rdram, kRwRenderFlags, flags);
+                readGuest(rdram, kRwAlpha1, alpha);
+                readGuest(rdram, kRwTest1, test);
+                ScreenVertex v0{};
+                readIm2DVertex(rdram, vertices, triangles[0], v0);
+                std::fprintf(stderr, "[p3fes-im2d] flags=%llX alpha1=%llX test1=%llX zbuf=%llX rgba=%u,%u,%u,%u\n",
+                             static_cast<unsigned long long>(flags), static_cast<unsigned long long>(alpha),
+                             static_cast<unsigned long long>(test), static_cast<unsigned long long>(zbuf),
+                             v0.color[0], v0.color[1], v0.color[2], v0.color[3]);
+            }
+        }
         const float inverseDepth = p3fes_im2d::inverseDepthRange(zbuf);
         std::vector<ScreenVertex> out;
         out.reserve(triangles.size());
@@ -3521,7 +3730,7 @@ namespace
     bool drawNativeIm2DLines(uint8_t *rdram, uint32_t vertices, uint32_t vertexCount,
                              const std::vector<uint16_t> &lines)
     {
-        if (g_gsColorMasked)
+        if (g_gsColorMasked && g_maskDropIm2d)
             return true;
         if (vertexCount == 0u || vertexCount > 65535u || lines.empty())
             return false;
@@ -4224,6 +4433,28 @@ namespace
             mesh.indices.insert(mesh.indices.end(), {base, base + 1u, base + 2u, base, base + 2u, base + 3u});
             ++quads;
         }
+        {
+            // P3FES_PTANK_DIAG=1: one line per sprite tank draw (global GS state, first particle)
+            static const bool ptankDiag = [] { const char *v = std::getenv("P3FES_PTANK_DIAG"); return v && *v == '1'; }();
+            static unsigned ptankDiagLines = 0u;
+            if (ptankDiag && ptankDiagLines++ < 600u && quads > 0u)
+            {
+                uint64_t alpha1 = 0u, test1 = 0u, flags = 0u;
+                readGuest(rdram, kRwAlpha1, alpha1);
+                readGuest(rdram, kRwTest1, test1);
+                readGuest(rdram, kRwRenderFlags, flags);
+                const auto &c0 = mesh.vertices[0].color;
+                std::fprintf(stderr, "[p3fes-ptank] frame=%llu quads=%u tex=%s alpha1=%llX test1=%llX flags=%llX blend=%d(%u/%u) override=%d first-rgba=%u,%u,%u,%u uv=%.2f,%.2f,%.2f,%.2f\n",
+                             static_cast<unsigned long long>(g_nativeFrameNumber), quads,
+                             drawState.materialTextures.empty() ? "-" : drawState.materialTextures[0].c_str(),
+                             static_cast<unsigned long long>(alpha1), static_cast<unsigned long long>(test1),
+                             static_cast<unsigned long long>(flags), drawState.blendEnabled ? 1 : 0,
+                             drawState.materialBlends.empty() ? 0u : drawState.materialBlends[0].src,
+                             drawState.materialBlends.empty() ? 0u : drawState.materialBlends[0].dst,
+                             (blendOverride && blendOverride->enabled) ? 1 : 0,
+                             c0[0], c0[1], c0[2], c0[3], uv[0], uv[1], uv[2], uv[3]);
+            }
+        }
         if (quads == 0u)
             return true; // nothing live: the original draws nothing either
         mesh.vertices.resize(static_cast<std::size_t>(quads) * 4u);
@@ -4401,7 +4632,7 @@ namespace
 
     void p3fesGsColorMaskOff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        static const bool maskDiag = [] { const char *v = std::getenv("P3FES_MASK_DIAG"); return v && *v == '1'; }();
+        static const bool maskDiag = [] { const char *v = std::getenv("P3FES_MASK_DIAG"); return v && *v >= '1'; }();
         if (maskDiag && g_gsColorMasked)
             std::fprintf(stderr, "[p3fes-mask] bracket on-ra=%08X off-ra=%08X dropped atomic=%u sector=%u im2d=%u im3d=%u\n", g_maskOnRa,
                          getRegU32(ctx, 31), g_maskDropped[0], g_maskDropped[1], g_maskDropped[2], g_maskDropped[3]);
@@ -4786,8 +5017,10 @@ namespace
             g_gsColorMasked = false;
             PS2Runtime::RecompiledFunction maskOn = runtime.lookupFunction(kGsColorMaskOn);
             PS2Runtime::RecompiledFunction maskOff = runtime.lookupFunction(kGsColorMaskOff);
-            // P3FES_GS_COLOR_MASK=0 leaves the bracket unhooked (A/B against the old behaviour).
+            // P3FES_GS_COLOR_MASK=0 leaves the bracket unhooked; =drop hooks it and discards the masked Im2D draws (A/B against the
+            // old behaviours); by default they are drawn alpha-only.
             const char *colorMaskOption = std::getenv("P3FES_GS_COLOR_MASK");
+            g_maskDropIm2d = colorMaskOption && std::strcmp(colorMaskOption, "drop") == 0;
             if ((!colorMaskOption || *colorMaskOption != '0') && maskOn && maskOff &&
                 maskOn != &p3fesGsColorMaskOn && maskOff != &p3fesGsColorMaskOff)
             {

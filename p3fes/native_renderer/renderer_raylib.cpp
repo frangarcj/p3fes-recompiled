@@ -740,8 +740,18 @@ public:
             else if (blend && blend->enabled)
             {
                 rlEnableColorBlend();
-                rlSetBlendFactors(rwBlendFactor(blend->src), rwBlendFactor(blend->dst), RL_FUNC_ADD);
-                rlSetBlendMode(RL_BLEND_CUSTOM);
+                if (blend->subtract)
+                {
+                    // Cd - Cs * As; the alpha channel keeps As (GS writes the source alpha)
+                    rlSetBlendFactorsSeparate(rwBlendFactor(blend->src), rwBlendFactor(blend->dst), RL_ONE, RL_ZERO,
+                                              RL_FUNC_REVERSE_SUBTRACT, RL_FUNC_ADD);
+                    rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
+                }
+                else
+                {
+                    rlSetBlendFactors(rwBlendFactor(blend->src), rwBlendFactor(blend->dst), RL_FUNC_ADD);
+                    rlSetBlendMode(RL_BLEND_CUSTOM);
+                }
             }
             else
             {
@@ -957,9 +967,18 @@ public:
         else if (!state.materialBlends.empty() && state.materialBlends[0].enabled)
         {
             rlEnableColorBlend();
-            rlSetBlendFactors(rwBlendFactor(state.materialBlends[0].src),
-                              rwBlendFactor(state.materialBlends[0].dst), RL_FUNC_ADD);
-            rlSetBlendMode(RL_BLEND_CUSTOM);
+            if (state.materialBlends[0].subtract)
+            {
+                rlSetBlendFactorsSeparate(rwBlendFactor(state.materialBlends[0].src), rwBlendFactor(state.materialBlends[0].dst),
+                                          RL_ONE, RL_ZERO, RL_FUNC_REVERSE_SUBTRACT, RL_FUNC_ADD);
+                rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
+            }
+            else
+            {
+                rlSetBlendFactors(rwBlendFactor(state.materialBlends[0].src),
+                                  rwBlendFactor(state.materialBlends[0].dst), RL_FUNC_ADD);
+                rlSetBlendMode(RL_BLEND_CUSTOM);
+            }
         }
         else
         {
@@ -1161,7 +1180,11 @@ template <typename Viewport, typename Fit>
         rlSetMatrixProjection(m_target ? MatrixOrtho(0.0, sourceWidth, 0.0, sourceHeight, -1.0, 0.0)
                                        : MatrixOrtho(0.0, sourceWidth, sourceHeight, 0.0, -1.0, 0.0));
         rlSetMatrixModelview(MatrixIdentity());
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        // FBMSK = 0x00FFFFFF: alpha-only write (see ScreenDrawState::alphaOnlyWrite)
+        if (state.alphaOnlyWrite)
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+        else
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         if (state.depthTest)
             rlEnableDepthTest();
         else
@@ -1227,6 +1250,13 @@ template <typename Viewport, typename Fit>
             rlSetBlendMode(RL_BLEND_CUSTOM);
             blendSrcRgb = GL_DST_ALPHA;
             blendDstRgb = GL_ONE;
+            break;
+        case ScreenBlend::DestinationAlpha:
+            rlEnableColorBlend();
+            rlSetBlendFactors(RL_DST_ALPHA, RL_ONE_MINUS_DST_ALPHA, RL_FUNC_ADD);
+            rlSetBlendMode(RL_BLEND_CUSTOM);
+            blendSrcRgb = GL_DST_ALPHA;
+            blendDstRgb = GL_ONE_MINUS_DST_ALPHA;
             break;
         default:
             rlEnableColorBlend();
@@ -1295,7 +1325,7 @@ template <typename Viewport, typename Fit>
                     rlEnableDepthMask();
                     break;
                 case ScreenAlphaFailAction::RgbOnly:
-                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+                    glColorMask(!state.alphaOnlyWrite, !state.alphaOnlyWrite, !state.alphaOnlyWrite, GL_FALSE);
                     rlDisableDepthMask();
                     break;
                 case ScreenAlphaFailAction::Keep:

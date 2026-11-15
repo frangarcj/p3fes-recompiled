@@ -48,7 +48,8 @@ inline bool sameScreenState(const ScreenDrawState &a, const ScreenDrawState &b)
            a.linearFilter == b.linearFilter && a.alphaTest.enabled == b.alphaTest.enabled &&
            a.alphaTest.function == b.alphaTest.function && a.alphaTest.reference == b.alphaTest.reference &&
            a.fog.enabled == b.fog.enabled && a.fog.start == b.fog.start && a.fog.end == b.fog.end &&
-           a.fog.color == b.fog.color && a.destinationAlphaTest == b.destinationAlphaTest;
+           a.fog.color == b.fog.color && a.destinationAlphaTest == b.destinationAlphaTest &&
+           a.alphaOnlyWrite == b.alphaOnlyWrite;
 }
 
 // A draw whose alpha test has a "failed" outcome that is drawn too (the GS keeps writing the frame buffer, the

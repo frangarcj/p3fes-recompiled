@@ -70,6 +70,9 @@ enum class ScreenBlend : std::uint8_t
     DestinationOnly,
     DestinationAlphaAdditive,
     Opaque,
+    // GS ALPHA_1 0x54: Cs * Ad + Cd * (1 - Ad). Ad is the frame buffer's alpha, which the game fills with an
+    // alpha-only pass (see ScreenDrawState::alphaOnlyWrite) just before.
+    DestinationAlpha,
 };
 
 enum class ScreenDepthFunction : std::uint8_t
@@ -128,6 +131,10 @@ struct ScreenDrawState
     // written. Used on render targets whose alpha is a mask (the shadow map's silhouette);
     // backends approximate it by multiplying the written alpha by the destination alpha.
     bool destinationAlphaTest = false;
+    // GS FRAME_1.FBMSK = 0x00FFFFFF: the draw writes only the frame buffer's alpha (its source alpha As), the colour
+    // channels are masked. The game brackets effect passes with it (mdlEffect_003294d0 / 00329550) and blends the
+    // following passes with Ad (ScreenBlend::DestinationAlpha / DestinationAlphaAdditive).
+    bool alphaOnlyWrite = false;
 };
 
 struct MeshDrawState
@@ -219,6 +226,8 @@ struct MeshDrawState
         // SRCCOLOR=3, INVSRCCOLOR=4, SRCALPHA=5, INVSRCALPHA=6, ...).
         std::uint8_t src = 5u;
         std::uint8_t dst = 6u;
+        // GS ALPHA_1 0x42, Cd - Cs * As: the equation is reverse subtract (src = SRCALPHA, dst = ONE).
+        bool subtract = false;
     };
     std::vector<BlendState> materialBlends;
 

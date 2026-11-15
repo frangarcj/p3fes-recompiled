@@ -114,7 +114,11 @@ namespace
                                            : std::chrono::duration<double>(now - diag.start).count();
         if (elapsed < diag.times[diag.next])
             return -1;
-        return static_cast<int>(diag.times[diag.next++]);
+        {
+            // Fractional times (71.25) are labelled t*100 (7125) so sub-second series do not overwrite each other.
+            const double t = diag.times[diag.next++];
+            return t == std::floor(t) ? static_cast<int>(t) : static_cast<int>(t * 100.0 + 0.5);
+        }
     }
 
     void gsCaptureWindow(int label)
