@@ -131,11 +131,16 @@ void audioLoop()
         if (!frames || frames > 16384u || audio.sampleRate > 48000u)
             continue;
         const unsigned outputFrames = (frames + 63u) & ~63u;
-        std::vector<int16_t> padded;
+        // The port keeps reading a buffer after sceAudioOutOutput returns, so a padded copy must
+        // outlive this iteration: rotate between a few that persist.
+        static std::vector<int16_t> paddedBuffers[4];
+        static unsigned paddedNext = 0u;
+        std::vector<int16_t> &padded = paddedBuffers[paddedNext];
         const void *pcm = frame.pData;
         if (outputFrames != frames)
         {
-            padded.resize(outputFrames * audio.channelCount);
+            paddedNext = (paddedNext + 1u) % 4u;
+            padded.assign(outputFrames * audio.channelCount, 0);
             std::memcpy(padded.data(), frame.pData, audio.size);
             pcm = padded.data();
         }
