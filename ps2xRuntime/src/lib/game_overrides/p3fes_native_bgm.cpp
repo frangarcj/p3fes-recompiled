@@ -472,7 +472,7 @@ namespace p3fes_native_bgm
             }
         };
 
-        // P3FES_BGM_ASYNC=1 (default off): start() and stop() only queue the request for a controller thread, so the
+        // P3FES_BGM_ASYNC=1 (default on, =0 disables): start() and stop() only queue the request for a controller thread, so the
         // game thread no longer waits for the old audio thread to notice the stop (one 21 ms block, then the feeder and the
         // port) or for the new port to open: both measured at 37-56 ms on the console, i.e. a lost frame at each track
         // change. Requests run in order; a start that a later request supersedes is skipped.
@@ -493,7 +493,7 @@ namespace p3fes_native_bgm
         std::atomic<bool> g_asyncActive{false};
         bool asyncMode()
         {
-            static const bool on = [] { const char *v = std::getenv("P3FES_BGM_ASYNC"); return v && v[0] == '1'; }();
+            static const bool on = [] { const char *v = std::getenv("P3FES_BGM_ASYNC"); return !v || v[0] != '0'; }();
             return on;
         }
         void stopController()
