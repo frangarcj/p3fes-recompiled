@@ -134,6 +134,48 @@ bool meshReuseEnabled()
     return enabled;
 }
 
+// P3FES_MESH_GLCACHE=1: the mesh path remembers the GL state it set and skips redundant calls (each vitaGL
+// enable / pointer / client-state call marks the fixed-function programs dirty, so a draw re-resolves them);
+// the reset to the baseline state is deferred to the end of a run of consecutive mesh draws.
+bool meshGlCacheEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_GLCACHE");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
+// P3FES_MESH_MERGE=1 (implies the GL cache): consecutive small unskinned parts that share every piece of draw
+// state are baked in world space into one client-array draw. P3FES_MESH_MERGE_VERTS = largest part merged.
+bool meshMergeEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_MERGE");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
+std::size_t meshMergeMaxVerts()
+{
+    static const std::size_t limit = [] {
+        const char *value = std::getenv("P3FES_MESH_MERGE_VERTS");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : 256;
+        return static_cast<std::size_t>(parsed > 0 ? std::min(parsed, 4096l) : 256l);
+    }();
+    return limit;
+}
+
+bool meshPhasesEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_PHASES");
+        return value && *value == '1';
+    }();
+    return enabled;
+}
+
 // ScreenVertex already has the client-array layout required by vitaGL.
 // Keep frame-owned data intact and let glDrawArrays consume it directly.
 static_assert(std::is_standard_layout_v<ScreenVertex> && sizeof(ScreenVertex) == 24u &&
@@ -186,6 +228,7 @@ struct DrawPart
     };
     std::vector<Instance> instances;
     std::uint32_t slotUsedFrame = 0;
+    std::vector<std::uint16_t> cpuIndices; // small unskinned parts only: triangle list, for the merged draw (P3FES_MESH_MERGE)
     std::vector<std::uint8_t> usedBones; // skinned: bones with a usable weight in this part
     detail::SkinLayout skinLayout;       // skinned: rigid runs per bone, then blended vertices (mesh_regen.h)
     bool lighting = false;
@@ -226,15 +269,31 @@ GLenum rwWrapMode(MeshDrawState::SamplerState::Address address)
     }
 }
 
+struct ResolvedSampler
+{
+    GLenum wrapS = GL_REPEAT, wrapT = GL_REPEAT;
+    bool linear = true;
+    bool operator==(const ResolvedSampler &) const = default;
+};
+
+ResolvedSampler resolveMeshSampler(const MeshDrawState &state, const MeshDrawState::SamplerState *sampler)
+{
+    const bool materialSampler = sampler && sampler->valid;
+    ResolvedSampler out;
+    out.wrapS = materialSampler ? rwWrapMode(sampler->u) : (state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    out.wrapT = materialSampler ? rwWrapMode(sampler->v) : (state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    out.linear = materialSampler ? sampler->linearFilter : state.linearFilter;
+    return out;
+}
+
 void applyMeshSampler(GLuint texture, const MeshDrawState &state,
                       const MeshDrawState::SamplerState *sampler = nullptr)
 {
     if (!texture)
         return;
-    const bool materialSampler = sampler && sampler->valid;
-    const GLenum wrapS = materialSampler ? rwWrapMode(sampler->u) : (state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    const GLenum wrapT = materialSampler ? rwWrapMode(sampler->v) : (state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    const bool linear = materialSampler ? sampler->linearFilter : state.linearFilter;
+    const ResolvedSampler resolved = resolveMeshSampler(state, sampler);
+    const GLenum wrapS = resolved.wrapS, wrapT = resolved.wrapT;
+    const bool linear = resolved.linear;
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
@@ -713,6 +772,8 @@ public:
     {
         if (m_open)
             return true;
+        m_merge.enabled = meshMergeEnabled();
+        m_gl.on = meshGlCacheEnabled() || m_merge.enabled;
         // In the Vita runtime vitaGL is already initialized by the host shim.
         // Borrow that one global context; only the standalone viewer creates
         // and later destroys its own window/context.
@@ -855,6 +916,7 @@ public:
 
     bool uploadMesh(MeshId id, const MeshData &source, std::string &error) override
     {
+        leaveMesh();
         if (!m_open)
         {
             error = "renderer is not open";
@@ -1005,6 +1067,8 @@ public:
             glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizei>(indices.size() * sizeof(std::uint16_t)),
                          indices.data(), GL_STATIC_DRAW);
             part.indexCount = static_cast<GLsizei>(indices.size());
+            if (meshMergeEnabled() && !part.skinned && part.sourceVertices.size() <= meshMergeMaxVerts())
+                part.cpuIndices = indices;
             if (!part.vertexBuffer || !part.indexBuffer)
             {
                 error = "vitaGL failed to allocate mesh buffers";
@@ -1140,9 +1204,19 @@ public:
         m_widescreen = mode;
     }
     void setScreenPlacement(ScreenPlacement placement) override { m_screenPlacement = placement; }
+    bool setWorldPlacement(WorldPlacement placement) override
+    {
+        const bool supported = m_widescreen == 2 && !m_target;
+        flushScreenBatch();
+        m_worldPlacement = supported ? placement : WorldPlacement::Full;
+        if (m_in3D)
+            apply3D();
+        return supported;
+    }
 
     void beginFrame(const Camera &camera, ClearColor clear) override
     {
+        leaveMesh();
         ++m_instanceFrame;
         m_screenZLayers.clear();
         m_camera = camera;
@@ -1194,10 +1268,12 @@ public:
         glClear(mask);
         glDisable(GL_SCISSOR_TEST);
         glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        applyWorldScissor();
     }
 
     void setCamera(const Camera &camera) override
     {
+        leaveMesh(); // a pending merged batch is drawn with the old camera
         m_camera = camera;
         // A colour attachment stores its bottom row first, while the game samples its camera
         // textures like any other raster (v = 0 is the top row): render target passes upside down.
@@ -1226,35 +1302,60 @@ public:
 
     void drawMeshImpl(MeshId id, const Matrix4 &model, const MeshDrawState &state)
     {
-        flushScreenBatch();
+        PhaseClock phase;
+        if (meshPhasesEnabled() && resourceDiagEnabled())
+        {
+            phase.timing = m_target ? &m_meshTimingTarget : &m_meshTiming;
+            phase.last = diagNowUs();
+        }
+        if (!m_gl.inRun)
+            flushScreenBatch();
         if (!m_in3D)
             apply3D();
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
             return;
-
-        applyAlphaTest(state.alphaTest);
-        applyFog(state.fog);
-        applyShadeMode(state.gouraudShading);
-        if (state.depthTest)
-            glEnable(GL_DEPTH_TEST);
-        else
-            glDisable(GL_DEPTH_TEST);
-        glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
-        if (state.cullMode == MeshDrawState::CullMode::None)
-            glDisable(GL_CULL_FACE);
-        else
+        if (m_gl.on && !m_gl.inRun)
         {
-            glEnable(GL_CULL_FACE);
-            glCullFace(state.cullMode == MeshDrawState::CullMode::Back ? GL_BACK : GL_FRONT);
+            m_gl.baseline();
+            m_gl.inRun = true;
         }
+
+        // State shared by all parts of the mesh. With the GL cache it is applied right before each part that is drawn
+        // directly (a pending merged batch sets its own, and the shadow keeps the calls that change nothing away).
+        const auto meshState = [&] {
+            // an FB_ONLY test is set per part with its own reference below
+            if (!(m_gl.on && alphaTestFbOnly(state.alphaTest)))
+                glsAlpha(state.alphaTest);
+            glsFog(state.fog);
+            glsShade(state.gouraudShading);
+            glsCap(m_gl.depthTest, GL_DEPTH_TEST, state.depthTest);
+            glsDepthMask(state.depthWrite);
+            glsCull(state.cullMode);
+        };
+        if (!m_gl.on)
+            meshState();
 
         glMatrixMode(GL_MODELVIEW);
         glPushMatrix();
         glMultMatrixf(model.data());
-        glEnableClientState(GL_VERTEX_ARRAY);
+        glsClient(m_gl.vtxArr, GL_VERTEX_ARRAY, true);
+        phase.lap(0);
         for (DrawPart &part : found->second)
         {
+            if (m_gl.on)
+            {
+                if (m_merge.enabled)
+                {
+                    if (tryMergePart(part, model, state))
+                    {
+                        phase.lap(5);
+                        continue;
+                    }
+                    flushMerge(&model); // the pending batch comes before this part
+                }
+                meshState();
+            }
             if (meshInstancesEnabled() && !part.skinned && part.staticVertexCache.valid &&
                 part.staticVertexCache.model != model &&
                 part.gpuVertices.size() == part.sourceVertices.size())
@@ -1279,6 +1380,7 @@ public:
                         DrawPart::Instance fresh;
                         glGenBuffers(1, &fresh.vertexBuffer);
                         glBindBuffer(GL_ARRAY_BUFFER, fresh.vertexBuffer);
+                        m_gl.arrayBuf = fresh.vertexBuffer;
                         glBufferData(GL_ARRAY_BUFFER,
                                      static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
                                      part.gpuVertices.data(), GL_STATIC_DRAW);
@@ -1296,34 +1398,22 @@ public:
                 }
             }
             part.slotUsedFrame = m_instanceFrame;
-            glBindBuffer(GL_ARRAY_BUFFER, part.vertexBuffer);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, part.indexBuffer);
+            glsBindArray(part.vertexBuffer);
+            glsBindElements(part.indexBuffer);
             const auto &color = part.materialIndex < state.materialColors.size()
                 ? state.materialColors[part.materialIndex]
                 : part.color;
             const MeshDrawState::BlendState *blend = part.materialIndex < state.materialBlends.size()
                 ? &state.materialBlends[part.materialIndex]
                 : nullptr;
-            glBlendEquation(GL_FUNC_ADD);
+            // subtract: Cd - Cs * As; alpha keeps As. The equation is put back to ADD by the next part / pass.
             if (!state.blendEnabled)
-                glDisable(GL_BLEND);
+                glsBlend(false, false, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             else if (blend && blend->enabled)
-            {
-                glEnable(GL_BLEND);
-                if (blend->subtract)
-                {
-                    // Cd - Cs * As; alpha keeps As. The equation is put back to ADD by the next part / pass.
-                    glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
-                    glBlendFuncSeparate(rwBlendFactor(blend->src), rwBlendFactor(blend->dst), GL_ONE, GL_ZERO);
-                }
-                else
-                    glBlendFunc(rwBlendFactor(blend->src), rwBlendFactor(blend->dst));
-            }
+                glsBlend(true, blend->subtract, rwBlendFactor(blend->src), rwBlendFactor(blend->dst));
             else
-            {
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            }
+                glsBlend(true, false, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            phase.lap(1);
 
             if (m_gpuSkinEnabled && part.skinned)
             {
@@ -1360,9 +1450,19 @@ public:
                 {
                     const MeshDrawState::SamplerState *sampler = part.materialIndex < state.materialSamplers.size()
                         ? &state.materialSamplers[part.materialIndex] : nullptr;
+                    phase.skip();
                     drawGpuSkinPart(part, model, state, color,
                                     gpuTexture == m_textures.end() ? 0u : gpuTexture->second,
                                     sampler);
+                    if (m_gl.on)
+                    {
+                        // the skin path sets its own program, arrays, texture and blend state
+                        m_gl.unknown();
+                        m_gl.skinTouched = true;
+                        m_samplerCache.clear();
+                    }
+                    phase.lap(7);
+                    if (phase.timing) ++phase.timing->partsGpuSkin;
                     continue;
                 }
             }
@@ -1492,43 +1592,39 @@ public:
                                                    skinBones, skinPalette);
                 }
             }
-            glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
-            glEnableClientState(GL_COLOR_ARRAY);
-            glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
-
+            phase.lap(2);
+            glsClient(m_gl.colArr, GL_COLOR_ARRAY, true);
             const auto &textureName = part.materialIndex < state.materialTextures.size()
                 ? state.materialTextures[part.materialIndex] : part.textureName;
             auto texture = textureName.empty() ? m_textures.end() : m_textures.find(textureKey(textureName));
+            glsPointers(part.vertexBuffer, texture != m_textures.end());
             if (texture != m_textures.end())
             {
-                glEnable(GL_TEXTURE_2D);
-                glBindTexture(GL_TEXTURE_2D, texture->second);
                 const MeshDrawState::SamplerState *sampler = part.materialIndex < state.materialSamplers.size()
                     ? &state.materialSamplers[part.materialIndex] : nullptr;
-                applyMeshSampler(texture->second, state, sampler);
-                glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-                glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
+                glsTexture(texture->second, resolveMeshSampler(state, sampler));
             }
             else
-            {
-                glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-                glDisable(GL_TEXTURE_2D);
-            }
+                glsTexture(0u, ResolvedSampler{});
             // FB_ONLY alpha test (see lighting.h): unskinned parts are drawn twice, skinned ones once.
             const bool alphaTwoPass = alphaTestFbOnly(state.alphaTest) && !part.skinned &&
                                       alphaTestFailPass(state.alphaTest).function != 0u;
             if (alphaTestFbOnly(state.alphaTest))
-                applyAlphaTest(alphaTwoPass ? alphaTestPassOne(state.alphaTest) : alphaTestSinglePass(state.alphaTest));
+                glsAlpha(alphaTwoPass ? alphaTestPassOne(state.alphaTest) : alphaTestSinglePass(state.alphaTest));
+            phase.lap(3);
             glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
+            if (phase.timing) { ++phase.timing->partsStatic; ++phase.timing->glDraws; }
             if (alphaTwoPass)
             {
                 // The pixels that failed the test: still drawn, Z not written.
-                applyAlphaTest(alphaTestFailPass(state.alphaTest));
-                glDepthMask(GL_FALSE);
+                glsAlpha(alphaTestFailPass(state.alphaTest));
+                glsDepthMask(false);
                 glDrawElements(GL_TRIANGLES, part.indexCount, GL_UNSIGNED_SHORT, nullptr);
-                glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
-                applyAlphaTest(alphaTestPassOne(state.alphaTest));
+                glsDepthMask(state.depthWrite);
+                glsAlpha(alphaTestPassOne(state.alphaTest));
+                if (phase.timing) ++phase.timing->glDraws;
             }
+            phase.lap(4);
 
             const MeshDrawState::DualPass *dual = part.materialIndex < state.materialDualPasses.size()
                 ? &state.materialDualPasses[part.materialIndex]
@@ -1538,6 +1634,7 @@ public:
                 const auto dualTexture = m_textures.find(textureKey(dual->textureName));
                 if (dualTexture != m_textures.end())
                 {
+                    if (m_gl.on) { m_gl.unknown(); m_samplerCache.clear(); }
                     applyMeshSampler(dualTexture->second, state, &dual->sampler);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
                     {
@@ -1574,6 +1671,7 @@ public:
                 const auto envTexture = m_textures.find(textureKey(env->textureName));
                 if (envTexture != m_textures.end())
                 {
+                    if (m_gl.on) { m_gl.unknown(); m_samplerCache.clear(); }
                     applyMeshSampler(envTexture->second, state, &env->sampler);
                     const float coefficient = std::clamp(env->coefficient, 0.0f, 1.0f);
                     for (std::size_t i = 0; i < part.sourceVertices.size(); ++i)
@@ -1607,9 +1705,20 @@ public:
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 }
             }
-            glBlendEquation(GL_FUNC_ADD);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            if (!m_gl.on)
+            {
+                glBlendEquation(GL_FUNC_ADD);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            }
+            phase.lap(5);
+        }
+        if (m_gl.on)
+        {
+            // the state is put back to the baseline by leaveMesh() when the run of mesh draws ends
+            glPopMatrix();
+            phase.lap(6);
+            return;
         }
         glDisableClientState(GL_TEXTURE_COORD_ARRAY);
         glDisableClientState(GL_COLOR_ARRAY);
@@ -1628,6 +1737,7 @@ public:
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         glDisable(GL_CULL_FACE);
+        phase.lap(6);
     }
 
     void drawWorldLines(const std::vector<Vertex> &vertices, const Matrix4 &model,
@@ -1733,6 +1843,7 @@ public:
                              std::string_view textureName,
                              const ScreenDrawState &state) override
     {
+        leaveMesh();
         if (!detail::screenBatchEnabled() || m_target || vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
         {
             flushScreenBatch();
@@ -1792,6 +1903,17 @@ public:
                                  static_cast<unsigned long long>(m.verifyPosBad), m.verifyPosMax,
                                  static_cast<unsigned long long>(m.verifyUvBad));
             }
+            if (a.phaseUs[0] || a.phaseUs[7] || a.phaseUs[4])
+                std::fprintf(stderr,
+                             "[native-mesh-phase] display us/frame-window: prologue=%llu bind+blend=%llu regen+rest=%llu pointers+texture=%llu gldraw=%llu dual/env+reset=%llu epilogue=%llu gpuskin=%llu | parts static=%u gpuskin=%u gl-draws=%u\n",
+                             static_cast<unsigned long long>(a.phaseUs[0]), static_cast<unsigned long long>(a.phaseUs[1]),
+                             static_cast<unsigned long long>(a.phaseUs[2]), static_cast<unsigned long long>(a.phaseUs[3]),
+                             static_cast<unsigned long long>(a.phaseUs[4]), static_cast<unsigned long long>(a.phaseUs[5]),
+                             static_cast<unsigned long long>(a.phaseUs[6]), static_cast<unsigned long long>(a.phaseUs[7]),
+                             a.partsStatic, a.partsGpuSkin, a.glDraws);
+            if (a.mergedParts || a.mergeBatches)
+                std::fprintf(stderr, "[native-mesh-merge] display: merged parts=%u verts=%u in %u draws\n",
+                             a.mergedParts, a.mergedVerts, a.mergeBatches);
             m_meshTiming = {};
             m_meshTimingTarget = {};
         }
@@ -2216,6 +2338,7 @@ private:
 
     void flushScreenBatch()
     {
+        leaveMesh();
         if (!m_batch.active)
             return;
         m_batch.active = false;
@@ -2463,6 +2586,7 @@ private:
     }
     void removeTextureLocked(std::string_view name)
     {
+        leaveMesh();
         flushScreenBatch();
         const std::string key = textureKey(name);
         dropSmallTexture(key);
@@ -2499,6 +2623,7 @@ private:
 
     void removeMeshLocked(MeshId id)
     {
+        leaveMesh();
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
             return;
@@ -2534,6 +2659,9 @@ private:
         std::uint64_t verifyVerts = 0, verifyColorOff1 = 0, verifyColorBad = 0, verifyUvBad = 0, verifyPosBad = 0;
         float verifyPosMax = 0.0f;
         std::uint32_t reasons[2][512] = {};   // [skinned][mismatch bits]: how often each reason set came up
+        // P3FES_MESH_PHASES=1: time by phase of drawMeshImpl (see PhaseClock), parts drawn by path, GL draw calls.
+        std::uint64_t phaseUs[8] = {};
+        std::uint32_t partsStatic = 0, partsGpuSkin = 0, glDraws = 0, mergedParts = 0, mergedVerts = 0, mergeBatches = 0;
     };
     MeshTiming m_meshTiming, m_meshTimingTarget; // display frame / render-target passes
     static std::uint64_t diagNowUs()
@@ -2545,6 +2673,439 @@ private:
             std::chrono::steady_clock::now().time_since_epoch()).count());
 #endif
     }
+    // ---- GL state shadow of the mesh path (P3FES_MESH_GLCACHE / P3FES_MESH_MERGE) ---------------------------------
+    // A run starts at the first mesh draw after any other renderer work and ends in leaveMesh(), which every other
+    // entry point reaches through flushScreenBatch() (or calls directly). Inside a run only the mesh path touches GL, so
+    // the shadow below is exact; it starts at the baseline state that the old per-draw epilogue used to restore.
+    static constexpr GLuint kUnknownBuffer = 0xFFFFFFFFu, kClientMemory = 0xFFFFFFFEu;
+    struct GlShadow
+    {
+        bool on = false, inRun = false, skinTouched = false;
+        std::int8_t depthTest = 1, depthMask = 1, cullOn = 0, blendOn = 1, alphaOn = 0, fogOn = 0, tex2d = 0, smooth = 1;
+        std::int8_t vtxArr = 0, colArr = 0, texArr = 0;
+        std::int8_t eqSub = 0;       // blend equation: 0 ADD, 1 REVERSE_SUBTRACT, -1 unknown
+        bool funcSeparate = false;   // alpha factors are (ONE, ZERO), set by a subtract draw
+        GLenum cullFace = GL_BACK;
+        GLenum funcSrc = GL_SRC_ALPHA, funcDst = GL_ONE_MINUS_SRC_ALPHA; // 0 = unknown
+        int alphaFunc = -1, alphaRef = -1;
+        FogState fog;
+        bool fogKnown = false;
+        GLuint arrayBuf = 0, elemBuf = 0, boundTex = kUnknownBuffer, ptrBuf = kUnknownBuffer, texPtrBuf = kUnknownBuffer;
+        // everything back to what leaveMesh() restores
+        void baseline()
+        {
+            depthTest = depthMask = blendOn = smooth = 1;
+            cullOn = alphaOn = fogOn = tex2d = vtxArr = colArr = texArr = 0;
+            eqSub = 0; funcSeparate = false;
+            funcSrc = GL_SRC_ALPHA; funcDst = GL_ONE_MINUS_SRC_ALPHA;
+            arrayBuf = elemBuf = 0;
+            cullFace = GL_BACK;
+            skinTouched = false;
+            // ids can be reused and vitaGL keeps a buffer pointer in each array pointer: re-issue them in every run
+            boundTex = ptrBuf = texPtrBuf = kUnknownBuffer;
+        }
+        // something outside the tracked calls changed GL state: forget all of it
+        void unknown()
+        {
+            depthTest = depthMask = cullOn = blendOn = alphaOn = fogOn = tex2d = smooth = vtxArr = colArr = texArr = -1;
+            eqSub = -1; funcSeparate = true; funcSrc = funcDst = 0; cullFace = 0;
+            alphaFunc = alphaRef = -1; fogKnown = false;
+            arrayBuf = elemBuf = boundTex = ptrBuf = texPtrBuf = kUnknownBuffer;
+        }
+    };
+    GlShadow m_gl;
+    std::unordered_map<GLuint, std::array<GLenum, 3>> m_samplerCache; // texture -> wrapS, wrapT, linear; valid inside a run only
+
+    void glsCap(std::int8_t &shadow, GLenum cap, bool on)
+    {
+        if (m_gl.on && shadow == static_cast<std::int8_t>(on))
+            return;
+        if (on) glEnable(cap); else glDisable(cap);
+        shadow = static_cast<std::int8_t>(on);
+    }
+    void glsDepthMask(bool on)
+    {
+        if (m_gl.on && m_gl.depthMask == static_cast<std::int8_t>(on))
+            return;
+        glDepthMask(on ? GL_TRUE : GL_FALSE);
+        m_gl.depthMask = static_cast<std::int8_t>(on);
+    }
+    void glsClient(std::int8_t &shadow, GLenum array, bool on)
+    {
+        if (m_gl.on && shadow == static_cast<std::int8_t>(on))
+            return;
+        if (on) glEnableClientState(array); else glDisableClientState(array);
+        shadow = static_cast<std::int8_t>(on);
+    }
+    void glsAlpha(const AlphaTestState &alpha)
+    {
+        if (!alpha.enabled)
+        {
+            glsCap(m_gl.alphaOn, GL_ALPHA_TEST, false);
+            return;
+        }
+        glsCap(m_gl.alphaOn, GL_ALPHA_TEST, true);
+        const int function = alpha.function & 7u; // bit 3 is the FB_ONLY marker, not part of the test
+        if (!m_gl.on || m_gl.alphaFunc != function || m_gl.alphaRef != alpha.reference)
+        {
+            glAlphaFunc(gsAlphaFunc(alpha.function), alpha.reference / 255.0f);
+            m_gl.alphaFunc = function;
+            m_gl.alphaRef = alpha.reference;
+        }
+    }
+    void glsFog(const FogState &fog)
+    {
+        if (!fog.enabled)
+        {
+            glsCap(m_gl.fogOn, GL_FOG, false);
+            return;
+        }
+        glsCap(m_gl.fogOn, GL_FOG, true);
+        if (!m_gl.on || !m_gl.fogKnown || m_gl.fog.start != fog.start || m_gl.fog.end != fog.end ||
+            m_gl.fog.color != fog.color)
+        {
+            const GLfloat color[4]{fog.color[0] / 255.0f, fog.color[1] / 255.0f, fog.color[2] / 255.0f, 1.0f};
+            glFogi(GL_FOG_MODE, GL_LINEAR);
+            glFogf(GL_FOG_START, fog.start);
+            glFogf(GL_FOG_END, fog.end);
+            glFogfv(GL_FOG_COLOR, color);
+            m_gl.fog = fog;
+            m_gl.fogKnown = true;
+        }
+    }
+    void glsShade(bool gouraud)
+    {
+        if (m_gl.on && m_gl.smooth == static_cast<std::int8_t>(gouraud))
+            return;
+        glShadeModel(gouraud ? GL_SMOOTH : GL_FLAT);
+        m_gl.smooth = static_cast<std::int8_t>(gouraud);
+    }
+    void glsCull(MeshDrawState::CullMode mode)
+    {
+        if (mode == MeshDrawState::CullMode::None)
+        {
+            glsCap(m_gl.cullOn, GL_CULL_FACE, false);
+            return;
+        }
+        const GLenum face = mode == MeshDrawState::CullMode::Back ? GL_BACK : GL_FRONT;
+        glsCap(m_gl.cullOn, GL_CULL_FACE, true);
+        if (!m_gl.on || m_gl.cullFace != face)
+        {
+            glCullFace(face);
+            m_gl.cullFace = face;
+        }
+    }
+    // Blend state of one part: `enabled` false leaves blending off; `subtract` is the reverse-subtract mode.
+    void glsBlend(bool enabled, bool subtract, GLenum src, GLenum dst)
+    {
+        if (!subtract)
+        {
+            if (!m_gl.on || m_gl.eqSub != 0)
+            {
+                glBlendEquation(GL_FUNC_ADD);
+                m_gl.eqSub = 0;
+            }
+            if (!enabled)
+            {
+                glsCap(m_gl.blendOn, GL_BLEND, false);
+                return;
+            }
+            glsCap(m_gl.blendOn, GL_BLEND, true);
+            if (!m_gl.on || m_gl.funcSeparate || m_gl.funcSrc != src || m_gl.funcDst != dst)
+            {
+                glBlendFunc(src, dst);
+                m_gl.funcSrc = src;
+                m_gl.funcDst = dst;
+                m_gl.funcSeparate = false;
+            }
+            return;
+        }
+        glsCap(m_gl.blendOn, GL_BLEND, true);
+        if (!m_gl.on || m_gl.eqSub != 1 || !m_gl.funcSeparate || m_gl.funcSrc != src || m_gl.funcDst != dst)
+        {
+            glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+            glBlendFuncSeparate(src, dst, GL_ONE, GL_ZERO);
+            m_gl.eqSub = 1;
+            m_gl.funcSeparate = true;
+            m_gl.funcSrc = src;
+            m_gl.funcDst = dst;
+        }
+    }
+    void glsBindArray(GLuint buffer)
+    {
+        if (m_gl.on && m_gl.arrayBuf == buffer)
+            return;
+        glBindBuffer(GL_ARRAY_BUFFER, buffer);
+        m_gl.arrayBuf = buffer;
+    }
+    void glsBindElements(GLuint buffer)
+    {
+        if (m_gl.on && m_gl.elemBuf == buffer)
+            return;
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffer);
+        m_gl.elemBuf = buffer;
+    }
+    // Texture of a part (0: none): enable + bind + sampler + the texture coordinate array. The pointer call for the
+    // coordinates is left to the caller (it depends on the bound buffer).
+    void glsTexture(GLuint texture, const ResolvedSampler &sampler)
+    {
+        if (!texture)
+        {
+            glsClient(m_gl.texArr, GL_TEXTURE_COORD_ARRAY, false);
+            glsCap(m_gl.tex2d, GL_TEXTURE_2D, false);
+            return;
+        }
+        glsCap(m_gl.tex2d, GL_TEXTURE_2D, true);
+        if (!m_gl.on || m_gl.boundTex != texture)
+        {
+            glBindTexture(GL_TEXTURE_2D, texture);
+            m_gl.boundTex = texture;
+        }
+        const std::array<GLenum, 3> wanted{sampler.wrapS, sampler.wrapT, sampler.linear ? 1u : 0u};
+        bool same = false;
+        if (m_gl.on)
+        {
+            const auto found = m_samplerCache.find(texture);
+            same = found != m_samplerCache.end() && found->second == wanted;
+        }
+        if (!same)
+        {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, sampler.wrapS);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, sampler.wrapT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sampler.linear ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sampler.linear ? GL_LINEAR : GL_NEAREST);
+            if (m_gl.on)
+                m_samplerCache[texture] = wanted;
+        }
+        glsClient(m_gl.texArr, GL_TEXTURE_COORD_ARRAY, true);
+    }
+    // Vertex / colour (and, when textured, coordinate) pointers into the bound array buffer, laid out as GpuVertex.
+    void glsPointers(GLuint buffer, bool textured)
+    {
+        if (!m_gl.on || m_gl.ptrBuf != buffer)
+        {
+            glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
+            glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
+            m_gl.ptrBuf = buffer;
+        }
+        if (textured && (!m_gl.on || m_gl.texPtrBuf != buffer))
+        {
+            glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
+            m_gl.texPtrBuf = buffer;
+        }
+    }
+
+    // Puts the baseline state back and draws any pending merged batch. A no-op outside a run.
+    void leaveMesh()
+    {
+        if (!m_gl.inRun)
+            return;
+        flushMerge(nullptr);
+        glsClient(m_gl.vtxArr, GL_VERTEX_ARRAY, false);
+        glsClient(m_gl.colArr, GL_COLOR_ARRAY, false);
+        glsClient(m_gl.texArr, GL_TEXTURE_COORD_ARRAY, false);
+        glColor4ub(255u, 255u, 255u, 255u);
+        glsBindElements(0);
+        glsBindArray(0);
+        glsCap(m_gl.tex2d, GL_TEXTURE_2D, false);
+        if (m_gl.skinTouched)
+        {
+            glUseProgram(0);
+            for (GLuint attribute = 0; attribute < 6u; ++attribute)
+                glDisableVertexAttribArray(attribute);
+        }
+        glsCap(m_gl.alphaOn, GL_ALPHA_TEST, false);
+        glsCap(m_gl.fogOn, GL_FOG, false);
+        glsShade(true);
+        glsCap(m_gl.depthTest, GL_DEPTH_TEST, true);
+        glsDepthMask(true);
+        glsBlend(true, false, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glsCap(m_gl.cullOn, GL_CULL_FACE, false);
+        m_gl.inRun = false;
+        m_samplerCache.clear();
+    }
+
+    // ---- merged draws of small unskinned parts (P3FES_MESH_MERGE) ---------------------------------------------------
+    struct MergeSig
+    {
+        AlphaTestState alpha;
+        FogState fog;
+        bool gouraud = true, depthTest = true, depthWrite = true;
+        MeshDrawState::CullMode cull = MeshDrawState::CullMode::None;
+        bool blendEnabled = true, subtract = false;
+        GLenum src = GL_SRC_ALPHA, dst = GL_ONE_MINUS_SRC_ALPHA;
+        GLuint texture = 0;
+        ResolvedSampler sampler;
+        bool same(const MergeSig &o) const
+        {
+            if (alpha.enabled != o.alpha.enabled || (alpha.enabled && (alpha.function != o.alpha.function || alpha.reference != o.alpha.reference)))
+                return false;
+            if (fog.enabled != o.fog.enabled || (fog.enabled && (fog.start != o.fog.start || fog.end != o.fog.end || fog.color != o.fog.color)))
+                return false;
+            if (gouraud != o.gouraud || depthTest != o.depthTest || depthWrite != o.depthWrite || cull != o.cull ||
+                blendEnabled != o.blendEnabled || texture != o.texture)
+                return false;
+            if (blendEnabled && (subtract != o.subtract || src != o.src || dst != o.dst))
+                return false;
+            return !texture || sampler == o.sampler;
+        }
+    };
+    struct MergeBatch
+    {
+        bool enabled = false;
+        MergeSig sig;
+        std::vector<GpuVertex> verts;
+        std::vector<std::uint16_t> indices;
+        std::uint32_t parts = 0;
+    };
+    MergeBatch m_merge;
+
+    // Adds the part to the pending batch (drawing the batch first when the state differs). False: the part is not
+    // eligible and nothing was changed. `model` is the matrix currently pushed by drawMeshImpl.
+    bool tryMergePart(DrawPart &part, const Matrix4 &model, const MeshDrawState &state)
+    {
+        if (part.cpuIndices.empty() || part.skinned || part.gpuVertices.size() != part.sourceVertices.size())
+            return false;
+        const std::size_t count = part.sourceVertices.size();
+        if (count > meshMergeMaxVerts() || !meshFastRegenEnabled())
+            return false;
+        if (model[3] != 0.0f || model[7] != 0.0f || model[11] != 0.0f || model[15] != 1.0f)
+            return false;
+        const std::uint32_t material = part.materialIndex;
+        if (material < state.materialDualPasses.size() && state.materialDualPasses[material].enabled &&
+            !state.materialDualPasses[material].textureName.empty())
+            return false;
+        if (material < state.materialEnvPasses.size() && state.materialEnvPasses[material].enabled && part.hasNormals &&
+            !state.materialEnvPasses[material].textureName.empty())
+            return false;
+        MergeSig sig;
+        sig.alpha = state.alphaTest;
+        if (alphaTestFbOnly(state.alphaTest))
+        {
+            if (alphaTestFailPass(state.alphaTest).function != 0u)
+                return false; // drawn twice
+            sig.alpha = alphaTestSinglePass(state.alphaTest);
+        }
+        const auto &color = material < state.materialColors.size() ? state.materialColors[material] : part.color;
+        const MeshDrawState::UvTransform defaultUv{};
+        const MeshDrawState::UvTransform &uv =
+            material < state.materialUvTransforms.size() ? state.materialUvTransforms[material] : defaultUv;
+        detail::RegenContext context;
+        if (!detail::prepareRegenContext(context, model, state.skinPalette, part.material, color, part.lighting,
+                                         part.hasPrelight, state, uv))
+            return false;
+        sig.fog = state.fog;
+        sig.gouraud = state.gouraudShading;
+        sig.depthTest = state.depthTest;
+        sig.depthWrite = state.depthWrite;
+        sig.cull = state.cullMode;
+        sig.blendEnabled = state.blendEnabled;
+        if (state.blendEnabled)
+        {
+            const MeshDrawState::BlendState *blend = material < state.materialBlends.size() ? &state.materialBlends[material] : nullptr;
+            if (blend && blend->enabled)
+            {
+                sig.subtract = blend->subtract;
+                sig.src = rwBlendFactor(blend->src);
+                sig.dst = rwBlendFactor(blend->dst);
+            }
+        }
+        const auto &textureName = material < state.materialTextures.size() ? state.materialTextures[material] : part.textureName;
+        if (!textureName.empty())
+        {
+            const auto found = m_textures.find(textureKey(textureName));
+            if (found != m_textures.end())
+            {
+                sig.texture = found->second;
+                sig.sampler = resolveMeshSampler(state, material < state.materialSamplers.size() ? &state.materialSamplers[material] : nullptr);
+            }
+        }
+        if (m_merge.parts &&
+            (!sig.same(m_merge.sig) || m_merge.verts.size() + count > 65535u))
+            flushMerge(&model);
+        if (!m_merge.parts)
+            m_merge.sig = sig;
+        const std::size_t base = m_merge.verts.size();
+        m_merge.verts.resize(base + count);
+        GpuVertex *out = m_merge.verts.data() + base;
+        detail::regenerateVertices(context, false, nullptr, part.sourceVertices.data(), out, count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto &p = part.sourceVertices[i].position;
+            out[i].position[0] = model[0] * p[0] + model[4] * p[1] + model[8] * p[2] + model[12];
+            out[i].position[1] = model[1] * p[0] + model[5] * p[1] + model[9] * p[2] + model[13];
+            out[i].position[2] = model[2] * p[0] + model[6] * p[1] + model[10] * p[2] + model[14];
+        }
+        const std::size_t firstIndex = m_merge.indices.size();
+        m_merge.indices.resize(firstIndex + part.cpuIndices.size());
+        for (std::size_t i = 0; i < part.cpuIndices.size(); ++i)
+            m_merge.indices[firstIndex + i] = static_cast<std::uint16_t>(part.cpuIndices[i] + base);
+        ++m_merge.parts;
+        MeshTiming &t = m_target ? m_meshTimingTarget : m_meshTiming;
+        ++t.mergedParts;
+        t.mergedVerts += static_cast<std::uint32_t>(count);
+        return true;
+    }
+
+    // Draws the pending batch. `activeModel` is the matrix drawMeshImpl has pushed (taken off for the draw, put back).
+    void flushMerge(const Matrix4 *activeModel)
+    {
+        if (!m_merge.parts)
+            return;
+        if (activeModel)
+            glPopMatrix();
+        const MergeSig &sig = m_merge.sig;
+        glsAlpha(sig.alpha);
+        glsFog(sig.fog);
+        glsShade(sig.gouraud);
+        glsCap(m_gl.depthTest, GL_DEPTH_TEST, sig.depthTest);
+        glsDepthMask(sig.depthWrite);
+        glsCull(sig.cull);
+        glsBlend(sig.blendEnabled, sig.blendEnabled && sig.subtract, sig.src, sig.dst);
+        glsBindElements(0);
+        glsBindArray(0);
+        glsClient(m_gl.vtxArr, GL_VERTEX_ARRAY, true);
+        glsClient(m_gl.colArr, GL_COLOR_ARRAY, true);
+        const GpuVertex *vertices = m_merge.verts.data();
+        glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), &vertices[0].position[0]);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), &vertices[0].color[0]);
+        m_gl.ptrBuf = kClientMemory;
+        glsTexture(sig.texture, sig.sampler);
+        if (sig.texture)
+        {
+            glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), &vertices[0].uv[0]);
+            m_gl.texPtrBuf = kClientMemory;
+        }
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(m_merge.indices.size()), GL_UNSIGNED_SHORT, m_merge.indices.data());
+        MeshTiming &t = m_target ? m_meshTimingTarget : m_meshTiming;
+        ++t.mergeBatches;
+        m_merge.verts.clear();
+        m_merge.indices.clear();
+        m_merge.parts = 0;
+        if (activeModel)
+        {
+            glPushMatrix();
+            glMultMatrixf(activeModel->data());
+        }
+    }
+
+    // Phase timing of drawMeshImpl (P3FES_RESOURCE_DIAG=1 and P3FES_MESH_PHASES=1): lap(i) adds the time since the previous
+    // lap to bucket i of the current MeshTiming. 0 prologue, 1 per-part binds + blend, 2 regen (counted by its own
+    // timer, here only the remainder), 3 pointers + texture + sampler, 4 glDrawElements, 5 dual/env + blend reset,
+    // 6 epilogue, 7 GPU-skinned part.
+    struct PhaseClock
+    {
+        MeshTiming *timing = nullptr;
+        std::uint64_t last = 0;
+        void lap(int bucket)
+        {
+            if (!timing) return;
+            const std::uint64_t now = diagNowUs();
+            timing->phaseUs[bucket] += now - last;
+            last = now;
+        }
+        void skip() { if (timing) last = diagNowUs(); }
+    };
     std::uint64_t m_gpuSkinDraws = 0;
     std::uint64_t m_gpuSkinCpuFallbacks = 0;
     std::array<std::uint64_t, 5> m_gpuSkinFallbackReasons{};
@@ -2558,6 +3119,7 @@ private:
     std::unordered_map<std::string, Target> m_targets; // colour textures live in m_textures
     Target *m_target = nullptr;
     int m_widescreen = 0;
+    WorldPlacement m_worldPlacement = WorldPlacement::Full;
     ScreenPlacement m_screenPlacement = ScreenPlacement::Centre;
 
 template <typename Viewport, typename Fit>
@@ -2595,6 +3157,18 @@ template <typename Viewport, typename Fit>
     {
         if (m_target)
             return {0, 0, m_target->width, m_target->height};
+        if (m_widescreen == 2 && m_worldPlacement != WorldPlacement::Full)
+        {
+            const FitViewport centre = fitViewport(640.0f, 448.0f);
+            if (m_worldPlacement == WorldPlacement::Centre)
+                return centre;
+            // Edge passes: magnify the picture so that its outermost kEdgeColumns pixel columns span the margin.
+            constexpr float kEdgeColumns = 8.0f;
+            const int hostWidth = std::max(GetScreenWidth(), 1);
+            const int margin = std::max(m_worldPlacement == WorldPlacement::EdgeLeft ? centre.x : hostWidth - centre.x - centre.width, 1);
+            const int width = std::clamp(static_cast<int>(static_cast<float>(margin) * static_cast<float>(centre.width) / kEdgeColumns), centre.width, 16000);
+            return {m_worldPlacement == WorldPlacement::EdgeLeft ? 0 : hostWidth - width, centre.y, width, centre.height};
+        }
         if (m_widescreen != 0)
             return {0, 0, std::max(GetScreenWidth(), 1), std::max(GetScreenHeight(), 1)};
         return fitViewport(640.0f, 448.0f);
@@ -2603,10 +3177,29 @@ template <typename Viewport, typename Fit>
     std::unordered_map<std::string, GLuint> m_textures;
     std::unordered_map<std::string, std::array<std::uint32_t, 2>> m_textureSizes;
 
+    // Edge placements draw into a magnified viewport and keep only the margin next to the 4:3 picture.
+    void applyWorldScissor()
+    {
+        if (m_widescreen == 2 && !m_target &&
+            (m_worldPlacement == WorldPlacement::EdgeLeft || m_worldPlacement == WorldPlacement::EdgeRight))
+        {
+            const FitViewport centre = fitViewport(640.0f, 448.0f);
+            const int hostWidth = std::max(GetScreenWidth(), 1), hostHeight = std::max(GetScreenHeight(), 1);
+            glEnable(GL_SCISSOR_TEST);
+            if (m_worldPlacement == WorldPlacement::EdgeLeft)
+                glScissor(0, 0, centre.x, hostHeight);
+            else
+                glScissor(centre.x + centre.width, 0, hostWidth - centre.x - centre.width, hostHeight);
+        }
+        else
+            glDisable(GL_SCISSOR_TEST);
+    }
+
     void apply3D()
     {
         const FitViewport viewport = worldViewport();
         glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        applyWorldScissor();
         glMatrixMode(GL_PROJECTION);
         if (m_camera.useMatrices)
         {
