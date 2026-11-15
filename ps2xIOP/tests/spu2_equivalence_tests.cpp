@@ -162,6 +162,7 @@ namespace
         // Everything observable that does not consume state.
         void compareCheap()
         {
+            a->flushOutput(); // PS2X_SPU2_BATCH stages frames; the consumer-side view is compared after publishing them
             expectEq(a->pendingFrames(), b->pendingFrames(), "pendingFrames");
             for (uint32_t core = 0; core < 2; ++core)
             {
@@ -201,6 +202,7 @@ namespace
         void drain(size_t maxFrames, size_t maxLatency)
         {
             std::vector<int16_t> bufA(maxFrames * 2u + 8u, 0x5A5A), bufB(maxFrames * 2u + 8u, 0x5A5A);
+            a->flushOutput();
             const size_t na = a->drainOutput(bufA.data(), maxFrames, maxLatency);
             const size_t nb = b->drainOutput(bufB.data(), maxFrames, maxLatency);
             expectEq(na, nb, "drain frames");
@@ -220,9 +222,11 @@ namespace
         {
             if (target > cycle)
                 samplesAdvanced += (target - cycle) / Spu2::CyclesPerSample;
+            a->flushOutput();
             const size_t before = a->pendingFrames();
             const uint64_t due = target > cycle ? (target - cycle) / Spu2::CyclesPerSample : 0u;
             both([&](auto &s) { s.advanceTo(target); });
+            a->flushOutput();
             if (a->pendingFrames() < before + due)
                 ++overflows; // fewer frames than produced: the drop-oldest-half policy ran
             if (target > cycle)

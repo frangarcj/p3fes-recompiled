@@ -2,6 +2,7 @@
 // Local builds include this file from p3fes_native_frame_cuts.cpp (unity style) until it has its own CMake line.
 #include "p3fes_native_ui.h"
 #include "p3fes_native_frame_cuts.h"
+#include "p3fes_native_leaf.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -134,13 +135,20 @@ namespace p3fes_native_ui
 
         enum class MaestroMode : uint8_t { Off, On, Verify };
         MaestroMode g_maestroMode = MaestroMode::Off;
+        // P3FES_CUT_MAESTRO_ROT=1: rotated sprites (angle != 0) run natively too, calling the guest matrix functions
+        // (RwMatrixCreate 0x4C38C0, RotateOneMinusCosineSine 0x4C2FC0, RwV3dTransformPoints 0x4C6C20, RwMatrixDestroy
+        // 0x4C3880) in the original order; default off
+        bool g_rotOn = false;
+        bool g_rotFns = false; // the four guest functions are present
+        constexpr uint32_t kMatrixCreate = 0x004C38C0u, kMatrixRotCs = 0x004C2FC0u, kTransformPoints = 0x004C6C20u, kMatrixDestroy = 0x004C3880u,
+                           kRotAxis = 0x005D6C28u;
         GuestFunction g_maestroOriginal = nullptr;
         int g_maestroVerifyEvery = 61;
         uint64_t g_maestroTick = 0u, g_maestroAltTick = 0u;
 
         struct MaestroCounters
         {
-            uint64_t native = 0u, fallback = 0u, rotated = 0u, notReady = 0u, pieces = 0u;
+            uint64_t native = 0u, fallback = 0u, rotated = 0u, rotNative = 0u, notReady = 0u, pieces = 0u;
             uint64_t verifyRuns = 0u, verifyOk = 0u, verifyBad = 0u, verifyUnwound = 0u, im2dFallback = 0u;
         } g_mc;
 
@@ -209,6 +217,7 @@ namespace p3fes_native_ui
         {
             uint32_t obj = 0u, parent = 0u, layoutBase = 0u, layout = 0u, texSlot = 0u, tex = 0u, cam = 0u;
             bool setStates = false;
+            bool rotated = false;
         };
 
         // Everything the guest function decides from reads alone before it changes anything: false = leave the call to
@@ -240,8 +249,16 @@ namespace p3fes_native_ui
                 return false;
             if ((rd32(rdram, e.obj + 0x20u) & 0x7FFFFFFFu) != 0u)
             {
-                ++g_mc.rotated;
-                return false;
+                // the angle: an ordinary float of a size the guest's +-360 loop settles in a few turns
+                const uint32_t bits = rd32(rdram, e.obj + 0x20u) & 0x7FFFFFFFu, exponent = bits & 0x7F800000u;
+                const uint32_t entrySp = getRegU32(ctx, 29);
+                if (!g_rotOn || exponent == 0u || exponent == 0x7F800000u || bits > 0x47C35000u /* 100000.0f */ || !inRam(entrySp - 0x220u, 0x220u) ||
+                    !inRam(kRotAxis, 12u) || !inRam(getRegU32(ctx, 28) - 0x8000u, 0x8000u) || !g_rotFns)
+                {
+                    ++g_mc.rotated;
+                    return false;
+                }
+                e.rotated = true;
             }
             if (rd32(rdram, kRsFnPtr) != kRsEntry || rd32(rdram, kIm2dFnPtr) != kIm2dEntry)
                 return false;
@@ -325,6 +342,111 @@ namespace p3fes_native_ui
                 std::memcpy(rdram + (scratch + i * 64u), f, 64u);
             }
             callGuest(rdram, runtime, ctx, kIm2dEntry, 4u, scratch, 4u);
+        }
+
+        // Like callGuest, with a third and fourth integer argument and the two float arguments (f12, f13); returns $v0.
+        bool callGuestF(uint8_t *rdram, PS2Runtime *runtime, R5900Context *ctx, uint32_t entry, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                        float f12, float f13, uint32_t &v0)
+        {
+            GuestFunction fn = runtime->lookupFunction(entry);
+            if (!fn)
+                return false;
+            ctx->pc = entry;
+            ctx->r[4] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a0)));
+            ctx->r[5] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a1)));
+            ctx->r[6] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a2)));
+            ctx->r[7] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a3)));
+            ctx->f[12] = f12;
+            ctx->f[13] = f13;
+            ctx->r[31] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(kSentinel)));
+            fn(rdram, ctx, runtime);
+            for (uint32_t resume = 0u; resume < 100000u && ctx->pc != kSentinel; ++resume)
+            {
+                if (runtime->isStopRequested() || ctx->pc == 0u || !runtime->hasFunction(ctx->pc))
+                    break;
+                runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+            }
+            v0 = getRegU32(ctx, 2);
+            return ctx->pc == kSentinel;
+        }
+
+        // The rotated branch of the guest drawer (0x112CC0..0x112EB4): the sprite's four corner points (x, y; the z words of
+        // the guest stack are never written) are turned about the z axis by obj+0x20 degrees. The angle is brought into
+        // [-180, 180], sin / cos come from the drawer's own polynomials (in the guest's float operations), the matrix is built
+        // by the guest functions on the guest stack at the same addresses (frame of the original: entrySp - 0x220), so
+        // allocator state and dead stack come out as the guest function leaves them.
+        void rotateCorners(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t obj, uint32_t entrySp, float *S, uint32_t &charge)
+        {
+#define SF(off) S[(off) >> 2]
+            const uint32_t gp = getRegU32(ctx, 28);
+            const uint32_t frame = entrySp - 0x220u;
+            float f3 = rdf(rdram, obj + 0x20u);
+            for (;;)
+            {
+                bool again = false;
+                if (!FPU_C_OLE_S(f3, 180.0f))
+                {
+                    f3 = FPU_SUB_S(f3, 360.0f);
+                    again = true;
+                }
+                else if (FPU_C_OLT_S(f3, -180.0f))
+                {
+                    f3 = FPU_ADD_S(f3, 360.0f);
+                    again = true;
+                }
+                charge += 32u;
+                if (!again)
+                    break;
+            }
+            ctx->fcr31 &= ~0x00800000u; // the last comparison of the loop (c.lt.s) was false
+            auto G = [&](uint32_t off) { return rdf(rdram, gp - off); };
+            const float zero = 0.0f;
+            const float f21 = ps2FpuDivide(ctx->fcr31, FPU_MUL_S(G(0x7E98u), f3), 180.0f);
+            const float f20 = FPU_MUL_S(f21, f21);
+            // cosine: 1 - cos (f12)
+            float t = G(0x7E3Cu);
+            t = FPU_ADD_S(FPU_ADD_S(zero, G(0x7E38u)), FPU_MUL_S(t, f20));
+            t = FPU_ADD_S(FPU_ADD_S(zero, G(0x7E34u)), FPU_MUL_S(f20, t));
+            t = FPU_ADD_S(FPU_ADD_S(zero, G(0x7E30u)), FPU_MUL_S(f20, t));
+            t = FPU_ADD_S(FPU_ADD_S(zero, G(0x7E2Cu)), FPU_MUL_S(f20, t));
+            const float c0 = FPU_ADD_S(FPU_ADD_S(zero, G(0x7E28u)), FPU_MUL_S(f20, t));
+            const float c1 = FPU_MUL_S(f20, c0);
+            const float oneMinus = FPU_SUB_S(FPU_MUL_S(0.5f, f20), FPU_MUL_S(f20, c1));
+            const float f12 = FPU_SUB_S(1.0f, FPU_SUB_S(1.0f, oneMinus));
+            // sine (f13)
+            float u = G(0x7E24u);
+            u = FPU_ADD_S(FPU_ADD_S(zero, G(0x7FB8u)), FPU_MUL_S(u, f20));
+            u = FPU_ADD_S(FPU_ADD_S(zero, G(0x7EE8u)), FPU_MUL_S(f20, u));
+            u = FPU_ADD_S(FPU_ADD_S(zero, G(0x7FB0u)), FPU_MUL_S(f20, u));
+            u = FPU_ADD_S(FPU_ADD_S(zero, G(0x7FACu)), FPU_MUL_S(f20, u));
+            u = FPU_ADD_S(FPU_ADD_S(zero, G(0x7E20u)), FPU_MUL_S(f20, u));
+            const float f13 = FPU_ADD_S(FPU_ADD_S(zero, f21), FPU_MUL_S(FPU_MUL_S(f20, f21), u));
+
+            const uint64_t savedSp = GPR_U64(ctx, 29);
+            ctx->r[29] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(frame)));
+            uint32_t matrix = 0u, v0 = 0u;
+            callGuestF(rdram, runtime, ctx, kMatrixCreate, 0u, 0u, 0u, 0u, 0.0f, 0.0f, matrix);
+            // the corner points, where the guest function keeps them (x, y only)
+            static const uint16_t pt[4][2] = {{0xD0, 0xD4}, {0xDC, 0xE0}, {0xE8, 0xEC}, {0xF4, 0xF8}};
+            for (uint32_t i = 0u; i < 4u; ++i)
+            {
+                std::memcpy(rdram + frame + 0xD0u + 12u * i, &SF(pt[i][0]), 4u);
+                std::memcpy(rdram + frame + 0xD4u + 12u * i, &SF(pt[i][1]), 4u);
+            }
+            callGuestF(rdram, runtime, ctx, kMatrixRotCs, matrix, kRotAxis, 0u, 0u, f12, f13, v0);
+            const uint32_t s2 = v0;
+            callGuestF(rdram, runtime, ctx, kTransformPoints, frame + 0xA0u, frame + 0xD0u, 4u, s2, 0.0f, 0.0f, v0);
+            callGuestF(rdram, runtime, ctx, kMatrixDestroy, s2, 0u, 0u, 0u, 0.0f, 0.0f, v0);
+            ctx->r[29] = _mm_set_epi64x(0, static_cast<int64_t>(savedSp));
+            // the guest copies the 12-byte results over the inputs (x, y, z); z is dead afterwards
+            for (uint32_t i = 0u; i < 4u; ++i)
+            {
+                std::memcpy(rdram + frame + 0xD0u + 12u * i, rdram + frame + 0xA0u + 12u * i, 12u);
+                std::memcpy(&SF(pt[i][0]), rdram + frame + 0xD0u + 12u * i, 4u);
+                std::memcpy(&SF(pt[i][1]), rdram + frame + 0xD4u + 12u * i, 4u);
+            }
+            charge += 4u * 8u + 4u * 32u;
+#undef SF
         }
 
         // The body, after maestroPrecheck said yes. Writes nothing the guest function does not write (its own dead
@@ -442,6 +564,8 @@ namespace p3fes_native_ui
             SF(0xE0) = SF(0xD4);
             SF(0xE8) = SF(0xD0);
             SF(0xEC) = SF(0xF8);
+            if (e.rotated)
+                rotateCorners(rdram, ctx, runtime, obj, entrySp, S, charge);
             {
                 const float f6 = rdf(rdram, obj + 0x10u), f5 = rdf(rdram, obj + 0x14u);
                 const float f4 = FPU_CVT_S_W(originX);
@@ -783,6 +907,8 @@ namespace p3fes_native_ui
                 return;
             }
             ++g_mc.native;
+            if (e.rotated)
+                ++g_mc.rotNative;
             if (g_maestroMode == MaestroMode::Verify && (++g_maestroTick % static_cast<uint64_t>(g_maestroVerifyEvery)) == 0u)
             {
                 maestroVerify(rdram, ctx, runtime, e);
@@ -800,6 +926,9 @@ namespace p3fes_native_ui
             g_rpSetDrop = false;
         if (const char *n = std::getenv("P3FES_CUT_MAESTRO_VERIFY_EVERY"); n && *n)
             g_maestroVerifyEvery = std::max(1, std::atoi(n));
+        if (const char *r = std::getenv("P3FES_CUT_MAESTRO_ROT"); r && r[0] == '1' && !r[1])
+            g_rotOn = true;
+        g_rotFns = runtime.hasFunction(kMatrixCreate) && runtime.hasFunction(kMatrixRotCs) && runtime.hasFunction(kTransformPoints) && runtime.hasFunction(kMatrixDestroy);
         if (g_maestroMode == MaestroMode::Off || !runtime.hasFunction(kMaestro))
             return false;
         GuestFunction current = runtime.lookupFunction(kMaestro);
@@ -807,18 +936,19 @@ namespace p3fes_native_ui
             return false;
         g_maestroOriginal = current;
         const bool ok = runtime.replaceFunction(kMaestro, &maestroHook);
-        std::fprintf(stderr, "[p3fes-native] cut sprite/panel drawer hook=%u mode=%s\n", ok ? 1u : 0u,
-                     g_maestroMode == MaestroMode::Verify ? "verify" : "on");
+        std::fprintf(stderr, "[p3fes-native] cut sprite/panel drawer hook=%u mode=%s rotated=%s\n", ok ? 1u : 0u,
+                     g_maestroMode == MaestroMode::Verify ? "verify" : "on", g_rotOn && g_rotFns ? "native" : "guest");
         return ok;
     }
 
     void logMaestroCounters()
     {
+        p3fes_native_leaf::logCounters(); // the leaf cuts have no log hook of their own: they print with the sprite drawer's line
         if (g_maestroMode == MaestroMode::Off)
             return;
-        std::fprintf(stderr, "[p3fes-ui] maestro native=%llu pieces=%llu left-to-guest: rotated=%llu no-texture=%llu not-ready=%llu im2d-declined=%llu | verify runs=%llu ok=%llu bad=%llu unwound=%llu\n",
+        std::fprintf(stderr, "[p3fes-ui] maestro native=%llu pieces=%llu rotated-native=%llu left-to-guest: rotated=%llu no-texture=%llu not-ready=%llu im2d-declined=%llu | verify runs=%llu ok=%llu bad=%llu unwound=%llu\n",
                      static_cast<unsigned long long>(g_mc.native), static_cast<unsigned long long>(g_mc.pieces),
-                     static_cast<unsigned long long>(g_mc.rotated), static_cast<unsigned long long>(g_mc.fallback),
+                     static_cast<unsigned long long>(g_mc.rotNative), static_cast<unsigned long long>(g_mc.rotated), static_cast<unsigned long long>(g_mc.fallback),
                      static_cast<unsigned long long>(g_mc.notReady), static_cast<unsigned long long>(g_mc.im2dFallback),
                      static_cast<unsigned long long>(g_mc.verifyRuns), static_cast<unsigned long long>(g_mc.verifyOk),
                      static_cast<unsigned long long>(g_mc.verifyBad), static_cast<unsigned long long>(g_mc.verifyUnwound));

@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #endif
 #if defined(PLATFORM_VITA)
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #elif !defined(_WIN32)
 #include <time.h>
@@ -39,6 +40,7 @@ namespace
     thread_local uint64_t t_holdStart = 0; // (diagnostic) when the current IopSync got the lock
     thread_local size_t t_holdKind = 0;
 }
+static std::atomic<PS2IopHostAdapter *> g_frameCounterOwner{nullptr}; // for ps2xIopFrameCounters (PS2X_FRAME_LIST)
 
 PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
     : m_lock(owner.m_callMutex),
@@ -647,6 +649,8 @@ struct PS2IopHostAdapter::IopThread
     uint64_t wakeEe = 294912u;  // EE cycles (1 ms) the executor posts before it wakes the worker
     uint64_t sliceEe = 294912u; // longest run with the lock held (1 ms of guest time)
     bool diag = false;
+    bool timing = false; // diag, or PS2X_FRAME_LIST: time the syncs (cumulative totals for the per-frame [fdip] lines)
+    std::atomic<uint64_t> totCount{0}, totWaitUs{0}, totTailUs{0}, totHoldUs{0}, totTailEe{0};
 
     // counters (PS2X_IOP_THREAD_DIAG=1: one line every 5 s from the worker)
     SyncStat syncs[static_cast<size_t>(IopSyncKind::Count)];
@@ -655,9 +659,13 @@ struct PS2IopHostAdapter::IopThread
 
     static uint64_t nowUs()
     {
+#if defined(PLATFORM_VITA)
+        return sceKernelGetProcessTimeWide(); // steady_clock costs ~6 us there
+#else
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now().time_since_epoch())
                                          .count());
+#endif
     }
     static uint64_t threadCpuUs()
     {
@@ -693,6 +701,8 @@ struct PS2IopHostAdapter::IopThread
             sliceEe = std::max<uint64_t>(1u, std::strtoull(v, nullptr, 10)) * 295u;
         if (const char *v = std::getenv("PS2X_IOP_THREAD_DIAG"))
             diag = v[0] == '1';
+        const char *list = std::getenv("PS2X_FRAME_LIST");
+        timing = diag || (list && std::atof(list) > 0.0);
     }
 
     ~IopThread() { shutdown(); }
@@ -783,12 +793,12 @@ struct PS2IopHostAdapter::IopThread
     {
         if (t_iopHolds)
             return; // nested (an IOP -> host callback that calls back into the runtime), or the worker itself
-        const uint64_t t0 = diag ? nowUs() : 0u;
+        const uint64_t t0 = timing ? nowUs() : 0u;
         eeWaiting.fetch_add(1);
         runMutex.lock();
         eeWaiting.fetch_sub(1);
         t_iopHolds = true;
-        const uint64_t t1 = diag ? nowUs() : 0u;
+        const uint64_t t1 = timing ? nowUs() : 0u;
         if (catchUp && t_iopExecutor)
         {
             drainDeferred();
@@ -799,36 +809,50 @@ struct PS2IopHostAdapter::IopThread
                 run(delta);
                 delivered = p;
                 deliveredMirror.store(p, std::memory_order_release);
-                if (diag)
+                if (timing)
                 {
-                    SyncStat &st = syncs[static_cast<size_t>(kind)];
-                    st.tailEe.fetch_add(delta, std::memory_order_relaxed);
                     const uint64_t us = nowUs() - t1;
-                    st.tailUs.fetch_add(us, std::memory_order_relaxed);
-                    raiseMax(st.maxTailUs, us);
+                    totTailUs.fetch_add(us, std::memory_order_relaxed);
+                    totTailEe.fetch_add(delta, std::memory_order_relaxed);
+                    if (diag)
+                    {
+                        SyncStat &st = syncs[static_cast<size_t>(kind)];
+                        st.tailEe.fetch_add(delta, std::memory_order_relaxed);
+                        st.tailUs.fetch_add(us, std::memory_order_relaxed);
+                        raiseMax(st.maxTailUs, us);
+                    }
                 }
             }
         }
-        if (diag)
+        if (timing)
         {
             t_holdStart = t1;
             t_holdKind = static_cast<size_t>(kind);
-            SyncStat &st = syncs[static_cast<size_t>(kind)];
-            st.count.fetch_add(1, std::memory_order_relaxed);
-            st.waitUs.fetch_add(t1 - t0, std::memory_order_relaxed);
-            raiseMax(st.maxWaitUs, t1 - t0);
+            totCount.fetch_add(1, std::memory_order_relaxed);
+            totWaitUs.fetch_add(t1 - t0, std::memory_order_relaxed);
+            if (diag)
+            {
+                SyncStat &st = syncs[static_cast<size_t>(kind)];
+                st.count.fetch_add(1, std::memory_order_relaxed);
+                st.waitUs.fetch_add(t1 - t0, std::memory_order_relaxed);
+                raiseMax(st.maxWaitUs, t1 - t0);
+            }
         }
     }
 
     void leave()
     {
-        if (diag)
+        if (timing)
         {
             // everything the executor did inside the sync: the tail run, then the RPC / transfer / memory access itself
-            SyncStat &st = syncs[t_holdKind];
             const uint64_t us = nowUs() - t_holdStart;
-            st.holdUs.fetch_add(us, std::memory_order_relaxed);
-            raiseMax(st.maxHoldUs, us);
+            totHoldUs.fetch_add(us, std::memory_order_relaxed);
+            if (diag)
+            {
+                SyncStat &st = syncs[t_holdKind];
+                st.holdUs.fetch_add(us, std::memory_order_relaxed);
+                raiseMax(st.maxHoldUs, us);
+            }
         }
         t_iopHolds = false;
         runMutex.unlock();
@@ -854,7 +878,8 @@ struct PS2IopHostAdapter::IopThread
                 }
         }
         const SceUID self = sceKernelGetThreadId();
-        sceKernelChangeThreadPriority(self, 120);
+        const char *prioValue = std::getenv("PS2X_VITA_IOP_PRIO"); // default 120 (the BGM feeder is 100, the game thread 128)
+        sceKernelChangeThreadPriority(self, prioValue ? std::atoi(prioValue) : 120);
         if (core >= 0)
             sceKernelChangeThreadCpuAffinityMask(self, 0x10000 << core);
 #endif
@@ -966,6 +991,7 @@ void PS2IopHostAdapter::configureIopThread(std::function<void(uint64_t)> run)
     if (!value || value[0] != '1')
         return;
     m_iopThread = std::make_unique<IopThread>(*this, std::move(run));
+    g_frameCounterOwner.store(this, std::memory_order_release);
     std::fprintf(stderr, "[iopthread] the IOP runs on its own thread (wake %llu EE cycles, slice %llu)\n",
                  static_cast<unsigned long long>(m_iopThread->wakeEe), static_cast<unsigned long long>(m_iopThread->sliceEe));
 }
@@ -995,6 +1021,26 @@ void PS2IopHostAdapter::IopSync::release()
 PS2IopHostAdapter::IopSync::~IopSync()
 {
     release();
+}
+
+// Cumulative totals for the per-frame [fdip] lines (EeScheduler.cpp): syncs, wait us, tail us, hold us, tail EE cycles.
+extern "C" void ps2xIopFrameCounters(uint64_t *out)
+{
+    out[0] = out[1] = out[2] = out[3] = out[4] = 0u;
+    PS2IopHostAdapter *owner = g_frameCounterOwner.load(std::memory_order_acquire);
+    if (owner)
+        owner->frameCounters(out);
+}
+
+void PS2IopHostAdapter::frameCounters(uint64_t *out) const
+{
+    if (!m_iopThread)
+        return;
+    out[0] = m_iopThread->totCount.load(std::memory_order_relaxed);
+    out[1] = m_iopThread->totWaitUs.load(std::memory_order_relaxed);
+    out[2] = m_iopThread->totTailUs.load(std::memory_order_relaxed);
+    out[3] = m_iopThread->totHoldUs.load(std::memory_order_relaxed);
+    out[4] = m_iopThread->totTailEe.load(std::memory_order_relaxed);
 }
 
 void PS2IopHostAdapter::stopIopThread()

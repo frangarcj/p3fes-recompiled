@@ -300,6 +300,14 @@ public:
     // the wider framebuffer (against the left or right edge, centred, stretched over all of it, or centred
     // and unclipped).
     virtual void setScreenPlacement(ScreenPlacement placement) = 0;
+    // Widescreen mode 2 only: where the following WORLD draws (meshes) go. Full (the default): the whole framebuffer.
+    // Centre: the centred 4:3 area, as the 2-D draws of ScreenPlacement::Centre. EdgeLeft / EdgeRight: draws clipped to the
+    // left / right margin beside that area, with the view magnified so that the outermost few pixel columns of the 4:3 picture
+    // fill the margin (an edge-flush backdrop extended sideways). Used for the polygon backdrop of the menus, which is
+    // drawn Centre once and then EdgeLeft and EdgeRight (the same draws replayed). Returns false when the backend does not
+    // implement it (the draws then stay Full and must not be replayed).
+    enum class WorldPlacement : std::uint8_t { Full, Centre, EdgeLeft, EdgeRight };
+    virtual bool setWorldPlacement(WorldPlacement placement) { (void)placement; return false; }
     // Diagnostic: write the finished frame as a raw file ("P3FB" + u32 width + u32 height + RGBA8
     // rows, top row first) during the next endFrame. Returns false when unsupported.
     virtual bool captureNextFrame(const std::string &path) { (void)path; return false; }
@@ -308,6 +316,17 @@ public:
     // Change view/projection state inside the current frame without clearing
     // or presenting. The next world-space draw uses this camera.
     virtual void setCamera(const Camera &camera) = 0;
+    // Copies what has been drawn so far into the texture `name` (created as a texWidth x texHeight render texture, v = 0
+    // is the top row like every other texture). The picture area (the whole framebuffer in widescreen modes, else the
+    // centred 4:3 area) is scaled into the top-left srcWidth x srcHeight texels, i.e. texel (x, y) holds the GS frame
+    // buffer pixel (x, y) of the 640x448 picture. For the game's draws that sample the frame buffer itself as a texture
+    // (a camera raster whose GS address is the display buffer). Returns false when unsupported (the texture then keeps
+    // whatever was uploaded under that name). Not inside a texture target; outside beginFrame/endFrame it does nothing.
+    virtual bool snapshotFramebuffer(std::string_view name, int texWidth, int texHeight, int srcWidth, int srcHeight)
+    {
+        (void)name; (void)texWidth; (void)texHeight; (void)srcWidth; (void)srcHeight;
+        return false;
+    }
     virtual void clear(ClearColor clear, bool colorBuffer, bool depthBuffer) = 0;
     virtual void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state = {}) = 0;
     void drawMesh(MeshId id) { drawMesh(id, kIdentityMatrix, {}); }

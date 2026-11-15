@@ -69,6 +69,10 @@ bool inTextureTarget();
 void setWidescreen(int mode);
 void defineMesh(nr::MeshId id, const nr::MeshData &mesh);
 void defineTexture(const nr::TextureData &texture, uint64_t revision);
+// Marks the texture `name` as the display frame buffer itself (a camera raster at GS address 0): before the first draw that
+// samples it in a frame the host copies the picture drawn so far into it (Renderer::snapshotFramebuffer into a
+// texWidth x texHeight texture holding the srcWidth x srcHeight picture). Producer side; idempotent.
+void markFramebufferTexture(const std::string &name, uint32_t texWidth, uint32_t texHeight, uint32_t srcWidth, uint32_t srcHeight);
 // Release the owner's reference; queued frames retain their own definitions.
 // The host deletes GPU storage after the last referencing frame is consumed.
 void retireTexture(const std::string &name);

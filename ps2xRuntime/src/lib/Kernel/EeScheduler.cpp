@@ -24,6 +24,13 @@
 
 
 extern std::atomic<uint32_t> g_ps2EeSampleCurrent;
+// PS2X_FRAME_LIST=<ms> (with PS2X_FRAME_HIST=1): one [fdip] line for every game frame whose wall time reaches <ms> or
+// whose CPU time reaches 85 % of it, with the time it sat in the scheduler's waits and in IOP syncs. The frame number is
+// published for the EE sampler (PS2X_EE_SAMPLE_FRAMES), which prints the functions of the same frames.
+std::atomic<uint64_t> g_ps2FrameSeq{0u};
+// Sentinels the waits publish as "current function" for the EE sampler (bit 1 = native tag, so they read as such).
+constexpr uint32_t kSampleWaitPacing = 0xFFFFFF01u, kSampleWaitEvent = 0xFFFFFF05u;
+extern "C" void ps2xIopFrameCounters(uint64_t *out); // ps2_iop_host.cpp: syncs, wait us, tail us, hold us, tail EE cycles
 
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
@@ -76,6 +83,12 @@ namespace
         static const bool on = [] { const char *v = std::getenv("PS2X_VSYNC_SLIP"); return v && *v == '1'; }();
         return on;
     }
+    double frameListMs()
+    {
+        static const double v = [] { const char *e = std::getenv("PS2X_FRAME_LIST"); return e ? std::atof(e) : 0.0; }();
+        return v;
+    }
+    uint64_t g_fhIopLast[5] = {0, 0, 0, 0, 0};
     uint64_t g_fhLastWall = 0u, g_fhLastRun = 0u, g_fhLastTick = 0u, g_fhWindowStart = 0u;
     uint64_t g_fhLastPace = 0u, g_fhLastEvt = 0u, g_fhLastLock = 0u, g_fhLastCap = 0u;
     double g_fhWorstWall = 0.0, g_fhWorstCpu = 0.0, g_fhPrintMs = 0.0;
@@ -88,15 +101,15 @@ namespace
     }
     struct FhScopedWait
     {
-        uint64_t &sink; uint64_t &count; uint64_t start; bool on; bool tag;
-        FhScopedWait(uint64_t &s, uint64_t &c) : sink(s), count(c), start(0u), on(frameHistOn()), tag(stallDiagOn())
+        uint64_t &sink; uint64_t &count; uint64_t start; bool on; bool tag; uint32_t prevSample;
+        FhScopedWait(uint64_t &s, uint64_t &c) : sink(s), count(c), start(0u), on(frameHistOn()), tag(stallDiagOn()), prevSample(0u)
         {
-            if (on) start = fhNowUs();
+            if (on) { start = fhNowUs(); prevSample = g_ps2EeSampleCurrent.exchange(&s == &g_fhPacingUs ? kSampleWaitPacing : kSampleWaitEvent, std::memory_order_relaxed); }
             if (tag) g_stallTag.store(&s == &g_fhPacingUs ? 1 : 2, std::memory_order_relaxed);
         }
         ~FhScopedWait()
         {
-            if (on) { sink += fhNowUs() - start; ++count; }
+            if (on) { sink += fhNowUs() - start; ++count; g_ps2EeSampleCurrent.store(prevSample, std::memory_order_relaxed); }
             if (tag) g_stallTag.store(0, std::memory_order_relaxed);
         }
     };
@@ -121,7 +134,21 @@ namespace
             b.cap += static_cast<unsigned>(g_fhCapFields - g_fhLastCap);
             g_fhWorstWall = std::max(g_fhWorstWall, wallMs);
             g_fhWorstCpu = std::max(g_fhWorstCpu, cpuMs);
+            const double listMs = frameListMs();
+            uint64_t iop[5];
+            ps2xIopFrameCounters(iop);
+            if (listMs > 0.0 && (wallMs >= listMs || cpuMs >= listMs * 0.85))
+            {
+                std::fprintf(stderr, "[fdip] seq=%llu t=%.3f wall=%.1f cpu=%.1f pace=%.1f event=%.1f lock=%.1f io=%.1f iop-sync n=%llu wait=%.2f tail=%.2f hold=%.2f tail-ee-ms=%.2f\n",
+                             static_cast<unsigned long long>(g_ps2FrameSeq.load(std::memory_order_relaxed)), wall / 1e6, wallMs, cpuMs,
+                             (g_fhPacingUs - g_fhLastPace) / 1000.0, (g_fhEventUs - g_fhLastEvt) / 1000.0, (g_fhLockUs - g_fhLastLock) / 1000.0,
+                             (g_fhIoUs - g_fhLastIo) / 1000.0, static_cast<unsigned long long>(iop[0] - g_fhIopLast[0]),
+                             (iop[1] - g_fhIopLast[1]) / 1000.0, (iop[2] - g_fhIopLast[2]) / 1000.0, (iop[3] - g_fhIopLast[3]) / 1000.0,
+                             (iop[4] - g_fhIopLast[4]) / 294912.0);
+            }
+            for (int i = 0; i < 5; ++i) g_fhIopLast[i] = iop[i];
         }
+        g_ps2FrameSeq.fetch_add(1u, std::memory_order_relaxed);
         (void)tick; (void)capped;
         g_fhLastWall = wall; g_fhLastRun = run; g_fhLastTick = tick;
         g_fhLastPace = g_fhPacingUs; g_fhLastEvt = g_fhEventUs; g_fhLastLock = g_fhLockUs; g_fhLastCap = g_fhCapFields; g_fhLastIo = g_fhIoUs;

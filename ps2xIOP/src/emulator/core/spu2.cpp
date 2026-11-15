@@ -48,6 +48,10 @@ namespace ps2x::iop::detail
 
     Spu2::Spu2() : m_ram(RamHalfwords), m_outRing(OutputRingFrames * 2u)
     {
+        const char *batch = std::getenv("PS2X_SPU2_BATCH");
+        m_batch = batch != nullptr && batch[0] == '1';
+        if (m_batch)
+            m_stage.resize(StageFrames * 2u);
         reset();
     }
 
@@ -65,6 +69,7 @@ namespace ps2x::iop::detail
             m_silentPending.store(0u, std::memory_order_relaxed);
             m_outRead = 0u;
             m_outCount = 0u;
+            m_stageCount = 0u;
         }
         for (auto &input : m_input)
             input = InputState{};
@@ -73,6 +78,7 @@ namespace ps2x::iop::detail
             for (auto &stream : m_streams)
                 stream = PcmStream{};
             m_streamsActive.store(false, std::memory_order_relaxed);
+            m_streamLive.store(false, std::memory_order_relaxed);
         }
         m_lastCycle = 0;
         m_interrupt = false;
@@ -665,6 +671,28 @@ namespace ps2x::iop::detail
 
     void Spu2::pushOutput(const int16_t *stereo, size_t frames)
     {
+        if (m_batch)
+        {
+            if (stereo == nullptr)
+            {
+                // Silence goes behind the frames staged so far.
+                if (m_stageCount != 0u)
+                    flushOutput();
+                m_silentPending.fetch_add(frames, std::memory_order_relaxed);
+                return;
+            }
+            while (frames != 0u)
+            {
+                const size_t take = std::min(frames, StageFrames - m_stageCount);
+                std::copy_n(stereo, take * 2u, m_stage.begin() + static_cast<std::ptrdiff_t>(m_stageCount * 2u));
+                m_stageCount += take;
+                stereo += take * 2u;
+                frames -= take;
+                if (m_stageCount == StageFrames)
+                    flushOutput();
+            }
+            return;
+        }
         if (stereo == nullptr)
         {
             m_silentPending.fetch_add(frames, std::memory_order_relaxed);
@@ -673,6 +701,16 @@ namespace ps2x::iop::detail
         std::lock_guard<std::mutex> lock(m_outputMutex);
         flushSilenceLocked();
         pushOutputLocked(stereo, frames);
+    }
+
+    void Spu2::flushOutput()
+    {
+        if (m_stageCount == 0u)
+            return;
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        flushSilenceLocked();
+        pushOutputLocked(m_stage.data(), m_stageCount);
+        m_stageCount = 0u;
     }
 
     void Spu2::flushSilenceLocked()
@@ -727,7 +765,7 @@ namespace ps2x::iop::detail
             // held for the whole chunk (mixStreams() needs it per sample) and released before the output is pushed.
             std::unique_lock<std::mutex> streamLock(m_streamMutex, std::defer_lock);
             bool streamsLive = false;
-            if (m_streamsActive.load(std::memory_order_relaxed))
+            if (m_batch ? m_streamLive.load(std::memory_order_relaxed) : m_streamsActive.load(std::memory_order_relaxed))
             {
                 streamLock.lock();
                 streamsLive = anyStreamLive();
@@ -777,6 +815,7 @@ namespace ps2x::iop::detail
         s.rate = rate;
         s.samples.insert(s.samples.end(), stereo, stereo + frames * 2u);
         m_streamsActive.store(true, std::memory_order_relaxed);
+        updateStreamLive();
     }
 
     uint64_t Spu2::streamConsumed(uint32_t stream) const
@@ -793,6 +832,12 @@ namespace ps2x::iop::detail
             return;
         std::lock_guard<std::mutex> lock(m_streamMutex);
         m_streams[stream] = PcmStream{};
+        updateStreamLive();
+    }
+
+    void Spu2::updateStreamLive() noexcept
+    {
+        m_streamLive.store(anyStreamLive(), std::memory_order_relaxed);
     }
 
     void Spu2::mixStreams(int32_t &left, int32_t &right)
@@ -816,6 +861,8 @@ namespace ps2x::iop::detail
             if (s.read >= frames)
                 s.fraction = 0.0;
         }
+        if (m_batch)
+            updateStreamLive();
     }
 
     void Spu2::advanceTo(uint64_t iopCycle)
@@ -829,7 +876,7 @@ namespace ps2x::iop::detail
             return;
         const uint64_t samples = elapsed / CyclesPerSample;
         // runSamples' whole-batch silence path, without entering it: nothing playing, no stream, no ADMA input
-        if (!diagEnabled() && !m_streamsActive.load(std::memory_order_relaxed) && m_activeVoices[0] == 0u &&
+        if (!diagEnabled() && !(m_batch ? m_streamLive.load(std::memory_order_relaxed) : m_streamsActive.load(std::memory_order_relaxed)) && m_activeVoices[0] == 0u &&
             m_activeVoices[1] == 0u && inputIdle(0u) && inputIdle(1u))
         {
             m_bulkSamples += samples;

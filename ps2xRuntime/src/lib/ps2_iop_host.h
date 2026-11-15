@@ -94,6 +94,7 @@ public:
     // catchUp=false: only exclude the worker (queries from other threads).
     [[nodiscard]] IopSync syncIop(IopSyncKind kind, bool catchUp = true);
     void stopIopThread();
+    void frameCounters(uint64_t *out) const; // cumulative IOP-sync totals (PS2X_FRAME_LIST); see EeScheduler.cpp
 
     [[nodiscard]] CallScope enterCall(R5900Context *context,
                                       uint8_t *rdram = nullptr);

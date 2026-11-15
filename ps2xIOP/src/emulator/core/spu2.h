@@ -84,6 +84,14 @@ namespace ps2x::iop::detail
         void step(); // one 48 kHz sample
         [[nodiscard]] bool takeInterrupt() noexcept;
 
+        // PS2X_SPU2_BATCH=1 (default off): the sample producer stages rendered frames locally and publishes them to
+        // the output ring (one lock) when 512 are staged, before silence is counted behind them, and on flushOutput(),
+        // which the IOP emulator calls at the end of each run; the stream lock is skipped while no PCM stream has
+        // frames to play. The PCM that reaches the consumer is the same, in the same order; it can arrive up to one
+        // run (1 ms of guest time on the IOP thread) later. Without the switch every sample publishes at once.
+        void flushOutput();
+        [[nodiscard]] bool batchedOutput() const noexcept { return m_batch; }
+
         // Interleaved stereo samples (L, R) produced since the last call. Producer (IOP) and consumer (host audio
         // thread) can be different threads. With maxLatencyFrames the oldest are dropped when more delay has built
         // up (emulation can run faster than real time).
@@ -186,6 +194,14 @@ namespace ps2x::iop::detail
         std::array<PcmStream, StreamCount> m_streams{};
         mutable std::mutex m_streamMutex;
         std::atomic<bool> m_streamsActive{false};
+        std::atomic<bool> m_streamLive{false}; // batch mode: some stream has frames left to play (written under m_streamMutex)
+        void updateStreamLive() noexcept;      // m_streamMutex held
+
+        // PS2X_SPU2_BATCH: producer-side staging of rendered frames (touched only by the producer thread).
+        static constexpr size_t StageFrames = 512u;
+        bool m_batch = false;
+        std::vector<int16_t> m_stage; // StageFrames * 2 samples
+        size_t m_stageCount = 0;
 
         std::vector<uint16_t> m_ram;
         std::array<uint16_t, 0x400> m_regs{};

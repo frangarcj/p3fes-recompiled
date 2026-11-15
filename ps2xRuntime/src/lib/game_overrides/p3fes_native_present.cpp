@@ -273,6 +273,7 @@ struct HostTiming
     uint64_t endFrame = 0;     // backend endFrame (swap)
     uint64_t post = 0;         // hand-back, retire, report
     uint64_t postFree = 0;     // of which dropping the frame (draw vectors and names)
+    uint64_t meshEnsure = 0, meshPatch = 0, meshBackend = 0; // inside meshes: ensureMesh, colour-override copy, g_renderer->drawMesh
     uint32_t screenDraws = 0, meshDraws = 0, screenVertices = 0;
 };
 HostTiming g_timing;
@@ -355,6 +356,8 @@ void reportResources()
             (t.screenEnsure + t.screenPlace + t.screenDraw) / n / 1000.0, t.screenDraws / n, t.screenVertices / n,
             t.other / n / 1000.0, t.endFrame / n / 1000.0, (t.post + t.postFree) / n / 1000.0, t.postFree / n / 1000.0,
             t.screenEnsure / sd, t.screenPlace / sd, t.screenDraw / sd);
+        std::fprintf(stderr, "[native-host] meshes split: ensure=%.2f patch-copy=%.2f backend-drawMesh=%.2f ms/frame\n",
+                     t.meshEnsure / n / 1000.0, t.meshPatch / n / 1000.0, t.meshBackend / n / 1000.0);
     }
     if (g_renderer)
     {
@@ -749,13 +752,13 @@ void dumpFrame(const Frame &frame, const std::function<std::string(const ScreenD
             const auto &c = screen->vertices.empty() ? std::array<std::uint8_t, 4>{} : screen->vertices[0].color;
             std::fprintf(stderr,
                 "[p3fes-frame] %u screen%s n=%u src=%gx%g xy=%.1f,%.1f..%.1f,%.1f z=%.5f..%.5f uv=%.4f,%.4f..%.4f,%.4f "
-                "tex=%s %ux%u blend=%u depth=%d/%d/%u atest=%d/%u/%u afail=%u clamp=%d%d linear=%d fog=%d rgba=%u,%u,%u,%u place=%s\n",
+                "tex=%s %ux%u blend=%u depth=%d/%d/%u atest=%d/%u/%u afail=%u clamp=%d%d linear=%d fog=%d rgba=%u,%u,%u,%u aonly=%d place=%s\n",
                 index, screen->lines ? "-lines" : "", static_cast<unsigned>(screen->vertices.size()), screen->sourceWidth, screen->sourceHeight,
                 x0, y0, x1, y1, z0, z1, u0, v0, u1, v1, screen->textureName.c_str(), tw, th,
                 static_cast<unsigned>(s.blend), s.depthTest ? 1 : 0, s.depthWrite ? 1 : 0,
                 static_cast<unsigned>(s.depthFunction), s.alphaTest.enabled ? 1 : 0, s.alphaTest.function,
                 s.alphaTest.reference, static_cast<unsigned>(s.alphaFailAction), s.clampU ? 1 : 0, s.clampV ? 1 : 0,
-                s.linearFilter ? 1 : 0, s.fog.enabled ? 1 : 0, c[0], c[1], c[2], c[3],
+                s.linearFilter ? 1 : 0, s.fog.enabled ? 1 : 0, c[0], c[1], c[2], c[3], s.alphaOnlyWrite ? 1 : 0,
                 (placementOf ? placementOf(*screen, slot) : std::string()).c_str());
         }
         else if (const auto *target = std::get_if<TargetDraw>(&draw))
@@ -869,9 +872,14 @@ void finishCapture()
         const uint32_t header[2] = {static_cast<uint32_t>(shown.width), static_cast<uint32_t>(shown.height)};
         std::fwrite("P3FB", 1, 4, file);
         std::fwrite(header, sizeof(uint32_t), 2, file);
+        // Copy out of display memory first and write once: writing row by row straight from the display
+        // buffer stalled the render thread for good when the game thread was reading files (seen in battle).
+        std::vector<uint8_t> copy(static_cast<size_t>(shown.width) * shown.height * 4u);
         for (uint32_t y = 0; y < shown.height; ++y)
-            std::fwrite(static_cast<const uint8_t *>(shown.base) + static_cast<size_t>(y) * shown.pitch * 4u, 4u,
-                        shown.width, file);
+            std::memcpy(copy.data() + static_cast<size_t>(y) * shown.width * 4u,
+                        static_cast<const uint8_t *>(shown.base) + static_cast<size_t>(y) * shown.pitch * 4u,
+                        static_cast<size_t>(shown.width) * 4u);
+        std::fwrite(copy.data(), 1, copy.size(), file);
         std::fclose(file);
         std::fprintf(stderr, "[p3fes-frame] capture %s %ux%u format=%u\n", path.c_str(), shown.width, shown.height,
                      shown.pixelformat);
@@ -1281,6 +1289,23 @@ void defineMesh(MeshId id, const MeshData &mesh)
     auto shared = std::make_shared<const MeshData>(mesh);
     ProducerLock lock;
     g_meshDefinitions.try_emplace(id, std::move(shared));
+}
+
+namespace
+{
+struct FramebufferTexture { uint32_t texWidth, texHeight, srcWidth, srcHeight; uint64_t snapshotFrame; };
+std::unordered_map<std::string, FramebufferTexture> g_framebufferTextures; // under g_mutex
+std::atomic<bool> g_anyFramebufferTexture{false};
+const bool g_fbPerDraw = [] { const char *v = std::getenv("P3FES_FB_TEXTURE_EVERY"); return v && *v == '1'; }();
+}
+
+void markFramebufferTexture(const std::string &name, uint32_t texWidth, uint32_t texHeight, uint32_t srcWidth, uint32_t srcHeight)
+{
+    if (!active() || name.empty())
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_framebufferTextures.try_emplace(name, FramebufferTexture{texWidth, texHeight, srcWidth, srcHeight, ~0ull});
+    g_anyFramebufferTexture.store(true, std::memory_order_release);
 }
 
 void defineTexture(const TextureData &texture, uint64_t revision)
@@ -1711,6 +1736,10 @@ bool renderHostFrame()
         }
     };
     bool anyMixed = false, polygonBackdrop = false, menuFrame = false;
+    // The run of mesh draws that follows the menu camera (the polygon backdrop): slots [backdropFrom, backdropTo).
+    size_t backdropFrom = 0u, backdropTo = 0u;
+    // P3FES_WS_BACKDROP_EDGES=0: the polygon backdrop is drawn over the whole framebuffer (stretched) as before.
+    static const bool g_menuBackdropEdges = [] { const char *v = std::getenv("P3FES_WS_BACKDROP_EDGES"); return !v || *v != '0'; }();
     if (widescreen == 2)
     {
         drawLayer.assign(frame.draws.size(), -1);
@@ -1733,7 +1762,22 @@ bool renderHostFrame()
             }
             previousDepthClear = false;
             if (depthClearPair && !inTarget && std::holds_alternative<CameraDraw>(draw))
+            {
                 polygonBackdrop = true;
+                if (backdropTo == 0u)
+                {
+                    size_t end = slot + 1u;
+                    while (end < frame.draws.size() && (std::holds_alternative<MeshDraw>(frame.draws[end]) ||
+                                                        std::holds_alternative<SharedMeshDraw>(frame.draws[end]) ||
+                                                        std::holds_alternative<TransientMeshDraw>(frame.draws[end])))
+                        ++end;
+                    if (end > slot + 1u)
+                    {
+                        backdropFrom = slot + 1u;
+                        backdropTo = end;
+                    }
+                }
+            }
             const auto *screen = inTarget ? nullptr : std::get_if<ScreenDraw>(&draw);
             if (!screen || screen->vertices.empty())
                 continue;
@@ -2287,14 +2331,15 @@ bool renderHostFrame()
     g_lastFrameCamera = frame.camera;
     // Two replays of the same list: first only the render-to-texture brackets (before the display
     // frame begins, so the display scene is never split), then everything outside them.
-    const auto runDraws = [&](const bool targetPass) {
+    const auto runDraws = [&](const bool targetPass, size_t rangeBegin = 0u, size_t rangeEnd = static_cast<size_t>(-1)) {
 #if defined(PS2X_P3FES_FRAME_TRACE)
-    uint32_t drawIndex = 0;
+    uint32_t drawIndex = static_cast<uint32_t>(rangeBegin);
 #endif
     bool inTarget = false;
-    size_t drawSlot = static_cast<size_t>(-1);
-    for (const Draw &draw : frame.draws)
+    size_t drawSlot = rangeBegin - 1u;
+    for (size_t rangeIndex = rangeBegin; rangeIndex < frame.draws.size() && rangeIndex < rangeEnd; ++rangeIndex)
     {
+        const Draw &draw = frame.draws[rangeIndex];
         ++drawSlot;
         if (const auto *target = std::get_if<TargetDraw>(&draw))
         {
@@ -2350,24 +2395,44 @@ bool renderHostFrame()
                 continue;
             if (timing) ++g_timing.meshDraws;
             const bool meshReady = ensureMesh(meshId);
+            const uint64_t meshEnsuredUs = timing ? nowUs() : 0u;
+            if (timing) g_timing.meshEnsure += meshEnsuredUs - drawStartUs;
 #if defined(PS2X_P3FES_FRAME_TRACE)
             if (traceDraw) submitStartNs = p3fes_frame_trace::nowNs();
 #endif
             if (meshReady)
             {
+                uint64_t meshPatchedUs = meshEnsuredUs;
                 if (mesh)
                     g_renderer->drawMesh(mesh->id, mesh->model, mesh->state);
                 else if (shared->colorCount)
                 {
                     // retained state with this draw's own material colours: patch a copy (host thread only)
                     static MeshDrawState patched;
-                    patched = *shared->state;
+                    // P3FES_PATCH_CACHE=1: draws of one retained state follow each other (particles): copy it once per
+                    // frame and only reset + patch the colours for the next draw.
+                    static const bool patchCache = [] { const char *v = std::getenv("P3FES_PATCH_CACHE"); return v && *v == '1'; }();
+                    static const MeshDrawState *patchedFrom = nullptr;
+                    static uint64_t patchedSequence = 0;
+                    if (patchCache && patchedFrom == shared->state.get() && patchedSequence == frame.sequence)
+                    {
+                        for (size_t i = 0; i < patched.materialColors.size() && i < shared->state->materialColors.size(); ++i)
+                            patched.materialColors[i] = shared->state->materialColors[i];
+                    }
+                    else
+                    {
+                        patched = *shared->state;
+                        patchedFrom = shared->state.get();
+                        patchedSequence = frame.sequence;
+                    }
                     for (uint32_t i = 0; i < shared->colorCount && i < patched.materialColors.size(); ++i)
                         std::memcpy(patched.materialColors[i].data(), &shared->colorOverride[i], 4);
+                    if (timing) { meshPatchedUs = nowUs(); g_timing.meshPatch += meshPatchedUs - meshEnsuredUs; }
                     g_renderer->drawMesh(shared->id, shared->model, patched);
                 }
                 else
                     g_renderer->drawMesh(shared->id, shared->model, *shared->state);
+                if (timing) g_timing.meshBackend += nowUs() - meshPatchedUs;
             }
         }
         else if (const auto *transient = std::get_if<TransientMeshDraw>(&draw))
@@ -2413,6 +2478,26 @@ bool renderHostFrame()
         else if (const auto *screen = std::get_if<ScreenDraw>(&draw))
         {
             const bool textureReady = ensureTexture(screen->textureName);
+            if (textureReady && !targetPass && g_anyFramebufferTexture.load(std::memory_order_acquire) &&
+                screen->textureName.compare(0, 3, "rt.") == 0)
+            {
+                // A draw that samples the display frame buffer: take the copy once per presented frame, before the first one.
+                FramebufferTexture copy{};
+                bool wanted = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    const auto found = g_framebufferTextures.find(screen->textureName);
+                    if (found != g_framebufferTextures.end() && (found->second.snapshotFrame != g_presentedFrames || g_fbPerDraw))
+                    {
+                        found->second.snapshotFrame = g_presentedFrames;
+                        copy = found->second;
+                        wanted = true;
+                    }
+                }
+                if (wanted)
+                    g_renderer->snapshotFramebuffer(screen->textureName, static_cast<int>(copy.texWidth), static_cast<int>(copy.texHeight),
+                                                    static_cast<int>(copy.srcWidth), static_cast<int>(copy.srcHeight));
+            }
             const uint64_t ensuredUs = timing ? nowUs() : 0u;
 #if defined(PS2X_P3FES_FRAME_TRACE)
             if (traceDraw) submitStartNs = p3fes_frame_trace::nowNs();
@@ -2491,7 +2576,26 @@ bool renderHostFrame()
     const uint64_t beginFrameNs = traceFrame
         ? p3fes_frame_trace::nowNs() - beginFrameStartNs : 0u;
 #endif
-    runDraws(false);
+    if (backdropFrom < backdropTo && widescreen == 2 && menuFrame && g_menuBackdropEdges)
+    {
+        // The polygon backdrop of a menu: drawn in the centred 4:3 area like the rest of the menu (the 2-D content is
+        // laid out for it), then replayed into each side margin with its outermost columns magnified. A backend
+        // without world placements (setWorldPlacement returns false) draws it once, over the whole framebuffer.
+        runDraws(false, 0u, backdropFrom);
+        const bool placed = g_renderer->setWorldPlacement(Renderer::WorldPlacement::Centre);
+        runDraws(false, backdropFrom, backdropTo);
+        if (placed)
+        {
+            g_renderer->setWorldPlacement(Renderer::WorldPlacement::EdgeLeft);
+            runDraws(false, backdropFrom, backdropTo);
+            g_renderer->setWorldPlacement(Renderer::WorldPlacement::EdgeRight);
+            runDraws(false, backdropFrom, backdropTo);
+            g_renderer->setWorldPlacement(Renderer::WorldPlacement::Full);
+        }
+        runDraws(false, backdropTo);
+    }
+    else
+        runDraws(false);
     timingMark = timing ? nowUs() : 0u;
 #if defined(PS2X_P3FES_FRAME_TRACE)
     const uint64_t endFrameStartNs = traceFrame ? p3fes_frame_trace::nowNs() : 0u;

@@ -466,12 +466,57 @@ public:
         rlViewport(0, 0, std::max(GetRenderWidth(), 1), std::max(GetRenderHeight(), 1));
     }
 
+    bool snapshotFramebuffer(std::string_view name, int texWidth, int texHeight, int srcWidth, int srcHeight) override
+    {
+        if (!m_open || m_target || texWidth <= 0 || texHeight <= 0 || srcWidth <= 0 || srcHeight <= 0 || srcWidth > texWidth ||
+            srcHeight > texHeight)
+            return false;
+        flushScreenBatch();
+        leave3D();
+        rlDrawRenderBatchActive();
+        const std::string key = textureKey(name);
+        auto target = m_targets.find(key);
+        if (target == m_targets.end() || target->second.texture.width != texWidth || target->second.texture.height != texHeight)
+        {
+            removeTexture(name);
+            const RenderTexture2D created = LoadRenderTexture(texWidth, texHeight);
+            if (created.id == 0u)
+                return false;
+            SetTextureFilter(created.texture, TEXTURE_FILTER_BILINEAR);
+            target = m_targets.emplace(key, created).first;
+            m_textures[key] = created.texture;
+        }
+        const int hostWidth = std::max(GetRenderWidth(), 1), hostHeight = std::max(GetRenderHeight(), 1);
+        const FitViewport area = m_widescreen != 0 ? FitViewport{0, 0, hostWidth, hostHeight} : fitViewport(640.0f, 448.0f);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target->second.id);
+        glDisable(GL_SCISSOR_TEST);
+        // top row of the picture -> row 0 of the texture (v = 0 is the top row of every sampled texture)
+        glBlitFramebuffer(area.x, area.y + area.height, area.x + area.width, area.y, 0, 0, srcWidth, srcHeight,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return true;
+    }
+
     void setWidescreen(int mode) override
     {
         flushScreenBatch();
         m_widescreen = mode;
     }
     void setScreenPlacement(ScreenPlacement placement) override { m_screenPlacement = placement; }
+    bool setWorldPlacement(WorldPlacement placement) override
+    {
+        if (m_widescreen != 2 || m_target)
+            placement = WorldPlacement::Full;
+        flushScreenBatch();
+        rlDrawRenderBatchActive();
+        m_worldPlacement = placement;
+        if (m_in3D)
+            applyWorldViewport();
+        else if (placement == WorldPlacement::Full)
+            glDisable(GL_SCISSOR_TEST);
+        return m_widescreen == 2 && !m_target;
+    }
 
     bool captureNextFrame(const std::string &path) override
     {
@@ -699,8 +744,7 @@ public:
                 rlSetMatrixProjection(MatrixPerspective(m_camera.fovy * DEG2RAD, 640.0 / 448.0,
                                                        rlGetCullDistanceNear(), rlGetCullDistanceFar()));
             }
-            const FitViewport viewport = worldViewport();
-            rlViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+            applyWorldViewport();
             m_in3D = true;
         }
         auto found = m_meshes.find(id);
@@ -1094,9 +1138,40 @@ private:
     {
         if (m_target)
             return {0, 0, m_target->texture.width, m_target->texture.height};
+        if (m_widescreen == 2 && m_worldPlacement != WorldPlacement::Full)
+        {
+            const FitViewport centre = fitViewport(640.0f, 448.0f);
+            if (m_worldPlacement == WorldPlacement::Centre)
+                return centre;
+            // Edge passes: magnify the picture so that its outermost kEdgeColumns pixel columns span the margin.
+            constexpr float kEdgeColumns = 8.0f;
+            const int hostWidth = std::max(GetRenderWidth(), 1);
+            const int margin = std::max(m_worldPlacement == WorldPlacement::EdgeLeft ? centre.x : hostWidth - centre.x - centre.width, 1);
+            const int width = std::clamp(static_cast<int>(static_cast<float>(margin) * static_cast<float>(centre.width) / kEdgeColumns), centre.width, 16000);
+            return {m_worldPlacement == WorldPlacement::EdgeLeft ? 0 : hostWidth - width, centre.y, width, centre.height};
+        }
         if (m_widescreen != 0)
             return {0, 0, std::max(GetRenderWidth(), 1), std::max(GetRenderHeight(), 1)};
         return fitViewport(640.0f, 448.0f);
+    }
+
+    // Viewport (and, for the edge placements, the scissor to the margin) of the current world placement.
+    void applyWorldViewport()
+    {
+        const FitViewport viewport = worldViewport();
+        rlViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        if (m_widescreen == 2 && !m_target && (m_worldPlacement == WorldPlacement::EdgeLeft || m_worldPlacement == WorldPlacement::EdgeRight))
+        {
+            const FitViewport centre = fitViewport(640.0f, 448.0f);
+            const int hostWidth = std::max(GetRenderWidth(), 1);
+            glEnable(GL_SCISSOR_TEST);
+            if (m_worldPlacement == WorldPlacement::EdgeLeft)
+                glScissor(0, 0, centre.x, std::max(GetRenderHeight(), 1));
+            else
+                glScissor(centre.x + centre.width, 0, hostWidth - centre.x - centre.width, std::max(GetRenderHeight(), 1));
+        }
+        else
+            glDisable(GL_SCISSOR_TEST);
     }
 
 
@@ -1537,6 +1612,7 @@ template <typename Viewport, typename Fit>
     RenderTexture2D *m_target = nullptr;
     int m_widescreen = 0;
     ScreenPlacement m_screenPlacement = ScreenPlacement::Centre;
+    WorldPlacement m_worldPlacement = WorldPlacement::Full;
     std::string m_capturePath;
 };
 } // namespace

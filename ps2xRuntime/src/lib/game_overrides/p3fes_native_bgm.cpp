@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -292,12 +293,6 @@ namespace p3fes_native_bgm
             g_startupCondition.notify_one();
         }
 
-        struct ShutdownGuard
-        {
-            ~ShutdownGuard() { stopLocked(); }
-        };
-        ShutdownGuard g_shutdownGuard;
-
         bool g_portInfoLogged = false;
 
         constexpr uint32_t kFramesPerBuffer = 1024u;
@@ -477,8 +472,50 @@ namespace p3fes_native_bgm
             }
         };
 
+        // P3FES_BGM_ASYNC=1 (default off): start() and stop() only queue the request for a controller thread, so the
+        // game thread no longer waits for the old audio thread to notice the stop (one 21 ms block, then the feeder and the
+        // port) or for the new port to open: both measured at 37-56 ms on the console, i.e. a lost frame at each track
+        // change. Requests run in order; a start that a later request supersedes is skipped.
+        // g_asyncActive is what playing() reports: true from an accepted start() until stop() or the track's natural end.
+        struct AsyncCommand
+        {
+            bool start = false;
+            std::unique_ptr<PcmSource> reader;
+            uint64_t generation = 0u;
+        };
+        std::mutex g_commandMutex;
+        std::condition_variable g_commandCondition;
+        std::deque<AsyncCommand> g_commands;
+        std::thread g_controller;
+        bool g_controllerStop = false;
+        std::atomic<uint64_t> g_asyncGeneration{0u};
+        std::atomic<uint64_t> g_sessionGeneration{0u};
+        std::atomic<bool> g_asyncActive{false};
+        bool asyncMode()
+        {
+            static const bool on = [] { const char *v = std::getenv("P3FES_BGM_ASYNC"); return v && v[0] == '1'; }();
+            return on;
+        }
+        void stopController()
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_commandMutex);
+                g_controllerStop = true;
+            }
+            g_commandCondition.notify_all();
+            if (g_controller.joinable())
+                g_controller.join();
+        }
+
+        struct ShutdownGuard
+        {
+            ~ShutdownGuard() { stopController(); stopLocked(); }
+        };
+        ShutdownGuard g_shutdownGuard;
+
         void audioLoop(std::unique_ptr<PcmSource> reader)
         {
+            const uint64_t sessionGeneration = g_sessionGeneration.load(std::memory_order_acquire);
 #if defined(PLATFORM_VITA)
             // Threads made by std::thread start at the lowest user priority (191), below the game
             // thread (128): whenever the game or the renderer was busy this thread missed the 21 ms
@@ -796,20 +833,134 @@ namespace p3fes_native_bgm
                              static_cast<unsigned long long>(outputPcmFrames), seconds);
             }
             g_playing.store(false, std::memory_order_release);
+            // The track ended by itself (or its port failed) and nothing newer was requested.
+            if (g_asyncGeneration.load(std::memory_order_acquire) == sessionGeneration)
+                g_asyncActive.store(false, std::memory_order_release);
+        }
+    }
+
+    // Time the calling (game) thread spends in start()/stop(): the join of the old audio thread and the wait for the
+    // new one to open its port. Logged when it exceeds 3 ms (PS2X_FRAME_LIST / PS2X_BGM_CALL_DIAG=1).
+    namespace
+    {
+        struct CallTimer
+        {
+            const char *what;
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            explicit CallTimer(const char *w) : what(w) {}
+            ~CallTimer()
+            {
+                static const bool on = [] { const char *a = std::getenv("PS2X_BGM_CALL_DIAG"); const char *b = std::getenv("PS2X_FRAME_LIST"); return (a && *a == '1') || (b && *b); }();
+                if (!on) return;
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (ms >= 3.0) std::fprintf(stderr, "[native-bgm] %s took %.1f ms on the calling thread\n", what, ms);
+            }
+        };
+    }
+
+    namespace
+    {
+        // The blocking half of start(): stops the running track, then runs the audio thread and waits until its port is
+        // open (the whole of start() unless P3FES_BGM_ASYNC=1, where the controller thread does this).
+        bool startReader(std::unique_ptr<PcmSource> reader, uint64_t generation)
+        {
+            std::lock_guard<std::mutex> lock(g_controlMutex);
+            stopLocked();
+
+            g_sessionGeneration.store(generation, std::memory_order_release);
+            g_stopRequested.store(false, std::memory_order_release);
+            g_paused.store(false, std::memory_order_release);
+            g_fadeRequested.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> startupLock(g_startupMutex);
+                g_startupDone = false;
+                g_startupSuccess = false;
+            }
+            try
+            {
+                g_audioThread = std::thread(audioLoop, std::move(reader));
+            }
+            catch (...)
+            {
+                g_playing.store(false, std::memory_order_release);
+                return false;
+            }
+
+            std::unique_lock<std::mutex> startupLock(g_startupMutex);
+            g_startupCondition.wait(startupLock, [] { return g_startupDone; });
+            const bool started = g_startupSuccess;
+            startupLock.unlock();
+            if (!started)
+            {
+                if (g_audioThread.joinable())
+                    g_audioThread.join();
+                g_playing.store(false, std::memory_order_release);
+            }
+            return started;
+        }
+
+        void controllerMain()
+        {
+            for (;;)
+            {
+                AsyncCommand command;
+                {
+                    std::unique_lock<std::mutex> lock(g_commandMutex);
+                    g_commandCondition.wait(lock, [] { return g_controllerStop || !g_commands.empty(); });
+                    if (g_commands.empty())
+                        return; // stop requested and nothing left to do
+                    command = std::move(g_commands.front());
+                    g_commands.pop_front();
+                    if (command.start && !g_commands.empty())
+                        continue; // a later request supersedes this start
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                if (command.start)
+                {
+                    if (!startReader(std::move(command.reader), command.generation))
+                    {
+                        std::fprintf(stderr, "[native-bgm] async start failed (port); no music\n");
+                        if (g_asyncGeneration.load(std::memory_order_acquire) == command.generation)
+                            g_asyncActive.store(false, std::memory_order_release);
+                    }
+                }
+                else
+                {
+                    std::lock_guard<std::mutex> lock(g_controlMutex);
+                    stopLocked();
+                }
+                static const bool diag = [] { const char *v = std::getenv("P3FES_RESOURCE_DIAG"); const char *b = std::getenv("PS2X_BGM_CALL_DIAG"); return (v && *v == '1') || (b && *b == '1'); }();
+                if (diag)
+                    std::fprintf(stderr, "[native-bgm] controller %s took %.1f ms (off the game thread)\n", command.start ? "start" : "stop",
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
+
+        void postCommand(AsyncCommand command)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_commandMutex);
+                if (!g_controller.joinable())
+                    g_controller = std::thread(controllerMain);
+                g_commands.push_back(std::move(command));
+            }
+            g_commandCondition.notify_one();
         }
     }
 
     bool start(const std::string &path)
     {
-        std::lock_guard<std::mutex> lock(g_controlMutex);
-        stopLocked();
-
+        CallTimer timer("start");
+        const auto openStart = std::chrono::steady_clock::now();
         auto reader = std::make_unique<PcmSource>();
         if (!reader->open(path))
         {
             std::fprintf(stderr, "[native-bgm] cannot open track: %s\n", path.c_str());
             return false;
         }
+        const double openMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - openStart).count();
+        if (openMs >= 3.0)
+            std::fprintf(stderr, "[native-bgm] opening the track took %.1f ms on the calling thread\n", openMs);
 
         const detail::WaveMetadata &metadata = reader->metadata();
         std::fprintf(stderr,
@@ -818,46 +969,40 @@ namespace p3fes_native_bgm
                      metadata.hasLoop ? 1u : 0u,
                      static_cast<unsigned long long>(metadata.loopStart),
                      static_cast<unsigned long long>(metadata.loopEndExclusive));
-        g_stopRequested.store(false, std::memory_order_release);
-        g_paused.store(false, std::memory_order_release);
-        g_fadeRequested.store(false, std::memory_order_release);
+        const uint64_t generation = g_asyncGeneration.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        if (asyncMode())
         {
-            std::lock_guard<std::mutex> startupLock(g_startupMutex);
-            g_startupDone = false;
-            g_startupSuccess = false;
+            g_asyncActive.store(true, std::memory_order_release);
+            AsyncCommand command;
+            command.start = true;
+            command.reader = std::move(reader);
+            command.generation = generation;
+            postCommand(std::move(command));
+            return true;
         }
-        try
-        {
-            g_audioThread = std::thread(audioLoop, std::move(reader));
-        }
-        catch (...)
-        {
-            g_playing.store(false, std::memory_order_release);
-            return false;
-        }
-
-        std::unique_lock<std::mutex> startupLock(g_startupMutex);
-        g_startupCondition.wait(startupLock, [] { return g_startupDone; });
-        const bool started = g_startupSuccess;
-        startupLock.unlock();
-        if (!started)
-        {
-            if (g_audioThread.joinable())
-                g_audioThread.join();
-            g_playing.store(false, std::memory_order_release);
-        }
-        return started;
+        return startReader(std::move(reader), generation);
     }
 
     void stop()
     {
+        CallTimer timer("stop");
+        if (asyncMode())
+        {
+            g_asyncGeneration.fetch_add(1u, std::memory_order_acq_rel);
+            g_asyncActive.store(false, std::memory_order_release);
+            AsyncCommand command;
+            command.start = false;
+            postCommand(std::move(command));
+            return;
+        }
+        g_asyncGeneration.fetch_add(1u, std::memory_order_acq_rel);
         std::lock_guard<std::mutex> lock(g_controlMutex);
         stopLocked();
     }
 
     void fadeOut(float seconds)
     {
-        if (!g_playing.load(std::memory_order_acquire))
+        if (!(asyncMode() ? g_asyncActive.load(std::memory_order_acquire) : g_playing.load(std::memory_order_acquire)))
             return;
         g_fadeDuration.store(std::max(0.0f, seconds), std::memory_order_relaxed);
         g_fadeRequested.store(true, std::memory_order_release);
@@ -865,6 +1010,8 @@ namespace p3fes_native_bgm
 
     bool playing()
     {
+        if (asyncMode())
+            return g_asyncActive.load(std::memory_order_acquire);
         return g_playing.load(std::memory_order_acquire);
     }
 

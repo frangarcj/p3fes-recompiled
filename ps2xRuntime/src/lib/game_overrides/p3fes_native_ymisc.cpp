@@ -1,5 +1,7 @@
 #include "p3fes_native_ymisc.h"
 #include "p3fes_native_effects.h"
+#include "p3fes_native_fnprof.h"
+#include "p3fes_native_leaf.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -1046,6 +1048,7 @@ namespace p3fes_native_ymisc
 
     void logCounters()
     {
+        p3fes_native_leaf::logCounters();
         if (g_mainCalls)
             std::fprintf(stderr, "[p3fes-ymisc] main calls=%llu unwound=%llu avg=%.1fus max=%.1fus\n", static_cast<unsigned long long>(g_mainCalls),
                          static_cast<unsigned long long>(g_mainUnwound), static_cast<double>(g_mainNs) / 1e3 / static_cast<double>(g_mainCalls),
@@ -1097,6 +1100,13 @@ namespace p3fes_native_ymisc
 
     bool install(PS2Runtime &runtime)
     {
+        // measurement wrappers (P3FES_FN_PROF) go on last, over every hook this function installs
+        struct FnProfGuard
+        {
+            PS2Runtime &rt;
+            ~FnProfGuard() { p3fes_native_fnprof::install(rt); }
+        } fnProfGuard{runtime};
+        p3fes_native_leaf::install(runtime);
         p3fes_native_effects::install(runtime); // TEMPORARY unity build: p3fes_native_effects.cpp is included at the end of this file
         const char *value = std::getenv("P3FES_NATIVE_YMISC");
         const char *diag = std::getenv("P3FES_RESOURCE_DIAG");

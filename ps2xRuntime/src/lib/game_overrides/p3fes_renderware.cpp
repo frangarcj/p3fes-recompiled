@@ -5075,12 +5075,43 @@ namespace
         {
             // The pixels come from the raster's render-target pass. The definition below is only the
             // name's placeholder (fully transparent, shown until the first pass has run).
+            {
+                static const bool diag = [] { const char *v = std::getenv("P3FES_SHADOW_DIAG"); return v && *v == '1'; }();
+                static uint32_t seen[16];
+                static unsigned seenCount = 0u;
+                if (diag && seenCount < 16u && std::find(seen, seen + seenCount, raster) == seen + seenCount)
+                {
+                    seen[seenCount++] = raster;
+                    int32_t w = 0, h = 0, depth = 0;
+                    uint32_t gsMem = 0u, flags = 0u;
+                    readGuest(rdram, raster + 12u, w);
+                    readGuest(rdram, raster + 16u, h);
+                    readGuest(rdram, raster + 20u, depth);
+                    readGuest(rdram, raster + 36u, gsMem);
+                    readGuest(rdram, raster + 32u, flags);
+                    std::fprintf(stderr, "[p3fes-camera-raster] raster=%08X %dx%d depth=%d type/flags=%08X +36=%08X (frame %llu)\n", raster, w, h, depth, flags, gsMem,
+                                 static_cast<unsigned long long>(g_nativeFrameNumber));
+                }
+            }
             TextureData placeholder;
             placeholder.name = cameraTextureName(raster);
             placeholder.width = 1u;
             placeholder.height = 1u;
             placeholder.rgba.assign(4u, 0u);
             p3fes_native_present::defineTexture(placeholder, 1u);
+            {
+                // A camera raster at GS address 0 is the display frame buffer itself (the game samples the picture drawn
+                // so far, e.g. the Tartarus haze sprites: 1024x512 raster, UVs = screen position). No pass ever renders
+                // into it, so the host copies the picture into it before the first draw that samples it each frame.
+                // Experimental, OFF by default: P3FES_FB_TEXTURE=1. The copy alone is wrong (washed-out floor; see Tartarus floor 2): the
+                // draws that sample it apparently rely on the GS frame buffer's alpha / a per-draw feedback that is not modelled.
+                static const bool fbCopy = [] { const char *v = std::getenv("P3FES_FB_TEXTURE"); return v && *v == '1'; }();
+                uint32_t gsAddress = 1u;
+                int32_t width = 0, height = 0;
+                if (fbCopy && readGuest(rdram, raster + 36u, gsAddress) && gsAddress == 0u && readGuest(rdram, raster + 12u, width) &&
+                    readGuest(rdram, raster + 16u, height) && width >= 640 && width <= 1024 && height >= 448 && height <= 1024)
+                    p3fes_native_present::markFramebufferTexture(placeholder.name, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 640u, 448u);
+            }
             textureName = std::move(placeholder.name);
             return true;
         }
@@ -6405,6 +6436,11 @@ namespace
                         logged = true;
                         std::fprintf(stderr, "[p3fes-native] particle tank %08X has an unresolvable texture (0x%X): not drawn\n", tank, texture);
                     }
+                    static const bool dropDiag = [] { const char *v = std::getenv("P3FES_PTANK_DIAG"); return v && *v == '1'; }();
+                    static unsigned dropLines = 0u;
+                    if (dropDiag && dropLines++ < 400u)
+                        std::fprintf(stderr, "[p3fes-ptank-drop] frame=%llu tank=%X count=%u material=%X texture=0x%X uvcb=%X\n",
+                                     static_cast<unsigned long long>(g_nativeFrameNumber), tank, count, material, texture, uvCallback);
                     return true;
                 }
             }
@@ -6577,6 +6613,26 @@ namespace
                 const uint64_t address = static_cast<uint64_t>(atomic) + pluginOffset;
                 return address <= 0xFFFFFFFFull ? static_cast<uint32_t>(address) : 0xFFFFFFFFu;
             };
+            {
+                static const bool entryDiag = [] { const char *v = std::getenv("P3FES_PTANK_DIAG"); return v && *v == '2'; }();
+                static unsigned entryLines = 0u;
+                if (entryDiag && entryLines++ < 6000u)
+                {
+                    uint32_t off = 0u, tk = 0u, geometry = 0u, matArray = 0u, material = 0u, texture = 0u, raster = 0u, uvcb = 0u;
+                    int32_t cnt = -1;
+                    if (readGuest(rdram, kPtankAtomicExtensionOffset, off) && off && guestPointer(atomic + off, 4u) && readGuest(rdram, atomic + off, tk) && tk && guestPointer(tk, 0x100u))
+                    {
+                        readGuest(rdram, tk + 4u, cnt);
+                        readGuest(rdram, tk + 0x2Cu, uvcb);
+                    }
+                    readGuest(rdram, atomic + 0x18u, geometry);
+                    if (geometry && readGuest(rdram, geometry + kGeometryMatListArrayOffset, matArray) && matArray && readGuest(rdram, matArray, material) && material)
+                        readGuest(rdram, material + kMaterialTextureOffset, texture);
+                    if (texture && guestPointer(texture, 4u)) readGuest(rdram, texture + kTextureRasterOffset, raster);
+                    std::fprintf(stderr, "[p3fes-ptank-entry] frame=%llu atomic=%X tank=%X count=%d texture=%X raster=%X uvcb=%X\n",
+                                 static_cast<unsigned long long>(g_nativeFrameNumber), atomic, tk, cnt, texture, raster, uvcb);
+                }
+            }
             if (!(readGuest(rdram, kPtankAtomicExtensionOffset, pluginOffset) && pluginOffset != 0u &&
                   guestPointer(atomicExtension(), sizeof(uint32_t)) &&
                   readGuest(rdram, atomicExtension(), tank) && tank && guestPointer(tank, 104u) &&
@@ -6671,7 +6727,31 @@ namespace
         {
             drawn = drawNativePtankSprites(rdram, atomic, tank, count, blend.enabled ? &blend : nullptr, ctx, runtime);
             if (!drawn)
+            {
+                static const bool failDiag = [] { const char *v = std::getenv("P3FES_PTANK_DIAG"); return v && *v == '1'; }();
+                static unsigned failLines = 0u;
+                if (failDiag && failLines++ < 400u)
+                {
+                    uint32_t cb[5] = {};
+                    for (uint32_t k = 0u; k < 5u; ++k)
+                        readGuest(rdram, tank + 0x24u + k * 4u, cb[k]);
+                    uint32_t geometry = 0u, matArray = 0u, material = 0u, texture = 0u;
+                    readGuest(rdram, atomic + 0x18u, geometry);
+                    if (geometry && readGuest(rdram, geometry + kGeometryMatListArrayOffset, matArray) && matArray && readGuest(rdram, matArray, material) && material)
+                        readGuest(rdram, material + kMaterialTextureOffset, texture);
+                    std::fprintf(stderr, "[p3fes-ptank-fail] frame=%llu tank=%X count=%d callbacks setup=%X pos=%X uv=%X color=%X +34=%X texture=%X\n",
+                                 static_cast<unsigned long long>(g_nativeFrameNumber), tank, count, cb[0], cb[1], cb[2], cb[3], cb[4], texture);
+                }
                 drawn = drawNativeAtomic(rdram, atomic, ctx, runtime, blend.enabled ? &blend : nullptr);
+            }
+        }
+        else
+        {
+            static const bool skipDiag = [] { const char *v = std::getenv("P3FES_PTANK_DIAG"); return v && *v == '1'; }();
+            static unsigned skipLines = 0u;
+            if (skipDiag && skipLines++ < 400u)
+                std::fprintf(stderr, "[p3fes-ptank-skip] frame=%llu tank=%X count=%d instanceResult=%u\n",
+                             static_cast<unsigned long long>(g_nativeFrameNumber), tank, count, instanceResult);
         }
         if (!g_ptankDiagPrinted.exchange(true, std::memory_order_relaxed))
         {

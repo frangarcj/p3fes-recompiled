@@ -1493,6 +1493,7 @@ extern "C" { int ps2x_vita_game_thread = 0; }
 // Forcing every call through the dispatcher instead is not an option on the
 // console: it dropped the game to one vblank per second.
 std::atomic<uint32_t> g_ps2EeSampleCurrent{0u};
+extern std::atomic<uint64_t> g_ps2FrameSeq; // EeScheduler.cpp (PS2X_FRAME_HIST=1)
 namespace ps2_ee_sample
 {
     std::atomic<uint32_t> &g_current = g_ps2EeSampleCurrent;
@@ -1513,10 +1514,41 @@ namespace ps2_ee_sample
         std::unordered_map<uint32_t, uint32_t> counts;
         uint32_t total = 0u;
         auto next = std::chrono::steady_clock::now();
+        // PS2X_EE_SAMPLE_FRAMES=<ms> (with PS2X_FRAME_HIST=1): also one [ee-frame] line per game frame whose samples
+        // reach <ms> (the sampler ticks every ms), with its busiest functions; "wait" samples are the scheduler's pacing /
+        // event waits, so busy = samples - wait. Same seq as the [fdip] lines (PS2X_FRAME_LIST).
+        static const uint32_t frameListMs = [] { const char *v = std::getenv("PS2X_EE_SAMPLE_FRAMES"); return v ? static_cast<uint32_t>(std::atol(v)) : 0u; }();
+        std::unordered_map<uint32_t, uint32_t> frameCounts;
+        uint64_t frameSeq = g_ps2FrameSeq.load(std::memory_order_relaxed);
+        uint32_t frameSamples = 0u, frameWait = 0u;
         for (;;)
         {
             next += std::chrono::milliseconds(1);
             std::this_thread::sleep_until(next);
+            if (frameListMs != 0u)
+            {
+                const uint64_t seq = g_ps2FrameSeq.load(std::memory_order_relaxed);
+                if (seq != frameSeq)
+                {
+                    if (frameSamples >= frameListMs)
+                    {
+                        std::vector<std::pair<uint32_t, uint32_t>> fs(frameCounts.begin(), frameCounts.end());
+                        std::sort(fs.begin(), fs.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                        char line[512];
+                        int n = std::snprintf(line, sizeof(line), "[ee-frame] seq=%llu samples=%u wait=%u busy=%u top:", static_cast<unsigned long long>(frameSeq),
+                                              frameSamples, frameWait, frameSamples - frameWait);
+                        for (size_t i = 0; i < fs.size() && i < 8 && n > 0 && n < static_cast<int>(sizeof(line)) - 40; ++i)
+                            n += std::snprintf(line + n, sizeof(line) - n, " %08X%s=%u", fs[i].first & ~3u, (fs[i].first & 1u) != 0u ? "n" : "", fs[i].second);
+                        std::fprintf(stderr, "%s\n", line);
+                    }
+                    frameCounts.clear();
+                    frameSamples = frameWait = 0u;
+                    frameSeq = seq;
+                }
+                const uint32_t cur = g_current.load(std::memory_order_relaxed);
+                ++frameSamples;
+                if (cur >= 0xFFFFFF00u) ++frameWait; else ++frameCounts[cur];
+            }
             ++counts[g_current.load(std::memory_order_relaxed)];
             if (++total < 5000u)
                 continue;

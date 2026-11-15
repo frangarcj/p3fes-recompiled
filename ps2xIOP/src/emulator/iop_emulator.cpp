@@ -1311,6 +1311,7 @@ namespace ps2x::iop::detail
             {
                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
             }
+            memory.spu2().flushOutput(); // PS2X_SPU2_BATCH: publish the frames staged by this run (no-op otherwise)
             if (workDiagEnabled)
             {
                 --workDiagRunDepth;
