@@ -285,6 +285,17 @@ public:
         }
         if (!IsWindowReady())
             return false;
+        // Diagnostic: P3FES_HOST_SIZE=WxH sets the host framebuffer size in pixels (e.g. 960x544, the Vita's
+        // screen) so the widescreen placement code can be exercised on the desktop, where the window is 4:3.
+        if (const char *size = std::getenv("P3FES_HOST_SIZE"))
+        {
+            int w = 0, h = 0;
+            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
+            {
+                const Vector2 dpi = GetWindowScaleDPI();
+                SetWindowSize(static_cast<int>(w / std::max(dpi.x, 1.0f)), static_cast<int>(h / std::max(dpi.y, 1.0f)));
+            }
+        }
         m_material = LoadMaterialDefault();
         m_stateShader = LoadShaderFromMemory(kStateVertexShader, kStateFragmentShader);
         if (m_stateShader.id != rlGetShaderIdDefault())
@@ -1092,7 +1103,7 @@ private:
 template <typename Viewport, typename Fit>
     Viewport screenViewport(float sourceWidth, float sourceHeight, Viewport full, Fit fit) const
     {
-        if (m_widescreen == 1 || (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Stretch))
+        if (m_widescreen == 1 || (m_widescreen == 2 && (m_screenPlacement == ScreenPlacement::Stretch || m_screenPlacement == ScreenPlacement::Wide)))
             return full;
         Viewport viewport = fit(sourceWidth, sourceHeight);
         if (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Left)
@@ -1177,8 +1188,18 @@ template <typename Viewport, typename Fit>
             : screenViewport(sourceWidth, sourceHeight,
                              FitViewport{0, 0, std::max(GetRenderWidth(), 1), std::max(GetRenderHeight(), 1)}, fitViewport);
         rlViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        // Wide placement: the source area keeps its centred 4:3 position and scale, the rest of the framebuffer
+        // shows the source plane beyond x = 0 / x = sourceWidth.
+        double orthoLeft = 0.0, orthoRight = sourceWidth;
+        if (!m_target && m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Wide)
+        {
+            const double span = static_cast<double>(viewport.width) * sourceWidth /
+                                std::max(fitViewport(sourceWidth, sourceHeight).width, 1);
+            orthoLeft = (sourceWidth - span) * 0.5;
+            orthoRight = orthoLeft + span;
+        }
         rlSetMatrixProjection(m_target ? MatrixOrtho(0.0, sourceWidth, 0.0, sourceHeight, -1.0, 0.0)
-                                       : MatrixOrtho(0.0, sourceWidth, sourceHeight, 0.0, -1.0, 0.0));
+                                       : MatrixOrtho(orthoLeft, orthoRight, sourceHeight, 0.0, -1.0, 0.0));
         rlSetMatrixModelview(MatrixIdentity());
         // FBMSK = 0x00FFFFFF: alpha-only write (see ScreenDrawState::alphaOnlyWrite)
         if (state.alphaOnlyWrite)

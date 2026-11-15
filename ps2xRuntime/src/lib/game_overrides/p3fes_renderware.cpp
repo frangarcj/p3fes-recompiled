@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -241,6 +242,104 @@ namespace
     std::atomic<PS2Runtime::RecompiledFunction> g_originalShowRaster{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalSofdecUpdateTask{nullptr};
     std::atomic<PS2Runtime::RecompiledFunction> g_originalSofdecDestroyTask{nullptr};
+    // Per-frame call counts of the atomic hook (printed with the P3FES_RESOURCE_DIAG block every 5 s).
+    struct HookCounts
+    {
+        uint64_t atomics = 0u, drawn = 0u, hashChecks = 0u, dynamicDraws = 0u, frameSyncs = 0u, lit = 0u, skinned = 0u;
+        uint64_t materials = 0u, texturedMaterials = 0u, texLookups = 0u, texSlowLookups = 0u, extraPasses = 0u;
+        uint64_t ptankDraws = 0u, ptankQuads = 0u, freshStates = 0u, cacheHits = 0u, cacheMisses = 0u, verifyChecks = 0u, verifyMismatches = 0u;
+    };
+    HookCounts g_hookCounts;
+    bool g_noLoan = false; // always false: LoanGuard target of draws that hold no loan of the stock
+    // Measurement only: P3FES_CUT_ALTERNATE=<seconds> switches every cut of this file and of p3fes_native_present.cpp off
+    // and on again every <seconds> (starting on), so one run compares both settings in the same scene.
+    bool g_cutsOn = true;
+    void reportProfFuncs(uint64_t frames); // P3FES_PROF_FUNCS, defined next to applyP3fesRenderWare
+    // P3FES_VERIFY_CUTS=1: every cut below also computes the plain path and compares (counted in verify= / bad= of
+    // the [p3fes-hookcount] line, the first mismatches are logged); the plain result is the one used.
+    bool cutVerifyEnabled()
+    {
+        static const bool on = [] { const char *v = std::getenv("P3FES_VERIFY_CUTS"); return v && *v == '1'; }();
+        return on;
+    }
+    void noteVerify(bool same, const char *what, uint32_t detail)
+    {
+        ++g_hookCounts.verifyChecks;
+        if (same)
+            return;
+        ++g_hookCounts.verifyMismatches;
+        static unsigned logs = 0u;
+        if (logs++ < 20u)
+            std::fprintf(stderr, "[p3fes-verify] MISMATCH %s detail=%08X\n", what, detail);
+    }
+    // P3FES_HOOK_TIME=1 (Mac bench: nanoseconds) or =2 (Vita with PS2X_VITA_PMU=1: game-thread instructions and cycles
+    // read from the PMU): what each stage of drawNativeAtomic costs, printed with the resource diagnostics. The cost
+    // of the clock read itself is measured at start-up and subtracted.
+    struct HookStageTimes
+    {
+        static constexpr int kStages = 11;
+        uint64_t ns[kStages] = {};      // time (mode 1) or instructions (mode 2)
+        uint64_t cyc[kStages] = {};     // cycles (mode 2)
+        uint64_t calls = 0u, syncNs = 0u, syncCalls = 0u;
+    };
+    HookStageTimes g_hookTimes;
+#if defined(PLATFORM_VITA)
+    extern "C" __attribute__((weak)) int ps2x_vita_pmu_read_fast(uint32_t *instr, uint32_t *cycles);
+#endif
+    int hookTimeMode()
+    {
+        static const int mode = [] { const char *v = std::getenv("P3FES_HOOK_TIME"); return v && *v >= '1' && *v <= '2' ? *v - '0' : 0; }();
+        return mode;
+    }
+    bool hookTimeEnabled() { return hookTimeMode() != 0; }
+    struct HookStamp
+    {
+        uint64_t value = 0u, cycles = 0u;
+    };
+    inline HookStamp hookNow()
+    {
+        HookStamp stamp;
+#if defined(PLATFORM_VITA)
+        if (hookTimeMode() == 2)
+        {
+            uint32_t instr = 0u, cycles = 0u;
+            if (ps2x_vita_pmu_read_fast && ps2x_vita_pmu_read_fast(&instr, &cycles))
+            {
+                stamp.value = instr;
+                stamp.cycles = cycles;
+            }
+            return stamp;
+        }
+#endif
+        stamp.value = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        return stamp;
+    }
+    inline uint64_t hookNowNs() { return hookNow().value; }
+    // Per-stamp cost of a clock read (consecutive reads), in the unit of the mode.
+    struct HookStampCost { uint64_t value = 0u, cycles = 0u; };
+    HookStampCost hookStampCost()
+    {
+        static const HookStampCost cost = [] {
+            HookStampCost c;
+            if (!hookTimeEnabled())
+                return c;
+            constexpr int kRounds = 200;
+            uint64_t v = 0u, y = 0u;
+            for (int i = 0; i < kRounds; ++i)
+            {
+                const HookStamp a = hookNow();
+                const HookStamp b = hookNow();
+                v += static_cast<uint32_t>(b.value - a.value);
+                y += static_cast<uint32_t>(b.cycles - a.cycles);
+            }
+            c.value = v / kRounds;
+            c.cycles = y / kRounds;
+            return c;
+        }();
+        return cost;
+    }
+
     std::atomic<bool> g_nativeEnabled{false};
     bool g_rwSkinPaletteNativeMath = true;
     bool g_rwSkinPaletteCompare = false;
@@ -541,6 +640,55 @@ namespace
     // carry in materialTextures). Filled where the texture is decoded, dropped when it is retired.
     // readNativeGlobalMeshState uses it to tell cut-out textures (alpha 0 texels) from solid ones.
     std::unordered_map<std::string, uint8_t> g_textureMinAlpha;
+    // P3FES_CUT_SOLID=0 restores the plain g_textureMinAlpha lookup (one string hash per textured material per
+    // draw). The cut keeps the answer in a direct-mapped cache keyed by the name's bytes; every change of
+    // g_textureMinAlpha bumps g_minAlphaVersion, which invalidates all entries.
+    uint32_t g_minAlphaVersion = 1u;
+    struct MinAlphaSlot
+    {
+        uint64_t key0 = 0u, key1 = 0u;
+        uint32_t version = 0u;
+        uint8_t state = 0u; // 0 name unknown (not decoded), 1 has alpha-0 texels, 2 solid
+    };
+    MinAlphaSlot g_minAlphaCache[128];
+    bool cutSolidEnabled()
+    {
+        static const bool on = [] { const char *v = std::getenv("P3FES_CUT_SOLID"); return !v || *v != '0'; }();
+        return on;
+    }
+    // 0 unknown, 1 cut-out, 2 solid; same answer as g_textureMinAlpha.find(name).
+    inline uint8_t textureAlphaClass(const std::string &name)
+    {
+        const auto lookup = [&]() -> uint8_t {
+            const auto found = g_textureMinAlpha.find(name);
+            return found == g_textureMinAlpha.end() ? 0u : (found->second == 0u ? 1u : 2u);
+        };
+        if (name.size() > 15u || !cutSolidEnabled() || !g_cutsOn)
+            return lookup();
+        // A string of up to 15 chars owns at least 16 readable bytes (inline buffer, or a heap block whose
+        // capacity exceeds 15), so two fixed 8-byte loads are safe; mask off what is past the end.
+        const size_t size = name.size();
+        uint64_t key0 = 0u, key1 = 0u;
+        std::memcpy(&key0, name.data(), 8);
+        std::memcpy(&key1, name.data() + 8, 8);
+        if (size < 8)
+        {
+            key0 &= (1ull << (8 * size)) - 1;
+            key1 = 0u;
+        }
+        else
+            key1 &= size == 8 ? 0ull : (1ull << (8 * (size - 8))) - 1;
+        MinAlphaSlot &slot = g_minAlphaCache[((key0 * 0x9E3779B97F4A7C15ull) ^ (key1 * 0xC2B2AE3D27D4EB4Full)) >> 57];
+        if (slot.version == g_minAlphaVersion && slot.key0 == key0 && slot.key1 == key1)
+        {
+            if (cutVerifyEnabled())
+                noteVerify(lookup() == slot.state, "solid", static_cast<uint32_t>(key0));
+            return slot.state;
+        }
+        const uint8_t state = lookup();
+        slot = {key0, key1, g_minAlphaVersion, state};
+        return state;
+    }
     // Direct-mapped front for prepareNativeRasterTexture's steady state (one lookup per material per
     // draw otherwise): raster -> its resource's texture name, valid while the raster lifecycle epoch is
     // unchanged (every version change or retire bumps it). Points at a g_nativeRasterResources node.
@@ -607,6 +755,7 @@ namespace
             !guestPointer(materialArray, static_cast<uint32_t>(materialCount) * sizeof(uint32_t)))
             return;
         const size_t count = static_cast<size_t>(materialCount);
+        g_hookCounts.materials += count;
         state.materialColors.assign(count, {255u, 255u, 255u, 255u});
         state.materialSamplers.resize(count);
         state.materialTextures.resize(count);
@@ -625,12 +774,14 @@ namespace
             {
                 readTextureSampler(rdram, texture, state.materialSamplers[static_cast<size_t>(i)]);
                 uint32_t raster = 0u;
+                ++g_hookCounts.texturedMaterials;
                 if (readGuest(rdram, texture + kTextureRasterOffset, raster))
                     prepareNativeRasterTexture(rdram, raster, state.materialTextures[static_cast<size_t>(i)]);
             }
             uint32_t extension = 0u, effect = 0u;
             if (!readMaterialMatFx(rdram, material, extension, effect))
                 continue;
+            ++g_hookCounts.extraPasses;
             if (effect == kMatFxUvTransform || effect == kMatFxDualUvTransform)
             {
                 MeshDrawState::UvTransform uv;
@@ -669,8 +820,7 @@ namespace
         {
             if (name.empty())
                 continue;
-            const auto found = g_textureMinAlpha.find(name);
-            if (found == g_textureMinAlpha.end() || found->second == 0u)
+            if (textureAlphaClass(name) != 2u)
                 return false;
             any = true;
         }
@@ -849,7 +999,9 @@ namespace
         uint32_t updateNode = 0u;
         if (readGuest(rdram, frame + 0xA0u, updateNode) && guestPointer(updateNode, 4u))
             syncRequested = (rdram[updateNode + 3u] & 1u) != 0u;
-        if (!syncRequested || !ctx || !runtime)
+        // P3FES_DIAG_NOSYNC=1 (measurement only, wrong matrices): never run the guest frame sync, to see what it costs.
+        static const bool diagNoSync = [] { const char *v = std::getenv("P3FES_DIAG_NOSYNC"); return v && *v == '1'; }();
+        if (!syncRequested || !ctx || !runtime || diagNoSync)
         {
             after = before;
             return true;
@@ -864,8 +1016,14 @@ namespace
 
         // The game helper may checkpoint inside _rwFrameSyncDirty. Resume its
         // saved guest PC to the private return sentinel before using the LTM.
+        const uint64_t syncStart = hookTimeEnabled() ? hookNowNs() : 0u;
         const auto sync = p3fes_guest_math_helper::run(rdram, *ctx, *runtime,
                                                        kRwFrameGetLtm, frame);
+        if (syncStart)
+        {
+            g_hookTimes.syncNs += hookTimeMode() == 2 ? static_cast<uint32_t>(hookNowNs() - syncStart) : hookNowNs() - syncStart;
+            ++g_hookTimes.syncCalls;
+        }
         if (!sync.completed)
             return false;
         const uint32_t matrix = sync.value;
@@ -2430,9 +2588,14 @@ namespace
         {
             bool valid = false;
             bool ok = false;
+            bool submitted = false;      // setCamera(camera) was called and nothing recorded since changed the camera
+            uint64_t presentEpoch = 0u;  // p3fes_native_present::cameraEpoch() right after that call
             uint32_t words[kKeyWords]{};
             Camera camera;
         };
+        // P3FES_CUT_CAMERA=0: compare with memcmp and call setCamera for every draw (the previous behaviour).
+        static const bool cutCameraEnv = [] { const char *v = std::getenv("P3FES_CUT_CAMERA"); return !v || *v != '0'; }();
+        const bool cutCamera = cutCameraEnv && g_cutsOn;
         static CameraCache cache;
         uint32_t cameraAddress = 0u, frame = 0u;
         if (!readGuest(rdram, kRwCurrentCamera, cameraAddress) ||
@@ -2459,20 +2622,79 @@ namespace
         std::memcpy(&words[18], camera + kCameraViewOffsetYOffset, 4u);
         std::memcpy(&words[19], camera + kCameraNearPlaneOffset, 4u);
         std::memcpy(&words[20], camera + kCameraFarPlaneOffset, 4u);
-        if (!cache.valid || std::memcmp(cache.words, words, sizeof(words)) != 0)
+        bool same = cache.valid;
+        if (same)
+        {
+            if (cutCamera)
+            {
+                // 32-bit compares: newlib's memcmp on the Vita is a byte loop for this size.
+                for (size_t i = 0u; i < kKeyWords; ++i)
+                    if (cache.words[i] != words[i])
+                    {
+                        same = false;
+                        break;
+                    }
+            }
+            else
+                same = std::memcmp(cache.words, words, sizeof(words)) == 0;
+        }
+        if (!same)
         {
             cache.camera = Camera{};
             cache.ok = readCurrentCamera(rdram, cache.camera);
             std::memcpy(cache.words, words, sizeof(words));
             cache.valid = true;
+            cache.submitted = false;
         }
         if (cache.ok)
+        {
+            // Same camera as the last call and nothing that records a camera has run since: setCamera would find it
+            // already recorded and return, so the call (a 170-byte compare) is skipped.
+            if (cutCamera && cache.submitted && cache.presentEpoch == p3fes_native_present::cameraEpoch())
+            {
+                if (cutVerifyEnabled())
+                    noteVerify(p3fes_native_present::setCameraWouldBeNoop(cache.camera), "camera", static_cast<uint32_t>(cache.presentEpoch));
+                return;
+            }
             p3fes_native_present::setCamera(cache.camera);
+            cache.submitted = true;
+            cache.presentEpoch = p3fes_native_present::cameraEpoch();
+        }
+    }
+
+    // P3FES_DIAG_SKIP=N (measurement only, the picture is wrong): drawNativeAtomic returns early at stage N to
+    // measure what each stage costs on the game thread (PMU instructions per frame). 1 start, 2 after the summary,
+    // frame/camera and mesh lookup, 3 after the model matrix (and its guest sync), 4 after the material and global
+    // GS state are read, 5 after lighting and the skin palette (everything but the hand-off); unset: full.
+    int diagSkipStage()
+    {
+        static const int stage = [] { const char *v = std::getenv("P3FES_DIAG_SKIP"); return v && *v >= '1' && *v <= '5' ? *v - '0' : 9; }();
+        return stage;
     }
 
     bool drawNativeAtomic(uint8_t *rdram, uint32_t atomic, R5900Context *ctx, PS2Runtime *runtime,
                           const MeshDrawState::BlendState *blendOverride = nullptr)
     {
+        const int skipStage = diagSkipStage();
+        ++g_hookCounts.atomics;
+        const bool timed = hookTimeEnabled();
+        HookStamp stampLast = timed ? hookNow() : HookStamp{};
+        const auto stamp = [&](int stage) {
+            if (!timed) return;
+            const HookStamp now = hookNow();
+            const HookStampCost cost = hookStampCost();
+            if (hookTimeMode() == 2)
+            {
+                g_hookTimes.ns[stage] += static_cast<uint32_t>(now.value - stampLast.value) - cost.value;
+                g_hookTimes.cyc[stage] += static_cast<uint32_t>(now.cycles - stampLast.cycles) - cost.cycles;
+            }
+            else
+                g_hookTimes.ns[stage] += now.value - stampLast.value - cost.value;
+            stampLast = hookNow();
+        };
+        g_hookTimes.calls += timed;
+        if (skipStage <= 1)
+            return true;
         // Diagnostics are fixed at start-up: one load here instead of one per block below.
         if (g_gsColorMasked)
         {
@@ -2483,9 +2705,12 @@ namespace
         AtomicSummary summary;
         if (!inspectAtomic(rdram, atomic, summary) || (summary.flags & kAtomicRenderFlag) == 0u)
             return false;
+        stamp(0);
         if (!ensureNativeFrame(rdram))
             return false;
+        stamp(1);
         captureNativeDrawCamera(rdram);
+        stamp(2);
 
         if (diag &&
             g_loggedAtomicCameras.size() < 16u && g_loggedAtomicCameras.insert(atomic).second)
@@ -2636,11 +2861,14 @@ namespace
                 definedMesh->contentHash = geometryContentHash(rdram, summary.vertexData, summary.prelitData, summary.vertices);
         }
         definedSlot = {meshId, definedMesh};
+        if (skipStage == 2)
+            return true;
         // Geometry the game rewrites in place after it was defined: rebuilt from guest memory at every draw.
         MeshData dynamicMesh;
         bool drawDynamic = false;
         if (definedMesh->contentHash != 0u)
         {
+            ++g_hookCounts.hashChecks;
             const uint64_t hashStart = ps2xFrameHistNowUs();
             if (!definedMesh->dynamic &&
                 geometryContentHash(rdram, summary.vertexData, summary.prelitData, summary.vertices) != definedMesh->contentHash)
@@ -2680,11 +2908,15 @@ namespace
             }
         }
 
+        stamp(3);
         Matrix4 model{};
         Matrix4 rawModel{};
         bool frameSyncRequested = false;
         if (!readFrameMatrixAfterSync(rdram, summary.frame, ctx, runtime, rawModel, model, frameSyncRequested))
             return false;
+        stamp(4);
+        g_hookCounts.frameSyncs += frameSyncRequested;
+        g_hookCounts.dynamicDraws += drawDynamic;
         if (diag)
         {
             const auto sample = g_skinDiagnosticSamples.find(meshId);
@@ -2725,9 +2957,55 @@ namespace
                 }
             }
         }
-        MeshDrawState drawState = p3fes_native_present::acquireDrawState();
+        if (skipStage == 3)
+            return true;
+        // P3FES_CUT_HANDOFF=0: acquire the state by value and move it through drawMesh (three moves per draw).
+        static const bool cutHandoffEnabled = [] { const char *v = std::getenv("P3FES_CUT_HANDOFF"); return !v || *v != '0'; }();
+        // One loan of the stock's state at a time: a draw that starts while another one is filling (guest code run by
+        // the frame sync re-entering the render callback) takes the by-value path.
+        static bool stateLoanOpen = false;
+        const bool cutHandoff = cutHandoffEnabled && g_cutsOn && !stateLoanOpen;
+        static MeshDrawState legacyState; // by-value path; only used when the cut is off (not re-entrant, copied below)
+        std::unique_ptr<MeshDrawState> nestedState; // re-entrant by-value draw (rare)
+        if (!cutHandoff)
+        {
+            if (cutHandoffEnabled && g_cutsOn)
+                nestedState = std::make_unique<MeshDrawState>(p3fes_native_present::acquireDrawState());
+            else
+                legacyState = p3fes_native_present::acquireDrawState();
+        }
+        else
+            stateLoanOpen = true;
+        // Gives the loan back if this function is left abnormally (an exception unwinding through the hook).
+        struct LoanGuard
+        {
+            bool &open;
+            ~LoanGuard()
+            {
+                if (open)
+                {
+                    p3fes_native_present::dropStockDrawState();
+                    open = false;
+                }
+            }
+        } loanGuard{cutHandoff ? stateLoanOpen : g_noLoan};
+        MeshDrawState &drawState = cutHandoff ? p3fes_native_present::stockDrawState()
+                                              : (nestedState ? *nestedState : legacyState);
+        g_hookCounts.freshStates += drawState.materialColors.capacity() == 0u;
+        stamp(5);
         readNativeMeshDrawState(rdram, summary.geometry, drawState);
+        stamp(6);
         readNativeGlobalMeshState(rdram, drawState);
+        stamp(7);
+        if (skipStage == 4)
+        {
+            if (cutHandoff)
+            {
+                p3fes_native_present::dropStockDrawState();
+                stateLoanOpen = false;
+            }
+            return true;
+        }
         if (blendOverride && blendOverride->enabled)
         {
             drawState.blendEnabled = true;
@@ -2735,13 +3013,18 @@ namespace
             drawState.materialBlends.assign(materialCount, *blendOverride);
         }
         if ((summary.geometryFlags & kGeometryLightingFlag) != 0u)
+        {
+            ++g_hookCounts.lit;
             readNativeLighting(rdram, false, atomic, drawState);
+        }
+        stamp(8);
         if (!prepareNativeSkinPalette(rdram, atomic, summary.geometry, ctx, runtime, drawState, definedMesh))
         {
             if (g_nativeErrors++ < 8u)
                 std::fprintf(stderr, "[p3fes-native] skin palette failed for atomic 0x%08X geometry 0x%08X\n",
                              atomic, summary.geometry);
         }
+        stamp(9);
         if (diag)
         {
             auto found = g_skinDiagnosticSamples.find(meshId);
@@ -2862,10 +3145,32 @@ namespace
                 }
             }
         }
+        if (skipStage == 5)
+        {
+            if (cutHandoff)
+            {
+                p3fes_native_present::dropStockDrawState();
+                stateLoanOpen = false;
+            }
+            return true;
+        }
         if (drawDynamic)
+        {
             p3fes_native_present::drawTransientMesh(std::move(dynamicMesh), model, std::move(drawState));
+            if (cutHandoff)
+            {
+                p3fes_native_present::dropStockDrawState();
+                stateLoanOpen = false;
+            }
+        }
+        else if (cutHandoff)
+        {
+            p3fes_native_present::drawMeshFromStock(meshId, model);
+            stateLoanOpen = false;
+        }
         else
             p3fes_native_present::drawMesh(meshId, model, std::move(drawState));
+        stamp(10);
         return true;
     }
 
@@ -3475,6 +3780,7 @@ namespace
             return;
         p3fes_native_present::retireTexture(found->second.textureName);
         g_textureMinAlpha.erase(found->second.textureName);
+        ++g_minAlphaVersion;
         g_nativeRasterResources.erase(found);
     }
 
@@ -3483,11 +3789,13 @@ namespace
         if (!raster) return false;
         const uint64_t lifecycleEpoch = p3fes_native_rasters::epoch();
         RasterNameCacheSlot &cached = g_rasterNameCache[(raster >> 4u) & 127u];
+        ++g_hookCounts.texLookups;
         if (cached.raster == raster && cached.epoch == lifecycleEpoch && cached.name)
         {
             textureName = *cached.name;
             return true;
         }
+        ++g_hookCounts.texSlowLookups;
         // An empty texture name means "untextured, vertex colour only", which
         // would paint solid blobs where the GS-resident shadow map should be
         // sampled. Bind a fully transparent 1x1 texture instead.
@@ -3539,6 +3847,7 @@ namespace
         {
             p3fes_native_present::retireTexture(found->second.textureName);
             g_textureMinAlpha.erase(found->second.textureName);
+            ++g_minAlphaVersion;
         }
         // Short, so the name fits the std::string small buffer (15 chars on libstdc++): every draw
         // copies these names and a heap allocation per copy is costly on the Vita's CPU. The raster
@@ -3577,6 +3886,7 @@ namespace
             for (size_t i = 3u; i < texture.rgba.size() && lowest != 0u; i += 4u)
                 lowest = std::min(lowest, texture.rgba[i]);
             g_textureMinAlpha[textureName] = lowest;
+            ++g_minAlphaVersion;
         }
         p3fes_native_present::defineTexture(texture, version.revision);
         NativeRasterResource &resource = g_nativeRasterResources[raster];
@@ -4235,6 +4545,22 @@ namespace
     {
         if (!g_nativeFrameActive)
             return;
+        {
+            static const int alternate = [] { const char *v = std::getenv("P3FES_CUT_ALTERNATE"); return v ? std::atoi(v) : 0; }();
+            if (alternate > 0)
+            {
+                static const auto start = std::chrono::steady_clock::now();
+                const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+                const bool on = ((seconds / alternate) & 1) == 0;
+                if (on != g_cutsOn)
+                {
+                    g_cutsOn = on;
+                    p3fes_native_present::setCutsEnabled(on);
+                    std::fprintf(stderr, "[p3fes-altcuts] %s at frame %llu (%llds after the first frame)\n", on ? "on" : "off",
+                                 static_cast<unsigned long long>(g_nativeFrameNumber), static_cast<long long>(seconds));
+                }
+            }
+        }
         if (!g_frameHasDisplayContent && cameraTexturesEnabled())
         {
             closeCameraTexture();
@@ -4257,6 +4583,50 @@ namespace
             {
                 previous = now;
                 const uint64_t fields = runtime ? runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
+                {
+                    static uint64_t lastFrames = 0u;
+                    const uint64_t frames = std::max<uint64_t>(g_nativeFrameNumber - lastFrames, 1u);
+                    lastFrames = g_nativeFrameNumber;
+                    const HookCounts &h = g_hookCounts;
+                    std::fprintf(stderr,
+                        "[p3fes-hookcount] cuts=%d per frame: atomics=%.1f hash=%.1f dyn=%.1f sync=%.1f lit=%.1f mats=%.1f tex=%.1f extra=%.1f lookups=%.1f slow=%.1f "
+                        "fresh=%.1f ptank=%.1f/%.1f quads cache=%llu/%llu verify=%llu bad=%llu\n",
+                        g_cutsOn ? 1 : 0, double(h.atomics) / frames, double(h.hashChecks) / frames, double(h.dynamicDraws) / frames,
+                        double(h.frameSyncs) / frames, double(h.lit) / frames, double(h.materials) / frames,
+                        double(h.texturedMaterials) / frames, double(h.extraPasses) / frames, double(h.texLookups) / frames,
+                        double(h.texSlowLookups) / frames, double(h.freshStates) / frames, double(h.ptankDraws) / frames, double(h.ptankQuads) / frames, static_cast<unsigned long long>(h.cacheHits),
+                        static_cast<unsigned long long>(h.cacheMisses), static_cast<unsigned long long>(h.verifyChecks),
+                        static_cast<unsigned long long>(h.verifyMismatches));
+                    g_hookCounts = {};
+                    reportProfFuncs(frames);
+                    if (g_hookTimes.calls)
+                    {
+                        static const char *names[HookStageTimes::kStages] = {"inspect", "ensure", "camera", "mesh", "matrix", "acquire", "materials", "gsstate", "lighting", "skin", "handoff"};
+                        const bool pmu = hookTimeMode() == 2;
+                        char line[640];
+                        int n = std::snprintf(line, sizeof(line), "[p3fes-hooktime] %s/atomic:", pmu ? "instr" : "ns");
+                        uint64_t total = 0u, totalCycles = 0u;
+                        for (int i = 0; i < HookStageTimes::kStages; ++i)
+                        {
+                            n += std::snprintf(line + n, sizeof(line) - n, " %s=%.0f", names[i], double(g_hookTimes.ns[i]) / g_hookTimes.calls);
+                            total += g_hookTimes.ns[i];
+                            totalCycles += g_hookTimes.cyc[i];
+                        }
+                        n += std::snprintf(line + n, sizeof(line) - n, " total=%.0f atomics/frame=%.1f\n", double(total) / g_hookTimes.calls,
+                                           double(g_hookTimes.calls) / frames);
+                        std::fputs(line, stderr);
+                        if (pmu)
+                        {
+                            n = std::snprintf(line, sizeof(line), "[p3fes-hooktime] cyc/atomic:");
+                            for (int i = 0; i < HookStageTimes::kStages; ++i)
+                                n += std::snprintf(line + n, sizeof(line) - n, " %s=%.0f", names[i], double(g_hookTimes.cyc[i]) / g_hookTimes.calls);
+                            n += std::snprintf(line + n, sizeof(line) - n, " total=%.0f stamp-cost=%llu instr %llu cyc\n", double(totalCycles) / g_hookTimes.calls,
+                                               static_cast<unsigned long long>(hookStampCost().value), static_cast<unsigned long long>(hookStampCost().cycles));
+                            std::fputs(line, stderr);
+                        }
+                        g_hookTimes = {};
+                    }
+                }
                 std::fprintf(stderr, "[p3fes-textures] prepared=%llu live=%u fields=%llu\n",
                              static_cast<unsigned long long>(g_texturePrepares), static_cast<unsigned>(g_nativeRasterResources.size()),
                              static_cast<unsigned long long>(fields));
@@ -4420,9 +4790,15 @@ namespace
         drawState.cullMode = MeshDrawState::CullMode::None;
         drawState.materialColors.assign(1u, {255u, 255u, 255u, 255u});
 
+        // P3FES_CUT_PTANK=0: the original per-particle loop (trig for every particle, indices inserted one quad at a time).
+        static const bool cutPtankEnv = [] { const char *v = std::getenv("P3FES_CUT_PTANK"); return !v || *v != '0'; }();
+        const bool cutPtank = cutPtankEnv && g_cutsOn;
         MeshData mesh;
         mesh.vertices.resize(static_cast<std::size_t>(count) * 4u);
-        mesh.indices.reserve(static_cast<std::size_t>(count) * 6u);
+        if (cutPtank)
+            mesh.indices.resize(static_cast<std::size_t>(count) * 6u);
+        else
+            mesh.indices.reserve(static_cast<std::size_t>(count) * 6u);
         mesh.hasPrelight = true;
         mesh.materials.resize(1u);
         if (!drawState.materialTextures.empty())
@@ -4447,7 +4823,11 @@ namespace
             if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) || !std::isfinite(size[0]) ||
                 !std::isfinite(size[1]) || !std::isfinite(angle))
                 continue;
-            const float c = std::cos(angle), sn = std::sin(angle);
+            // angle == 0 (no rotation column, or an unrotated particle): cos = 1 and sin = 0 exactly, no trig call.
+            const bool unrotated = cutPtank && angle == 0.0f;
+            const float c = unrotated ? 1.0f : std::cos(angle), sn = unrotated ? 0.0f : std::sin(angle);
+            if (unrotated && cutVerifyEnabled())
+                noteVerify(c == std::cos(angle) && sn == std::sin(angle), "ptank-trig", i);
             const float hw = 0.5f * size[0], hh = 0.5f * size[1];
             std::array<float, 3> axisR, axisU, centre;
             for (int k = 0; k < 3; ++k)
@@ -4465,7 +4845,14 @@ namespace
                 v.texCoord = {cornerU[corner], cornerV[corner]};
                 v.color = rgba;
             }
-            mesh.indices.insert(mesh.indices.end(), {base, base + 1u, base + 2u, base, base + 2u, base + 3u});
+            if (cutPtank)
+            {
+                uint32_t *index = mesh.indices.data() + static_cast<std::size_t>(quads) * 6u;
+                index[0] = base; index[1] = base + 1u; index[2] = base + 2u;
+                index[3] = base; index[4] = base + 2u; index[5] = base + 3u;
+            }
+            else
+                mesh.indices.insert(mesh.indices.end(), {base, base + 1u, base + 2u, base, base + 2u, base + 3u});
             ++quads;
         }
         {
@@ -4490,9 +4877,13 @@ namespace
                              c0[0], c0[1], c0[2], c0[3], uv[0], uv[1], uv[2], uv[3]);
             }
         }
+        ++g_hookCounts.ptankDraws;
+        g_hookCounts.ptankQuads += quads;
         if (quads == 0u)
             return true; // nothing live: the original draws nothing either
         mesh.vertices.resize(static_cast<std::size_t>(quads) * 4u);
+        if (cutPtank)
+            mesh.indices.resize(static_cast<std::size_t>(quads) * 6u);
         mesh.submeshes.push_back(Submesh{0u, static_cast<uint32_t>(mesh.indices.size()), 0u});
         p3fes_native_present::drawTransientMesh(std::move(mesh), p3fes::native_renderer::kIdentityMatrix, std::move(drawState));
         return true;
@@ -4920,6 +5311,72 @@ namespace
             original(rdram, ctx, runtime);
     }
 
+    // P3FES_PROF_FUNCS=0xADDR,0xADDR,... (measurement only): wraps guest functions with a timer and a call counter and
+    // prints, with the resource diagnostics, calls and inclusive milliseconds per game frame. Resume entries (a function
+    // re-entered at a label after a blocking call) are forwarded untimed. Up to 8 functions.
+    constexpr int kProfSlots = 8;
+    struct ProfSlot
+    {
+        uint32_t address = 0u;
+        PS2Runtime::RecompiledFunction original = nullptr;
+        uint64_t calls = 0u, ns = 0u;
+    };
+    ProfSlot g_profSlots[kProfSlots];
+    int g_profCount = 0;
+    template <int N>
+    void profWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ProfSlot &slot = g_profSlots[N];
+        if (ctx->pc != slot.address)
+        {
+            slot.original(rdram, ctx, runtime);
+            return;
+        }
+        const uint64_t start = hookNowNs();
+        slot.original(rdram, ctx, runtime);
+        slot.ns += hookNowNs() - start;
+        ++slot.calls;
+    }
+    using ProfFn = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
+    constexpr ProfFn kProfWrappers[kProfSlots] = {&profWrapper<0>, &profWrapper<1>, &profWrapper<2>, &profWrapper<3>,
+                                                  &profWrapper<4>, &profWrapper<5>, &profWrapper<6>, &profWrapper<7>};
+    void installProfFuncs(PS2Runtime &runtime)
+    {
+        const char *list = std::getenv("P3FES_PROF_FUNCS");
+        if (!list || !*list)
+            return;
+        while (*list && g_profCount < kProfSlots)
+        {
+            char *end = nullptr;
+            const uint32_t address = static_cast<uint32_t>(std::strtoul(list, &end, 16));
+            if (end == list)
+                break;
+            list = *end == ',' ? end + 1 : end;
+            PS2Runtime::RecompiledFunction original = runtime.lookupFunction(address);
+            if (!original)
+                continue;
+            ProfSlot &slot = g_profSlots[g_profCount];
+            slot.address = address;
+            slot.original = original;
+            if (runtime.replaceFunction(address, kProfWrappers[g_profCount]))
+                std::fprintf(stderr, "[p3fes-prof] timing %08X\n", address);
+            ++g_profCount;
+        }
+    }
+    void reportProfFuncs(uint64_t frames)
+    {
+        if (!g_profCount)
+            return;
+        std::fprintf(stderr, "[p3fes-prof] per game frame:");
+        for (int i = 0; i < g_profCount; ++i)
+        {
+            std::fprintf(stderr, " %08X calls=%.1f ms=%.3f", g_profSlots[i].address, double(g_profSlots[i].calls) / frames,
+                         double(g_profSlots[i].ns) / frames / 1e6);
+            g_profSlots[i].calls = g_profSlots[i].ns = 0u;
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     void applyP3fesRenderWare(PS2Runtime &runtime)
     {
         const char *native = std::getenv("P3FES_NATIVE_RW");
@@ -4954,6 +5411,7 @@ namespace
             p3fes_native_rasters::reset();
             g_nativeRasterResources.clear();
             g_textureMinAlpha.clear();
+            ++g_minAlphaVersion;
             for (auto &slot : g_rasterNameCache)
                 slot = {};
             g_texturePrepares = 0u;
@@ -4987,6 +5445,7 @@ namespace
         g_shadowBoundaryTime = {};
         g_nativeIm3D = {};
         g_originalAtomicRender.store(original, std::memory_order_release);
+        installProfFuncs(runtime);
         const bool replaced = runtime.replaceFunction(kRpAtomicRender, &p3fesAtomicDefaultRender);
         if (diagEnabled)
             std::fprintf(stderr, "[p3fes-rw] RpAtomicRender hook %s at 0x%08X\n",

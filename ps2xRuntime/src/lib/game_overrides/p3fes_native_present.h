@@ -27,8 +27,25 @@ void setHostPresentationPaused(bool paused);
 // A default-initialised draw state that may reuse storage returned by the presentation thread.
 // Producer thread only; falls back to a fresh state when nothing is available.
 nr::MeshDrawState acquireDrawState();
+// In-place variant of acquireDrawState + drawMesh (P3FES_CUT_HANDOFF): stockDrawState() returns a clean state that
+// the caller fills where it lies (the back of the stock, or a scratch state when the stock is empty), and
+// drawMeshFromStock() then moves it into the frame once. Instead of drawMeshFromStock, a caller that moved the state
+// elsewhere (a transient draw) or abandons it calls dropStockDrawState(). Exactly one of the three must follow each
+// stockDrawState(); nothing else may record draws or take states in between.
+nr::MeshDrawState &stockDrawState();
+void drawMeshFromStock(nr::MeshId id, const nr::Matrix4 &model);
+void dropStockDrawState();
 void beginFrame(const nr::Camera &camera, nr::ClearColor clear = {});
 void setCamera(const nr::Camera &camera);
+// Producer side: bumped whenever the camera recorded in the frame under construction can have changed (frame begin
+// and end, a recorded setCamera, a render-target bracket, a producer reset). While it is unchanged, calling setCamera
+// again with the camera passed last time records nothing, so the caller can skip the call.
+uint64_t cameraEpoch();
+// Measurement only (P3FES_CUT_ALTERNATE in p3fes_renderware.cpp): turns the producer-side cuts of this file off and
+// back on at run time, so one run can compare both settings in the same scene.
+void setCutsEnabled(bool enabled);
+// Verification of that statement: true when setCamera(camera) would record nothing right now.
+bool setCameraWouldBeNoop(const nr::Camera &camera);
 void clear(nr::ClearColor clear, bool colorBuffer, bool depthBuffer);
 // Render-to-texture bracket inside the frame being recorded: world draws, setCamera and clear up to
 // endTextureTarget go to a width x height target that any draw of the same frame can sample under

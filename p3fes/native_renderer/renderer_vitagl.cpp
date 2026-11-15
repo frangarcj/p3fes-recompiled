@@ -2277,10 +2277,20 @@ private:
         lap(2);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
+        // Wide placement: the source area keeps its centred 4:3 position and scale, the rest of the framebuffer
+        // shows the source plane beyond x = 0 / x = sourceWidth.
+        float orthoLeft = 0.0f, orthoRight = sourceWidth;
+        if (!m_target && m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Wide)
+        {
+            const float span = static_cast<float>(viewport.width) * sourceWidth /
+                               static_cast<float>(std::max(fitViewport(sourceWidth, sourceHeight).width, 1));
+            orthoLeft = (sourceWidth - span) * 0.5f;
+            orthoRight = orthoLeft + span;
+        }
         if (m_target && targetFlipEnabled())
             glOrthof(0.0f, sourceWidth, 0.0f, sourceHeight, -1.0f, 0.0f);
         else
-            glOrthof(0.0f, sourceWidth, sourceHeight, 0.0f, -1.0f, 0.0f);
+            glOrthof(orthoLeft, orthoRight, sourceHeight, 0.0f, -1.0f, 0.0f);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
         // The GS passes a GEQUAL depth test on exactly equal Z, and the game relies on it: HUD text
@@ -2485,7 +2495,7 @@ private:
 template <typename Viewport, typename Fit>
     Viewport screenViewport(float sourceWidth, float sourceHeight, Viewport full, Fit fit) const
     {
-        if (m_widescreen == 1 || (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Stretch))
+        if (m_widescreen == 1 || (m_widescreen == 2 && (m_screenPlacement == ScreenPlacement::Stretch || m_screenPlacement == ScreenPlacement::Wide)))
             return full;
         Viewport viewport = fit(sourceWidth, sourceHeight);
         if (m_widescreen == 2 && m_screenPlacement == ScreenPlacement::Left)

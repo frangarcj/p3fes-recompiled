@@ -20,6 +20,8 @@
 #include <optional>
 #include <string_view>
 #include <cstring>
+#include <cmath>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -161,6 +163,7 @@ bool g_buildingOpen = false;
 bool g_targetOpen = false;
 bool g_forceCameraRecord = false;
 Camera g_cameraBeforeTarget{};
+uint64_t g_cameraEpoch = 1; // see cameraEpoch()
 float g_targetWidth = 0.0f, g_targetHeight = 0.0f;
 uint64_t g_sequence = 0;
 uint32_t g_producerEpoch = 0;
@@ -181,6 +184,11 @@ void clearNameCache()
     for (NameCacheSlot &slot : g_nameCache) slot = {};
 }
 std::vector<MeshDrawState> g_stateStock;
+// stockDrawState() bookkeeping: the state handed out is the back of g_stateStock (g_stockLent) or g_lentScratch.
+// A producer reset that arrives while the stock's back is lent clears the stock when the loan ends.
+MeshDrawState g_lentScratch;
+bool g_stockLent = false;
+bool g_stockClearPending = false;
 // Direct-mapped MeshId -> material count of its definition, so a draw does not walk g_meshDefinitions
 // (hash, bucket, node, vector header: four dependent loads) just to learn there is nothing to retain.
 // Definitions are never replaced or erased while the producer state lives; syncProducer clears it.
@@ -395,10 +403,11 @@ void syncProducer()
     g_building = {};
     g_buildingOpen = false;
     g_targetOpen = g_forceCameraRecord = false;
+    ++g_cameraEpoch;
     clearNameCache();
     g_textureDefinitions.clear();
     g_retiredEntryNames.clear();
-    g_stateStock.clear();
+    if (g_stockLent) g_stockClearPending = true; else g_stateStock.clear();
     for (MaterialCountSlot &slot : g_materialCountCache) slot = {};
     g_textureDefinitionCount.store(0, std::memory_order_relaxed);
     // The tables are emptied under the lock but destroyed after it (freeing the meshes takes a while).
@@ -411,6 +420,16 @@ void syncProducer()
         oldRetired.swap(g_retiredTextures);
         oldPool.swap(g_statePool);
     }
+}
+
+// P3FES_CUT_STATEPOOL=0: only MeshDraw states go back to the producer's pool (the previous behaviour). By default the
+// states of transient meshes (particle tanks, dynamic geometry) are recycled too: without it every such draw built
+// a fresh state, 5 vector allocations each.
+static bool g_cutsEnabled = true; // setCutsEnabled(); producer thread only
+bool recycleTransientStates()
+{
+    static const bool on = [] { const char *v = std::getenv("P3FES_CUT_STATEPOOL"); return !v || *v != '0'; }();
+    return on && g_cutsEnabled;
 }
 
 // Resets a drawn state for reuse while keeping its vectors' storage.
@@ -603,13 +622,15 @@ std::string capturePath()
     return path;
 }
 
-void dumpFrame(const Frame &frame)
+void dumpFrame(const Frame &frame, const std::function<std::string(const ScreenDraw &, size_t)> &placementOf)
 {
     std::fprintf(stderr, "[p3fes-frame] t=%d sequence=%llu draws=%u targets=%d\n", g_diagLabel,
                  static_cast<unsigned long long>(frame.sequence), static_cast<unsigned>(frame.draws.size()), frame.hasTargets ? 1 : 0);
     uint32_t index = 0;
+    size_t slot = static_cast<size_t>(-1);
     for (const Draw &draw : frame.draws)
     {
+        ++slot;
         if (const auto *screen = std::get_if<ScreenDraw>(&draw))
         {
             float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
@@ -632,13 +653,14 @@ void dumpFrame(const Frame &frame)
             const auto &c = screen->vertices.empty() ? std::array<std::uint8_t, 4>{} : screen->vertices[0].color;
             std::fprintf(stderr,
                 "[p3fes-frame] %u screen%s n=%u src=%gx%g xy=%.1f,%.1f..%.1f,%.1f z=%.5f..%.5f uv=%.4f,%.4f..%.4f,%.4f "
-                "tex=%s %ux%u blend=%u depth=%d/%d/%u atest=%d/%u/%u afail=%u clamp=%d%d linear=%d fog=%d rgba=%u,%u,%u,%u\n",
+                "tex=%s %ux%u blend=%u depth=%d/%d/%u atest=%d/%u/%u afail=%u clamp=%d%d linear=%d fog=%d rgba=%u,%u,%u,%u place=%s\n",
                 index, screen->lines ? "-lines" : "", static_cast<unsigned>(screen->vertices.size()), screen->sourceWidth, screen->sourceHeight,
                 x0, y0, x1, y1, z0, z1, u0, v0, u1, v1, screen->textureName.c_str(), tw, th,
                 static_cast<unsigned>(s.blend), s.depthTest ? 1 : 0, s.depthWrite ? 1 : 0,
                 static_cast<unsigned>(s.depthFunction), s.alphaTest.enabled ? 1 : 0, s.alphaTest.function,
                 s.alphaTest.reference, static_cast<unsigned>(s.alphaFailAction), s.clampU ? 1 : 0, s.clampV ? 1 : 0,
-                s.linearFilter ? 1 : 0, s.fog.enabled ? 1 : 0, c[0], c[1], c[2], c[3]);
+                s.linearFilter ? 1 : 0, s.fog.enabled ? 1 : 0, c[0], c[1], c[2], c[3],
+                (placementOf ? placementOf(*screen, slot) : std::string()).c_str());
         }
         else if (const auto *target = std::get_if<TargetDraw>(&draw))
             std::fprintf(stderr, "[p3fes-frame] %u target %s %s %ux%u\n", index, target->begin ? "begin" : "end",
@@ -918,6 +940,43 @@ MeshDrawState acquireDrawState()
     return state;
 }
 
+MeshDrawState &stockDrawState()
+{
+    if (active())
+    {
+        syncProducer();
+        if (!g_stateStock.empty())
+        {
+            g_stockLent = true;
+            return g_stateStock.back();
+        }
+    }
+    g_stockLent = false;
+    return g_lentScratch;
+}
+
+// Ends the loan of stockDrawState(): the state was moved from (or is abandoned).
+static void finishLentState()
+{
+    if (g_stockLent)
+    {
+        g_stateStock.pop_back();
+        g_stockLent = false;
+    }
+    else
+        g_lentScratch = MeshDrawState{};
+    if (g_stockClearPending)
+    {
+        g_stockClearPending = false;
+        g_stateStock.clear();
+    }
+}
+
+void dropStockDrawState()
+{
+    finishLentState();
+}
+
 void beginFrame(const Camera &camera, ClearColor clear)
 {
     if (!active())
@@ -955,6 +1014,7 @@ void beginFrame(const Camera &camera, ClearColor clear)
     g_building.clear = clear;
     g_building.sequence = ++g_sequence;
     g_targetOpen = g_forceCameraRecord = false;
+    ++g_cameraEpoch;
 #if defined(PS2X_P3FES_FRAME_TRACE)
     g_building.trace = p3fes_frame_trace::beginFrame(g_building.sequence);
 #endif
@@ -965,16 +1025,62 @@ void beginFrame(const Camera &camera, ClearColor clear)
 // almost always "same". Bitwise-identical data is equal (barring NaN, where recording one camera
 // draw less changes nothing), so test that with a few block compares and only fall back to the
 // member-wise comparison, which also treats -0.0 and 0.0 as equal, when the bits differ.
+// P3FES_CUT_CAMERA=0 restores the memcmp calls (newlib's memcmp on the Vita compares byte by byte for the odd 41-byte
+// head: ~1000 instructions per call of this function, once per atomic) and the per-draw setCamera call.
+static bool cutCameraEnabled()
+{
+    static const bool on = [] { const char *v = std::getenv("P3FES_CUT_CAMERA"); return !v || *v != '0'; }();
+    return on && g_cutsEnabled;
+}
+// Equal bytes, compared a 32-bit word at a time (no alignment assumed).
+static inline bool bytesEqualWords(const void *x, const void *y, size_t bytes)
+{
+    const unsigned char *a = static_cast<const unsigned char *>(x), *b = static_cast<const unsigned char *>(y);
+    size_t i = 0;
+    for (; i + 4 <= bytes; i += 4)
+    {
+        uint32_t wa, wb;
+        std::memcpy(&wa, a + i, 4);
+        std::memcpy(&wb, b + i, 4);
+        if (wa != wb) return false;
+    }
+    for (; i < bytes; ++i)
+        if (a[i] != b[i]) return false;
+    return true;
+}
 bool sameCamera(const Camera &a, const Camera &b)
 {
     static_assert(offsetof(Camera, view) == offsetof(Camera, useMatrices) + 4u &&
                       offsetof(Camera, projection) == offsetof(Camera, view) + 64u &&
                       sizeof(Camera) == offsetof(Camera, projection) + 64u,
                   "Camera layout assumed by sameCamera");
-    if (std::memcmp(&a, &b, offsetof(Camera, useMatrices) + 1u) == 0 &&
-        std::memcmp(a.view.data(), b.view.data(), 128u) == 0)
+    if (cutCameraEnabled())
+    {
+        if (bytesEqualWords(&a, &b, offsetof(Camera, useMatrices) + 1u) &&
+            bytesEqualWords(a.view.data(), b.view.data(), 128u))
+            return true;
+    }
+    else if (std::memcmp(&a, &b, offsetof(Camera, useMatrices) + 1u) == 0 &&
+             std::memcmp(a.view.data(), b.view.data(), 128u) == 0)
         return true;
     return a == b;
+}
+
+uint64_t cameraEpoch()
+{
+    return g_cameraEpoch;
+}
+
+void setCutsEnabled(bool enabled)
+{
+    g_cutsEnabled = enabled;
+}
+
+bool setCameraWouldBeNoop(const Camera &camera)
+{
+    if (!active())
+        return true;
+    return !g_buildingOpen || (!g_forceCameraRecord && sameCamera(g_building.recordedCamera, camera));
 }
 
 void setCamera(const Camera &camera)
@@ -990,6 +1096,7 @@ void setCamera(const Camera &camera)
 #endif
     g_building.draws.emplace_back(CameraDraw{camera});
     g_building.recordedCamera = camera;
+    ++g_cameraEpoch;
 }
 
 void clear(ClearColor clear, bool colorBuffer, bool depthBuffer)
@@ -1022,6 +1129,7 @@ bool beginTextureTarget(const std::string &name, uint32_t width, uint32_t height
     g_building.hasTargets = true;
     g_cameraBeforeTarget = g_building.recordedCamera;
     g_forceCameraRecord = true;
+    ++g_cameraEpoch;
     g_targetOpen = true;
     return true;
 }
@@ -1041,6 +1149,7 @@ void endTextureTarget()
     // the one recorded before it.
     g_building.recordedCamera = g_cameraBeforeTarget;
     g_forceCameraRecord = false;
+    ++g_cameraEpoch;
     g_targetOpen = false;
 }
 
@@ -1133,6 +1242,38 @@ void drawMesh(MeshId id, const Matrix4 &model, MeshDrawState state)
         // Build in place: avoids materialising a MeshDraw and moving it into the variant.
         g_building.draws.emplace_back(std::in_place_type<MeshDraw>, id, model, std::move(state));
     }
+}
+
+void drawMeshFromStock(MeshId id, const Matrix4 &model)
+{
+    MeshDrawState &state = g_stockLent ? g_stateStock.back() : g_lentScratch;
+    if (active())
+    {
+        syncProducer();
+        if (g_buildingOpen)
+        {
+            // Same recording as drawMesh.
+            MaterialCountSlot &slot = g_materialCountCache[((id * 0x9E3779B97F4A7C15ull) >> 56) & 255u];
+            if (!slot.valid || slot.id != id)
+            {
+                const auto mesh = g_meshDefinitions.find(id);
+                slot = mesh != g_meshDefinitions.end()
+                    ? MaterialCountSlot{id, static_cast<uint32_t>(mesh->second->materials.size()), true}
+                    : MaterialCountSlot{};
+            }
+            if (slot.valid && state.materialTextures.size() < slot.count)
+            {
+                const auto mesh = g_meshDefinitions.find(id);
+                if (mesh != g_meshDefinitions.end()) retainMaterials(*mesh->second, state.materialTextures.size());
+            }
+            retainPasses(state);
+#if defined(PS2X_P3FES_FRAME_TRACE)
+            recordDrawOrigin();
+#endif
+            g_building.draws.emplace_back(std::in_place_type<MeshDraw>, id, model, std::move(state));
+        }
+    }
+    finishLentState();
 }
 
 void drawTransientMesh(MeshData mesh, const Matrix4 &model, MeshDrawState state)
@@ -1257,6 +1398,7 @@ void endFrame()
     }
     g_building = {};
     g_buildingOpen = false;
+    ++g_cameraEpoch;
     // A frame the host never presented still holds drawn states with their vectors' storage; keep
     // that storage for the producer instead of freeing it and re-allocating on the next frames.
     if (superseded)
@@ -1267,6 +1409,12 @@ void endFrame()
                 if (g_stateStock.size() >= kStatePoolLimit) break;
                 resetForReuse(mesh->state);
                 g_stateStock.push_back(std::move(mesh->state));
+            }
+            else if (auto *transient = std::get_if<TransientMeshDraw>(&draw); transient && recycleTransientStates())
+            {
+                if (g_stateStock.size() >= kStatePoolLimit) break;
+                resetForReuse(transient->state);
+                g_stateStock.push_back(std::move(transient->state));
             }
     }
 }
@@ -1318,16 +1466,28 @@ bool renderHostFrame()
     // icons), so placement is decided per Z layer from the layer's horizontal extent. A layer that
     // reaches only the left (right) edge of the 4:3 source is pinned to that edge of the screen, one
     // that reaches both (fades, vignettes, backdrops) is stretched, the rest stays centred.
+    //
+    // Menus cannot be placed per layer: a menu puts all of its content in one Z layer, with elements that
+    // belong together on both sides of the layer's centre, and a bar or a title that touches an edge says
+    // nothing about the list next to it. A layer that touches an edge and is not a compact corner element or a
+    // dialogue panel (the "mixed" layers) is therefore placed draw by draw, see classifyMixedDraws: backdrops
+    // and strips are stretched, art touching an edge is pinned to it, flat bars touching an edge are extended
+    // to it, and everything else stays in one centred block, so that groups keep their layout.
     struct ScreenLayer
     {
         float z, x0, x1, width;
         bool hasStrip = false; // some texture's draws span most of the width (a dialogue box, a wide panel)
+        bool mixed = false;    // placed draw by draw (see above)
+        float untexturedArea = 0.0f, untexturedSolidArea = 0.0f, untexturedSolidLargest = 0.0f, untexturedX0 = 1e9f, untexturedX1 = -1e9f; // draws without texture
     };
     // Horizontal extent of the draws of one texture inside one layer.
     struct LayerTexture
     {
         float z, x0, x1;
         const std::string *name;
+        float area = 0.0f;       // sum of the draws' boxes clipped to the source area (backdrop detection)
+        float opaqueArea = 0.0f; // the same for draws that blend normally (not the fades and effects: additive, mask passes)
+        float opaqueLargest = 0.0f; // the largest of those draws (overlapping effect quads add up to a screen too)
     };
     static std::vector<ScreenLayer> layers;
     static std::vector<LayerTexture> layerTextures;
@@ -1341,6 +1501,20 @@ bool renderHostFrame()
     // layerTextures are found by (z, name) through a small open-addressed table of indices.
     static std::vector<int32_t> layerTextureTable;
     static std::vector<int32_t> drawLayer, drawLayerTexture; // per frame.draws slot: index into layers / layerTextures (-1: none)
+    // Per slot the placement picked by classifyMixedDraws (kMenuNone: the layer rules apply), the box of the draw.
+    constexpr uint8_t kMenuNone = 0xFFu, kMenuBleedLeft = 0x20u, kMenuBleedRight = 0x40u, kMenuPlacementMask = 0x0Fu;
+    static std::vector<uint8_t> drawMenu;
+    static std::vector<std::array<float, 4>> drawBox; // x0, x1, y0, y1 of the draw's vertices
+    // Panels of a strip texture: the connected groups of its draws (the pieces of a 9-slice box). A panel that
+    // runs across the screen is the dialogue box, any other (the choice box) is an ordinary element.
+    struct StripPanel
+    {
+        float z, x0, x1, y0, y1;
+        bool spanning;
+    };
+    static std::vector<StripPanel> stripPanels;
+    static std::vector<int32_t> drawStripPanel; // per slot: index into stripPanels (-1: not a piece of one)
+    static std::vector<int32_t> panelRoot, panelSlots;
     layerTextureTable.assign(1024, -1);
     const auto layerTextureSlot = [&](float z, const std::string &name) {
         uint32_t zBits;
@@ -1356,16 +1530,30 @@ bool renderHostFrame()
                 return index;
         }
     };
+    bool anyMixed = false, polygonBackdrop = false, menuFrame = false;
     if (widescreen == 2)
     {
         drawLayer.assign(frame.draws.size(), -1);
         drawLayerTexture.assign(frame.draws.size(), -1);
-        bool inTarget = false;
+        drawBox.assign(frame.draws.size(), {0.0f, 0.0f, 0.0f, 0.0f});
+        bool inTarget = false, previousDepthClear = false, depthClearPair = false;
         for (size_t slot = 0; slot < frame.draws.size(); ++slot)
         {
             const Draw &draw = frame.draws[slot];
             if (const auto *target = std::get_if<TargetDraw>(&draw))
                 inTarget = target->begin;
+            // The menu pass of the game starts with two depth clears in a row, and its backdrop made of polygons
+            // is drawn with a camera of its own after them (the world's camera was set before).
+            if (const auto *clearDraw = std::get_if<ClearDraw>(&draw))
+            {
+                const bool depthOnly = clearDraw->depthBuffer && !clearDraw->colorBuffer;
+                depthClearPair = depthClearPair || (depthOnly && previousDepthClear && !inTarget);
+                previousDepthClear = depthOnly;
+                continue;
+            }
+            previousDepthClear = false;
+            if (depthClearPair && !inTarget && std::holds_alternative<CameraDraw>(draw))
+                polygonBackdrop = true;
             const auto *screen = inTarget ? nullptr : std::get_if<ScreenDraw>(&draw);
             if (!screen || screen->vertices.empty())
                 continue;
@@ -1400,28 +1588,312 @@ bool renderHostFrame()
                 }
             }
             LayerTexture *texture = textureIndex >= 0 ? &layerTextures[static_cast<size_t>(textureIndex)] : nullptr;
+            float bx0 = screen->vertices[0].x, bx1 = bx0, by0 = screen->vertices[0].y, by1 = by0;
             for (const ScreenVertex &v : screen->vertices)
             {
-                layer->x0 = std::min(layer->x0, v.x);
-                layer->x1 = std::max(layer->x1, v.x);
+                bx0 = std::min(bx0, v.x); bx1 = std::max(bx1, v.x);
+                by0 = std::min(by0, v.y); by1 = std::max(by1, v.y);
+            }
+            layer->x0 = std::min(layer->x0, bx0);
+            layer->x1 = std::max(layer->x1, bx1);
+            if (texture)
+            {
+                texture->x0 = std::min(texture->x0, bx0);
+                texture->x1 = std::max(texture->x1, bx1);
+            }
+            drawBox[slot] = {bx0, bx1, by0, by1};
+            // Coverage of the source area, for the menu backdrop test (boxes, so a tiled backdrop adds up to 100 %).
+            const float cw = std::min(bx1, screen->sourceWidth) - std::max(bx0, 0.0f);
+            const float ch = std::min(by1, screen->sourceHeight) - std::max(by0, 0.0f);
+            if (cw > 0.0f && ch > 0.0f)
+            {
+                const bool normalBlend = (screen->state.blend == ScreenBlend::Alpha || screen->state.blend == ScreenBlend::Opaque) &&
+                                         !screen->state.alphaOnlyWrite;
                 if (texture)
                 {
-                    texture->x0 = std::min(texture->x0, v.x);
-                    texture->x1 = std::max(texture->x1, v.x);
+                    texture->area += cw * ch;
+                    if (normalBlend) { texture->opaqueArea += cw * ch; texture->opaqueLargest = std::max(texture->opaqueLargest, cw * ch); }
+                }
+                else
+                {
+                    layer->untexturedArea += cw * ch;
+                    if (normalBlend && screen->vertices[0].color[3] >= 0xF0u)
+                    {
+                        layer->untexturedSolidArea += cw * ch;
+                        layer->untexturedSolidLargest = std::max(layer->untexturedSolidLargest, cw * ch);
+                    }
+                    layer->untexturedX0 = std::min(layer->untexturedX0, bx0);
+                    layer->untexturedX1 = std::max(layer->untexturedX1, bx1);
                 }
             }
             drawLayer[slot] = layerIndex;
             drawLayerTexture[slot] = textureIndex;
         }
-        for (const LayerTexture &texture : layerTextures)
-            if (isStrip(texture, 640.0f))
+        stripPanels.clear();
+        drawStripPanel.assign(frame.draws.size(), -1);
+        for (size_t textureIndex = 0; textureIndex < layerTextures.size(); ++textureIndex)
+        {
+            if (!isStrip(layerTextures[textureIndex], 640.0f))
+                continue;
+            // the draws of this texture, joined when their boxes touch
+            panelSlots.clear();
+            for (size_t slot = 0; slot < frame.draws.size(); ++slot)
+                if (drawLayerTexture[slot] == static_cast<int32_t>(textureIndex))
+                    panelSlots.push_back(static_cast<int32_t>(slot));
+            if (panelSlots.size() > 192u)
+                continue;
+            panelRoot.resize(panelSlots.size());
+            for (size_t i = 0; i < panelRoot.size(); ++i)
+                panelRoot[i] = static_cast<int32_t>(i);
+            const auto find = [&](int32_t i) {
+                while (panelRoot[static_cast<size_t>(i)] != i)
+                    i = panelRoot[static_cast<size_t>(i)] = panelRoot[static_cast<size_t>(panelRoot[static_cast<size_t>(i)])];
+                return i;
+            };
+            // Pieces of one box lie edge to edge (they touch on one axis and overlap on the other); a box drawn on
+            // top of another one, or its shadow offset by a few units, overlaps on both and is another panel.
+            constexpr float kTouch = 1.5f;
+            for (size_t i = 0; i < panelSlots.size(); ++i)
+                for (size_t j = i + 1; j < panelSlots.size(); ++j)
+                {
+                    const auto &a = drawBox[static_cast<size_t>(panelSlots[i])], &b = drawBox[static_cast<size_t>(panelSlots[j])];
+                    const float overlapX = std::min(a[1], b[1]) - std::max(a[0], b[0]);
+                    const float overlapY = std::min(a[3], b[3]) - std::max(a[2], b[2]);
+                    if (overlapX >= -kTouch && overlapY >= -kTouch && (overlapX <= kTouch || overlapY <= kTouch))
+                        panelRoot[static_cast<size_t>(find(static_cast<int32_t>(i)))] = find(static_cast<int32_t>(j));
+                }
+            static std::vector<int32_t> rootPanel;
+            rootPanel.assign(panelSlots.size(), -1);
+            for (size_t i = 0; i < panelSlots.size(); ++i)
+            {
+                const int32_t root = find(static_cast<int32_t>(i));
+                const auto &box = drawBox[static_cast<size_t>(panelSlots[i])];
+                int32_t &panel = rootPanel[static_cast<size_t>(root)];
+                if (panel < 0)
+                {
+                    stripPanels.push_back({layerTextures[textureIndex].z, box[0], box[1], box[2], box[3], false});
+                    panel = static_cast<int32_t>(stripPanels.size() - 1);
+                }
+                StripPanel &group = stripPanels[static_cast<size_t>(panel)];
+                group.x0 = std::min(group.x0, box[0]); group.x1 = std::max(group.x1, box[1]);
+                group.y0 = std::min(group.y0, box[2]); group.y1 = std::max(group.y1, box[3]);
+                drawStripPanel[static_cast<size_t>(panelSlots[i])] = panel;
+            }
+            for (size_t i = 0; i < rootPanel.size(); ++i)
+                if (rootPanel[i] >= 0)
+                {
+                    StripPanel &group = stripPanels[static_cast<size_t>(rootPanel[i])];
+                    group.spanning = group.x0 >= -0.5f && group.x0 <= 0.15f * 640.0f && group.x1 >= 0.85f * 640.0f && group.x1 <= 640.5f;
+                }
+        }
+        for (const StripPanel &panel : stripPanels)
+            if (panel.spanning)
                 for (ScreenLayer &layer : layers)
-                    if (layer.z == texture.z)
+                    if (layer.z == panel.z)
                         layer.hasStrip = true;
+        // A menu frame: no world shows behind the content. Either the backdrop is made of polygons (see above) or
+        // a textured screen draw (several, tiled) covers the whole screen and blends normally. The fades and
+        // masks that cover the screen in the field and in battle are not that.
+        menuFrame = polygonBackdrop;
+        for (const LayerTexture &texture : layerTextures)
+            menuFrame = menuFrame || (texture.opaqueArea >= 0.7f * 640.0f * 448.0f && texture.opaqueLargest >= 0.3f * 640.0f * 448.0f && texture.x0 <= 0.15f * 640.0f && texture.x1 >= 0.85f * 640.0f);
+        for (const ScreenLayer &layer : layers) // a flat solid backdrop (the save screen); a fade is not solid until it is complete
+            menuFrame = menuFrame || (layer.untexturedSolidArea >= 0.7f * 640.0f * 448.0f && layer.untexturedSolidLargest >= 0.3f * 640.0f * 448.0f && layer.untexturedX0 <= 0.15f * 640.0f && layer.untexturedX1 >= 0.85f * 640.0f);
+        for (ScreenLayer &layer : layers)
+        {
+            const bool left = layer.x0 <= 0.5f, right = layer.x1 >= layer.width - 0.5f;
+            layer.mixed = menuFrame || (left && right);
+            anyMixed = anyMixed || layer.mixed;
+        }
+        drawMenu.assign(frame.draws.size(), kMenuNone);
     }
-    lap(g_timing.prepass);
-    const auto placeScreenDraw = [&](const ScreenDraw &screen, size_t slot) {
+    // Mixed layers, draw by draw (after the texture index exists: the flat-edge test reads texels).
+    const auto classifyMixedDraws = [&] {
         using Placement = Renderer::ScreenPlacement;
+        // Is the column of texels at the quad's left (right) side, where it meets the edge of the source area (or
+        // its own end when that lies inside), one flat colour? Then the quad can be extended sideways to the
+        // edge of the screen by repeating that column (a bar or a panel flush with the edge); character art and
+        // lettering are not flat and are pinned to the edge instead.
+        const auto flatEdge = [&](const ScreenDraw &screen, bool left) {
+            const auto &v = screen.vertices;
+            if (v.size() != 6u || screen.lines) return false;
+            const TextureDefinition *definition = screen.textureName.empty() ? nullptr : findHostTexture(screen.textureName);
+            if (!screen.textureName.empty() && (!definition || definition->texture.rgba.size() < 4u)) return false;
+            float xl = v[0].x, xr = v[0].x, yt = v[0].y, yb = v[0].y;
+            for (const ScreenVertex &p : v)
+            {
+                xl = std::min(xl, p.x); xr = std::max(xr, p.x);
+                yt = std::min(yt, p.y); yb = std::max(yb, p.y);
+            }
+            if (xr - xl < 1.0f) return false;
+            float uL = 0.0f, uR = 0.0f, vTop = 0.0f, vBottom = 0.0f;
+            for (const ScreenVertex &p : v)
+            {
+                if (std::fabs(p.x - xl) > 0.01f && std::fabs(p.x - xr) > 0.01f) return false; // not an axis-aligned quad
+                if (std::fabs(p.y - yt) > 0.01f && std::fabs(p.y - yb) > 0.01f) return false;
+                if (std::fabs(p.x - xl) <= 0.01f) uL = p.u; else uR = p.u;
+                if (std::fabs(p.x - (left ? xl : xr)) <= 0.01f)
+                {
+                    if (std::fabs(p.y - yt) <= 0.01f) vTop = p.v; else vBottom = p.v;
+                }
+            }
+            if (!definition) return true; // untextured: vertex colour only
+            const float edge = left ? std::max(xl, 0.0f) : std::min(xr, screen.sourceWidth);
+            const float edgeU = uL + (edge - xl) / (xr - xl) * (uR - uL);
+            const TextureData &tex = definition->texture;
+            const int w = static_cast<int>(tex.width), h = static_cast<int>(tex.height);
+            if (w <= 0 || h <= 0 || tex.rgba.size() < static_cast<size_t>(w) * h * 4u) return false;
+            // Repeating the edge column is invisible when the texels next to it, further inside, are the same
+            // (a bar's rows may differ from each other: its top and bottom edges are soft).
+            const int px = std::clamp(static_cast<int>(edgeU * w + (left ? 0.5f : -0.5f)), 0, w - 1);
+            static const bool debugFlat = std::getenv("P3FES_WS_DEBUG") != nullptr;
+            const float uSign = uR >= uL ? 1.0f : -1.0f;
+            const int inward = (left ? 1 : -1) * (uSign > 0.0f ? 1 : -1);
+            // (a quad that maps one column of texels over its whole width is a bar the game itself stretches that way)
+            const float texelsPerUnit = std::fabs(uR - uL) * static_cast<float>(w) / (xr - xl);
+            const int step = std::max(1, static_cast<int>(std::lround(4.0f * texelsPerUnit)));
+            int worst = texelsPerUnit * (xr - xl) <= 1.0f ? -1 : 0;
+            for (int s = 0; s < 8 && worst >= 0; ++s)
+            {
+                const float t = (s + 0.5f) / 8.0f;
+                const int py = std::clamp(static_cast<int>((vTop + (vBottom - vTop) * t) * h), 0, h - 1);
+                const uint8_t *edgeTexel = &tex.rgba[(static_cast<size_t>(py) * w + px) * 4u];
+                const int pxIn = std::clamp(px + inward * step, 0, w - 1);
+                const uint8_t *inner = &tex.rgba[(static_cast<size_t>(py) * w + pxIn) * 4u];
+                if (edgeTexel[3] < 24 && inner[3] < 24) continue; // two transparent texels are the same whatever their colour
+                for (int c = 0; c < 4; ++c)
+                    worst = std::max(worst, std::abs(static_cast<int>(edgeTexel[c]) - static_cast<int>(inner[c])));
+            }
+            const bool flat = worst <= 24;
+            if (debugFlat)
+                std::fprintf(stderr, "[p3fes-ws] flatEdge %s tex=%s %dx%d edgeU=%.4f px=%d v=%.3f..%.3f xl=%.1f xr=%.1f worst=%d -> %d\n", left ? "left" : "right",
+                             screen.textureName.c_str(), w, h, edgeU, px, vTop, vBottom, xl, xr, worst, flat ? 1 : 0);
+            return flat;
+        };
+        for (size_t slot = 0; slot < frame.draws.size(); ++slot)
+        {
+            const auto *screen = std::get_if<ScreenDraw>(&frame.draws[slot]);
+            if (!screen || screen->vertices.empty() || drawLayer[slot] < 0)
+                continue;
+            const ScreenLayer &layer = layers[static_cast<size_t>(drawLayer[slot])];
+            if (!layer.mixed)
+                continue;
+            const LayerTexture *texture = drawLayerTexture[slot] >= 0 ? &layerTextures[static_cast<size_t>(drawLayerTexture[slot])] : nullptr;
+            const float sw = screen->sourceWidth, sh = screen->sourceHeight;
+            const float x0 = drawBox[slot][0], x1 = drawBox[slot][1];
+            Placement placement = Placement::Centre;
+            uint8_t flags = 0;
+            // A backdrop: draws of one texture (or all untextured ones of the layer) that cover the screen
+            // between them, edge to edge. Flat, gradient or abstract: stretching it is the right thing.
+            const float coverage = texture ? texture->area : layer.untexturedArea;
+            const float gx0 = texture ? texture->x0 : layer.untexturedX0, gx1 = texture ? texture->x1 : layer.untexturedX1;
+            if (coverage >= 0.7f * sw * sh && gx0 <= 0.15f * sw && gx1 >= 0.85f * sw &&
+                (!menuFrame || (x1 - x0) * (drawBox[slot][3] - drawBox[slot][2]) >= 0.1f * sw * sh)) // in a menu not the small pieces drawn at the same Z
+                placement = Placement::Stretch;
+            else if (x0 <= 0.02f * sw && x1 >= 0.98f * sw) // a strip across the whole screen, edge to edge (its end caps may sit a few units in)
+                placement = Placement::Stretch;
+            else if (!menuFrame)
+            {
+                // HUD: placed by cluster below, except the sprites that follow the 3-D world (light and glow
+                // quads: a small texture magnified several times, or a render target), whose positions were
+                // projected with the widened camera: they move with the stretched picture.
+                bool worldSprite = screen->textureName.compare(0, 3, "rt.") == 0;
+                if (!worldSprite && !screen->textureName.empty())
+                    if (const TextureDefinition *definition = findHostTexture(screen->textureName))
+                        if (definition->texture.width >= 2u && definition->texture.height >= 2u)
+                            worldSprite = (x1 - x0) >= 4.0f * static_cast<float>(definition->texture.width) &&
+                                          (drawBox[slot][3] - drawBox[slot][2]) >= 4.0f * static_cast<float>(definition->texture.height);
+                if (worldSprite)
+                    drawMenu[slot] = static_cast<uint8_t>(Placement::Stretch);
+                continue;
+            }
+            else if (x1 > 0.5f && x0 < sw - 0.5f)
+            {
+                if (x0 <= 0.5f) // touches or overhangs the left edge
+                {
+                    if (flatEdge(*screen, true)) flags = kMenuBleedLeft; // stays centred (clipped to the source area)
+                    else placement = Placement::Left;
+                }
+                else if (x1 >= sw - 0.5f)
+                {
+                    if (flatEdge(*screen, false)) flags = kMenuBleedRight;
+                    else placement = Placement::Right;
+                }
+            }
+            drawMenu[slot] = static_cast<uint8_t>(static_cast<uint8_t>(placement) | flags);
+        }
+        if (menuFrame)
+            return;
+        // HUD (the world shows behind): a layer that reaches both edges is several elements, not one. What is
+        // left after the backdrops and strips is grouped into clusters (draws whose boxes overlap or touch: a
+        // gauge and its icon, the command ring and its labels), and each cluster goes to the side it is on:
+        // left, right, or centred when it is in the middle or as wide as the screen.
+        for (size_t layerIndex = 0; layerIndex < layers.size(); ++layerIndex)
+        {
+            if (!layers[layerIndex].mixed)
+                continue;
+            panelSlots.clear();
+            for (size_t slot = 0; slot < frame.draws.size(); ++slot)
+                if (drawLayer[slot] == static_cast<int32_t>(layerIndex) && drawMenu[slot] == kMenuNone)
+                    panelSlots.push_back(static_cast<int32_t>(slot));
+            if (panelSlots.empty() || panelSlots.size() > 512u)
+                continue;
+            panelRoot.resize(panelSlots.size());
+            for (size_t i = 0; i < panelRoot.size(); ++i)
+                panelRoot[i] = static_cast<int32_t>(i);
+            const auto find = [&](int32_t i) {
+                while (panelRoot[static_cast<size_t>(i)] != i)
+                    i = panelRoot[static_cast<size_t>(i)] = panelRoot[static_cast<size_t>(panelRoot[static_cast<size_t>(i)])];
+                return i;
+            };
+            constexpr float kJoin = 6.0f;
+            for (size_t i = 0; i < panelSlots.size(); ++i)
+                for (size_t j = i + 1; j < panelSlots.size(); ++j)
+                {
+                    const auto &a = drawBox[static_cast<size_t>(panelSlots[i])], &b = drawBox[static_cast<size_t>(panelSlots[j])];
+                    if (a[0] <= b[1] + kJoin && b[0] <= a[1] + kJoin && a[2] <= b[3] + kJoin && b[2] <= a[3] + kJoin)
+                        panelRoot[static_cast<size_t>(find(static_cast<int32_t>(i)))] = find(static_cast<int32_t>(j));
+                }
+            static std::vector<std::array<float, 2>> clusterX; // x0, x1 per root
+            clusterX.assign(panelSlots.size(), {1e9f, -1e9f});
+            for (size_t i = 0; i < panelSlots.size(); ++i)
+            {
+                auto &extent = clusterX[static_cast<size_t>(find(static_cast<int32_t>(i)))];
+                extent[0] = std::min(extent[0], drawBox[static_cast<size_t>(panelSlots[i])][0]);
+                extent[1] = std::max(extent[1], drawBox[static_cast<size_t>(panelSlots[i])][1]);
+            }
+            for (size_t i = 0; i < panelSlots.size(); ++i)
+            {
+                const auto &extent = clusterX[static_cast<size_t>(find(static_cast<int32_t>(i)))];
+                const float sw = layers[layerIndex].width;
+                const float visible = std::min(extent[1], sw) - std::max(extent[0], 0.0f);
+                const float centre = 0.5f * (extent[0] + extent[1]);
+                Placement placement = Placement::Centre;
+                if (visible < 0.6f * sw)
+                {
+                    if (centre < 0.4f * sw) placement = Placement::Left;
+                    else if (centre > 0.6f * sw) placement = Placement::Right;
+                }
+                drawMenu[static_cast<size_t>(panelSlots[i])] = static_cast<uint8_t>(placement);
+            }
+        }
+    };
+    // The placement of one screen draw and, for menu draws, which side to extend.
+    struct ScreenPlace
+    {
+        Renderer::ScreenPlacement placement = Renderer::ScreenPlacement::Centre;
+        bool bleedLeft = false, bleedRight = false;
+    };
+    const auto choosePlacement = [&](const ScreenDraw &screen, size_t slot) {
+        using Placement = Renderer::ScreenPlacement;
+        ScreenPlace result;
+        if (slot < drawMenu.size() && drawMenu[slot] != kMenuNone)
+        {
+            result.placement = static_cast<Placement>(drawMenu[slot] & kMenuPlacementMask);
+            result.bleedLeft = (drawMenu[slot] & kMenuBleedLeft) != 0;
+            result.bleedRight = (drawMenu[slot] & kMenuBleedRight) != 0;
+            return result;
+        }
         Placement placement = Placement::Centre;
         if (!screen.vertices.empty() && slot < drawLayer.size() && drawLayer[slot] >= 0)
         {
@@ -1442,28 +1914,108 @@ bool renderHostFrame()
                 // texture is stretched across the screen, what hangs over the right edge
                 // (the speaker's portrait) is pinned to the right undeformed, and the rest
                 // (name and text glyphs) keeps its shape and follows the panel's left end.
-                const LayerTexture *texture = drawLayerTexture[slot] >= 0 ? &layerTextures[static_cast<size_t>(drawLayerTexture[slot])] : nullptr;
-                float x1 = screen.vertices[0].x;
+                // A panel of the same texture that does not run across the screen (the choice box) and what
+                // is inside it stay together, centred.
+                const int32_t piece = slot < drawStripPanel.size() ? drawStripPanel[slot] : -1;
+                float x1 = screen.vertices[0].x, y0 = screen.vertices[0].y, y1 = y0, x0 = x1;
                 for (const ScreenVertex &v : screen.vertices)
-                    x1 = std::max(x1, v.x);
-                if (texture && isStrip(*texture, layer.width))
+                {
+                    x0 = std::min(x0, v.x); x1 = std::max(x1, v.x);
+                    y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+                }
+                bool inLoosePanel = false;
+                if (piece < 0)
+                    for (const StripPanel &panel : stripPanels)
+                        if (!panel.spanning && panel.z == layer.z && 0.5f * (x0 + x1) >= panel.x0 && 0.5f * (x0 + x1) <= panel.x1 &&
+                            0.5f * (y0 + y1) >= panel.y0 && 0.5f * (y0 + y1) <= panel.y1)
+                            inLoosePanel = true;
+                if (piece >= 0 && stripPanels[static_cast<size_t>(piece)].spanning)
                     placement = Placement::Stretch;
+                else if (piece >= 0 || inLoosePanel)
+                    placement = Placement::Centre;
                 else if (x1 > layer.width + 0.5f)
                     placement = Placement::Right;
                 else
                     placement = Placement::Left;
             }
         }
-        g_renderer->setScreenPlacement(placement);
+        result.placement = placement;
+        return result;
+    };
+    // Extends the quad `screen` sideways to the edge of the framebuffer by repeating its column of texels at the
+    // edge of the source area (the sliver is one column wide and reaches far out; Wide placement shows as much of
+    // it as there is room for). The quad itself is drawn centred and clipped to the source area.
+    const auto drawBleed = [&](const ScreenDraw &screen, bool left) {
+        static std::vector<ScreenVertex> sliver;
+        sliver = screen.vertices;
+        float xl = sliver[0].x, xr = sliver[0].x;
+        for (const ScreenVertex &v : sliver)
+        {
+            xl = std::min(xl, v.x);
+            xr = std::max(xr, v.x);
+        }
+        if (xr - xl < 1.0f) return;
+        float uL = 0.0f, uR = 0.0f;
+        for (const ScreenVertex &v : screen.vertices)
+            (std::fabs(v.x - xl) <= 0.01f ? uL : uR) = v.u;
+        const float edge = left ? std::max(xl, 0.0f) : std::min(xr, screen.sourceWidth);
+        float edgeU = uL + (edge - xl) / (xr - xl) * (uR - uL);
+        // half a texel inside, so that point sampling (and the atlas neighbours of a small texture) cannot reach past the column
+        if (const TextureDefinition *definition = screen.textureName.empty() ? nullptr : findHostTexture(screen.textureName))
+            if (definition->texture.width > 0)
+            {
+                const float half = 0.5f / static_cast<float>(definition->texture.width);
+                const bool increasing = uR >= uL;
+                edgeU += ((left == increasing) ? half : -half);
+            }
+        const float far = left ? edge - 1000.0f : edge + 1000.0f;
+        for (ScreenVertex &v : sliver)
+        {
+            const bool onEdgeSide = std::fabs(v.x - (left ? xl : xr)) <= 0.01f;
+            // the colour is that of the vertex on the edge side of the same row (a vertical gradient stays one)
+            const ScreenVertex *row = &v;
+            for (const ScreenVertex &e : screen.vertices)
+                if (std::fabs(e.x - (left ? xl : xr)) <= 0.01f && std::fabs(e.y - v.y) <= 0.01f) { row = &e; break; }
+            v.color = row->color;
+            v.u = edgeU;
+            // outer side (reaching out) and inner side (on the edge of the source area)
+            v.x = onEdgeSide ? far : edge;
+        }
+        g_renderer->setScreenPlacement(Renderer::ScreenPlacement::Wide);
+        g_renderer->drawScreenTriangles(sliver, screen.sourceWidth, screen.sourceHeight, screen.textureName, screen.state);
+    };
+    lap(g_timing.prepass);
+    const auto placeScreenDraw = [&](const ScreenDraw &screen, size_t slot) {
+        const ScreenPlace place = choosePlacement(screen, slot);
+        if (place.bleedLeft && !screen.lines) drawBleed(screen, true);
+        if (place.bleedRight && !screen.lines) drawBleed(screen, false);
+        g_renderer->setScreenPlacement(place.placement);
     };
     const FrameDiag diag = frameDiagFor(g_presentedFrames);
-    if (diag.dump) dumpFrame(frame);
     if (diag.capture) requestCapture();
 #if defined(PS2X_P3FES_FRAME_TRACE)
     const uint64_t texturePreloadStartNs = traceFrame ? p3fes_frame_trace::nowNs() : 0u;
     const uint64_t textureUploadsBefore = g_textureUploads;
 #endif
     buildHostTextureIndex();
+    if (widescreen == 2 && anyMixed)
+        classifyMixedDraws();
+    if (diag.dump)
+    {
+        static const char *const kNames[] = {"centre", "left", "right", "stretch", "wide"};
+        dumpFrame(frame, [&](const ScreenDraw &screen, size_t slot) {
+            if (widescreen != 2) return std::string();
+            const ScreenPlace place = choosePlacement(screen, slot);
+            std::string text = kNames[static_cast<size_t>(place.placement)];
+            if (place.bleedLeft) text += "+bleedL";
+            if (place.bleedRight) text += "+bleedR";
+            if (slot < drawMenu.size() && drawMenu[slot] != kMenuNone) text += "(mixed)";
+            return text;
+        });
+        if (widescreen == 2)
+            std::fprintf(stderr, "[p3fes-frame] menuFrame=%d polygonBackdrop=%d mixedLayers=%d\n", menuFrame ? 1 : 0, polygonBackdrop ? 1 : 0,
+                         anyMixed ? 1 : 0);
+    }
     for (const TextureDefinition *definition : g_hostTextureList)
         ensureTexture(definition->texture.name);
 #if defined(PS2X_P3FES_FRAME_TRACE)
@@ -1686,6 +2238,11 @@ bool renderHostFrame()
         {
             resetForReuse(mesh->state);
             recycled.push_back(std::move(mesh->state));
+        }
+        else if (auto *transient = std::get_if<TransientMeshDraw>(&draw); transient && recycleTransientStates())
+        {
+            resetForReuse(transient->state);
+            recycled.push_back(std::move(transient->state));
         }
     g_hostFrame.reset();
     lap(g_timing.postFree);

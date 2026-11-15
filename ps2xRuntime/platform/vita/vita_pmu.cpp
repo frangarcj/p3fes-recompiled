@@ -396,6 +396,16 @@ extern "C" void ps2x_vita_pmu_sample(void)
     }
 }
 
+// Game thread only. Instruction and cycle counters of the calling thread (the two raw 32-bit reads, no window
+// bookkeeping): the stage profiler of p3fes_renderware.cpp (P3FES_HOOK_TIME=2) differences them around stages.
+extern "C" int ps2x_vita_pmu_read_fast(uint32_t *instr, uint32_t *cycles)
+{
+    if (!g_ready)
+        return 0;
+    return scePerfArmPmonGetCounterValue(kSelf, 0, instr) >= 0 &&
+           scePerfArmPmonGetCounterValue(kSelf, SCE_PERF_ARM_PMON_CYCLE_COUNTER, cycles) >= 0;
+}
+
 extern "C" void ps2x_vita_pmu_report(void)
 {
     static uint32_t printed = 0;     // host thread only

@@ -292,9 +292,13 @@ public:
     // use the whole framebuffer and screen-space draws keep square pixels (uniform scale), placed
     // by setScreenPlacement.
     virtual void setWidescreen(int mode) = 0;
-    enum class ScreenPlacement : std::uint8_t { Centre, Left, Right, Stretch };
+    // Wide is Centre without the 4:3 clip: same uniform scale and position, but the viewport is the whole
+    // framebuffer, so geometry beyond the source area (x < 0 or x > sourceWidth) shows in the side margins.
+    // Used to extend flat edge-flush bars (see p3fes_native_present.cpp, menu frames).
+    enum class ScreenPlacement : std::uint8_t { Centre, Left, Right, Stretch, Wide };
     // Widescreen mode 2 only: where the following screen-space draws put their 4:3 source area on
-    // the wider framebuffer (against the left or right edge, centred, or stretched over all of it).
+    // the wider framebuffer (against the left or right edge, centred, stretched over all of it, or centred
+    // and unclipped).
     virtual void setScreenPlacement(ScreenPlacement placement) = 0;
     // Diagnostic: write the finished frame as a raw file ("P3FB" + u32 width + u32 height + RGBA8
     // rows, top row first) during the next endFrame. Returns false when unsupported.
