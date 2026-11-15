@@ -85,6 +85,7 @@ namespace p3fes_native_effects
             uint64_t verifyRoiBad = 0u, verifyWriteBad = 0u, verifySoft = 0u;
             uint64_t ns = 0u, nsCalls = 0u;
             uint64_t aliasWhy[40] = {};
+            uint64_t attrHit = 0u, attrMiss = 0u, attrNoCache = 0u, basisMiss = 0u, curveEntryMiss = 0u, s7Sum = 0u, nSum = 0u;
         } g_c;
 
         bool g_time = false;
@@ -123,13 +124,13 @@ namespace p3fes_native_effects
             return static_cast<uint32_t>(b - a);
 #endif
         }
-        enum { SEG_PRE, SEG_SETUP, SEG_LOOP, SEG_ALIVE, SEG_SPAWN, SEG_POST, SEG_TOTAL, SEG_COUNT };
+        enum { SEG_PRE, SEG_SETUP, SEG_LOOP, SEG_ALIVE, SEG_SPAWN, SEG_POST, SEG_TOTAL, SEG_BASIS, SEG_CURVE, SEG_SIN, SEG_COUNT };
         uint64_t g_seg[SEG_COUNT] = {};
         uint64_t g_segN[SEG_COUNT] = {};
         uint64_t g_stampCost = 0u;
         // per-call cost of the whole hook: [0] original code, [1] native path; index 0 particles, 1 forAllAtomics, 2 scale, 3 translate
-        uint64_t g_hu[2][4] = {};
-        uint64_t g_hn[2][4] = {};
+        uint64_t g_hu[2][6] = {};
+        uint64_t g_hn[2][6] = {};
         template <bool kOn> struct SegTimerT
         {
             explicit SegTimerT(int) {}
@@ -157,6 +158,7 @@ namespace p3fes_native_effects
             void clear() { entries.clear(); }
         };
 
+        // Addresses are used as they are (no wrap, no scratchpad): every caller checks its ranges with rangeOk() first.
         struct Mem
         {
             uint8_t *ram;
@@ -165,55 +167,63 @@ namespace p3fes_native_effects
             inline uint32_t r32(uint32_t a) const
             {
                 uint32_t v;
-                std::memcpy(&v, ram + (a & PS2_RAM_MASK), 4u);
+                std::memcpy(&v, ram + a, 4u);
                 return v;
             }
             inline int32_t ri32(uint32_t a) const { return static_cast<int32_t>(r32(a)); }
-            inline uint8_t r8(uint32_t a) const { return ram[a & PS2_RAM_MASK]; }
+            inline uint8_t r8(uint32_t a) const { return ram[a]; }
             inline float rf(uint32_t a) const
             {
                 float v;
-                std::memcpy(&v, ram + (a & PS2_RAM_MASK), 4u);
+                std::memcpy(&v, ram + a, 4u);
                 return v;
             }
             inline __m128 ld4(uint32_t a) const // lq / lqc2: the low four address bits are ignored
             {
                 __m128 v;
-                std::memcpy(&v, ram + ((a & ~0xFu) & PS2_RAM_MASK), 16u);
+                std::memcpy(&v, ram + (a & ~0xFu), 16u);
                 return v;
             }
-            inline void note(uint32_t a, uint32_t len)
+            __attribute__((noinline)) void noteSlow(uint32_t a, uint32_t len)
             {
-                if (!jr)
-                    return;
                 Journal::Entry e;
-                e.addr = a & PS2_RAM_MASK;
+                e.addr = a;
                 e.len = len;
                 std::memcpy(e.old, ram + e.addr, len);
                 jr->entries.push_back(e);
             }
+            inline void note(uint32_t a, uint32_t len)
+            {
+                if (__builtin_expect(jr != nullptr, 0))
+                    noteSlow(a, len);
+            }
             inline void w32(uint32_t a, uint32_t v)
             {
                 note(a, 4u);
-                std::memcpy(ram + (a & PS2_RAM_MASK), &v, 4u);
+                std::memcpy(ram + a, &v, 4u);
+            }
+            inline void w8(uint32_t a, uint8_t v)
+            {
+                note(a, 1u);
+                ram[a] = v;
             }
             inline void wf(uint32_t a, float v)
             {
                 note(a, 4u);
-                std::memcpy(ram + (a & PS2_RAM_MASK), &v, 4u);
+                std::memcpy(ram + a, &v, 4u);
             }
             inline void st4(uint32_t a, __m128 v) // sq / sqc2
             {
                 a &= ~0xFu;
                 note(a, 16u);
-                std::memcpy(ram + (a & PS2_RAM_MASK), &v, 16u);
+                std::memcpy(ram + a, &v, 16u);
             }
             // memcpy of one 0x20 byte slot (the regions never overlap: the slots are 0x20 apart at least)
             inline void copy32(uint32_t dst, uint32_t src)
             {
                 note(dst, 16u);
                 note(dst + 16u, 16u);
-                std::memmove(ram + (dst & PS2_RAM_MASK), ram + (src & PS2_RAM_MASK), 32u);
+                std::memmove(ram + dst, ram + src, 32u);
             }
         };
 
@@ -242,6 +252,10 @@ namespace p3fes_native_effects
             return FPU_CVT_S_W(static_cast<int32_t>(v));
         }
 
+        // ps2_fadd(+0.0f, x): x itself unless its exponent field is 0 (+-0 and the PS2's "denormals" give +0.0). Checked for all
+        // 2^32 inputs against ps2_fadd on the Mac build; the add of zero is what `adda.s $f(0), x` / `mtc1 $zero` produce.
+        inline float addZero(float x) { return (fbits(x) & 0x7F800000u) != 0u ? x : 0.0f; }
+
         template <int L> inline __m128 bc(__m128 v) { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(L, L, L, L)); }
 
         // ---- environment of one native run -----------------------------------------------------------------------
@@ -259,12 +273,21 @@ namespace p3fes_native_effects
             bool cSet = false, cVal = false; // last c.le.s result (FCR31 bit 23)
             bool failed = false;
             float cInv255 = 0.0f;  // [gp-0x7EA4]
+            uint64_t live = 0u;    // live particles updated by this call (added to the counters afterwards)
             struct CurveEntry *curve = nullptr; // memoized curves of the template being updated (null: compute)
         };
 
         inline bool cLe(Env &env, float a, float b)
         {
             const bool r = FPU_C_OLE_S(a, b);
+            env.cSet = true;
+            env.cVal = r;
+            return r;
+        }
+
+        inline bool cLt(Env &env, float a, float b)
+        {
+            const bool r = FPU_C_OLT_S(a, b);
             env.cSet = true;
             env.cVal = r;
             return r;
@@ -317,13 +340,29 @@ namespace p3fes_native_effects
             g_sinMode = same ? 1 : 2;
             std::fprintf(stderr, "[p3fes-effects] sinf at 0x%08X: %s\n", kSinf, same ? "host sin (P3FES_NATIVE_MATH hook)" : "guest function");
         }
+        // separate functions: the compiler must not turn sin(x) and cos(x) of one argument into one sincos call (a different
+        // library routine with other roundings than the separate sinf / cosf the P3FES_NATIVE_MATH hooks call)
+        __attribute__((noinline)) float hostSinf(float x) { return std::sin(x); }
+        __attribute__((noinline)) float hostCosf(float x) { return std::cos(x); }
+        constexpr uint32_t kCosf = 0x0052E6D8u;
+        int g_cosMode = 0;
+        void probeCos(Env &env)
+        {
+            static const float probes[] = {0.7f, 1.9f, -3.3f, 100.5f, 0.01f, 5.5f, -0.2f};
+            bool same = true;
+            for (float p : probes)
+                same = same && fbits(hostCosf(p)) == fbits(callGuestFloat(env, kCosf, p));
+            env.failed = false;
+            g_cosMode = same ? 1 : 2;
+            std::fprintf(stderr, "[p3fes-effects] cosf at 0x%08X: %s\n", kCosf, same ? "host cos (P3FES_NATIVE_MATH hook)" : "guest function");
+        }
         inline float psSin(Env &env, float x)
         {
             ++env.calls;
             if (g_sinMode == 0)
                 probeSin(env);
             if (g_sinMode == 1 && nativeSinArg(x))
-                return std::sin(x);
+                return hostSinf(x);
             ++g_c.sinGuest;
             return callGuestFloat(env, kSinf, x);
         }
@@ -593,7 +632,7 @@ namespace p3fes_native_effects
                 break;
             }
             const float d = FPU_SUB_S(f3, f4);
-            const float acc = FPU_ADD_S(0.0f, f4);
+            const float acc = addZero(f4);
             return FPU_ADD_S(acc, FPU_MUL_S(f2, d));
         }
 
@@ -660,6 +699,11 @@ namespace p3fes_native_effects
                 ++g_c.fbTrail;
                 return false;
             }
+            if (!rangeOk(env.gp - 0x7F40u, 0x100u) || (pl.tc != 0u && !rangeOk(env.sp - 0x300u, 0x100u)))
+            {
+                ++g_c.fbRange;
+                return false;
+            }
             const uint32_t pBytes = (pl.N * (1u + pl.tc)) * 0x20u; // N <= 0x1000, tc <= 0x1000: < 2^30
             const uint32_t qBytes = pl.N * 0x3Cu;
             if (pl.N != 0u && (!rangeOk(pl.P, pBytes) || !rangeOk(pl.Q, qBytes) || ((pl.P | pl.Q) & 3u) != 0u))
@@ -672,6 +716,11 @@ namespace p3fes_native_effects
             struct Rg { uint32_t a; uint32_t n; };
             const Rg readOnly[] = {{pl.T, 0x100u}, {E, 0x28u}, {kRandState, 16u}, {kUpVector, 16u}, {gpLo, 0x1000u}};
             const Rg written[] = {{pl.P, pBytes}, {pl.Q, qBytes}};
+            if (pl.N != 0u && overlap(pl.P, pBytes, pl.Q, qBytes))
+            {
+                ++g_c.fbAlias; // the live-particle update keeps the slot and its data block in locals
+                return false;
+            }
             if (pl.N != 0u)
                 for (const Rg &w : written)
                     for (int i = 0; i < 5; ++i)
@@ -808,7 +857,6 @@ namespace p3fes_native_effects
                 vf11 = PS2_VSUB(vf11, V1);
                 const __m128 ones = _mm_setr_ps(1.0f, 1.0f, 1.0f, 0.0f);
                 const __m128 D = PS2_VMUL(PS2_VMUL(ones, _mm_set1_ps(f7)), vf11);
-                const float f1z = 0.0f;
                 const uint32_t a0 = s4 - 1u;
                 for (uint32_t t0 = 0u; t0 < a0; ++t0)
                 {
@@ -821,9 +869,9 @@ namespace p3fes_native_effects
                     const __m128 accv = PS2_VMUL(vf11, vf2x);
                     vf10 = PS2_VADD(accv, PS2_VMUL(vf10, bc<3>(vf3)));
                     m.st4(s1, vf10);
-                    float acc = FPU_ADD_S(f1z, f5);
+                    float acc = addZero(f5);
                     m.wf(s1 + 0x18u, FPU_ADD_S(acc, FPU_MUL_S(f4, f6)));
-                    acc = FPU_ADD_S(f1z, f3);
+                    acc = addZero(f3);
                     m.wf(s1 + 0x1Cu, FPU_ADD_S(acc, FPU_MUL_S(f2, f6)));
                     V1 = PS2_VADD(V1, D);
                     vf10 = PS2_VMUL(V1, _mm_set1_ps(255.0f));
@@ -865,9 +913,9 @@ namespace p3fes_native_effects
                 ++env.calls;
                 const __m128 vf10 = cubic(pts, f21t, garbage);
                 m.st4(s1, vf10);
-                float acc = FPU_ADD_S(0.0f, f20);
+                float acc = addZero(f20);
                 m.wf(s1 + 0x18u, FPU_ADD_S(acc, FPU_MUL_S(f26, f21t)));
-                acc = FPU_ADD_S(0.0f, f25);
+                acc = addZero(f25);
                 m.wf(s1 + 0x1Cu, FPU_ADD_S(acc, FPU_MUL_S(f24, f21t)));
                 V1 = PS2_VADD(V1, D);
                 m.w32(s1 + 0x14u, packColor(PS2_VMUL(V1, _mm_set1_ps(255.0f))));
@@ -898,18 +946,38 @@ namespace p3fes_native_effects
         CurveEntry g_curves[kCurveEntries];
         uint32_t g_curveNext = 0u;
 
+        // newlib's memcmp costs ~4 instructions a byte on the Vita: 128-bit compares for the 148 byte template key
+        inline bool sameKey(const uint8_t *a, const uint8_t *b)
+        {
+            __m128i acc = _mm_setzero_si128();
+            for (uint32_t i = 0u; i < 9u; ++i)
+                acc = _mm_or_si128(acc, _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(a + 16u * i)),
+                                                      _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + 16u * i))));
+            uint32_t ta, tb;
+            std::memcpy(&ta, a + 144u, 4u);
+            std::memcpy(&tb, b + 144u, 4u);
+            return ta == tb && _mm_movemask_epi8(_mm_cmpeq_epi8(acc, _mm_setzero_si128())) == 0xFFFF;
+        }
+
         CurveEntry *findCurve(const uint8_t *ram, uint32_t T, int32_t L, uint32_t cbits)
         {
             if (L <= 0 || static_cast<uint32_t>(L) > kCurveAges)
                 return nullptr;
             const uint8_t *key = ram + ((T + 0x2Cu) & PS2_RAM_MASK);
-            for (uint32_t i = 0u; i < kCurveEntries; ++i)
+            static uint32_t last = 0u; // most recently used entry first: neighbouring emitters usually share a template
+            for (uint32_t n = 0u; n < kCurveEntries; ++n)
             {
+                const uint32_t i = (last + n) % kCurveEntries;
                 CurveEntry &e = g_curves[i];
-                if (e.valid && e.L == L && e.cbits == cbits && std::memcmp(e.key, key, kCurveKey) == 0)
+                if (e.valid && e.L == L && e.cbits == cbits && sameKey(e.key, key))
+                {
+                    last = i;
                     return &e;
+                }
             }
-            CurveEntry &e = g_curves[g_curveNext++ % kCurveEntries];
+            ++g_c.curveEntryMiss;
+            CurveEntry &e = g_curves[g_curveNext % kCurveEntries];
+            last = g_curveNext++ % kCurveEntries;
             e.valid = true;
             e.L = L;
             e.cbits = cbits;
@@ -930,6 +998,7 @@ namespace p3fes_native_effects
                 uint8_t &h = e->have[a];
                 if (!(h & 1u))
                 {
+                    ++g_c.attrMiss;
                     e->color[a] = colorCurve(env, T + 0x2Cu, T + 0x50u, age, pl.s7);
                     h = static_cast<uint8_t>(h | 1u | (env.cVal ? 8u : 0u));
                 }
@@ -958,6 +1027,7 @@ namespace p3fes_native_effects
                 m.wf(p + 0x1Cu, e->f1c[a]);
                 return;
             }
+            ++g_c.attrNoCache;
             m.w32(p + 0x14u, colorCurve(env, T + 0x2Cu, T + 0x50u, age, pl.s7));
             m.wf(p + 0x18u, floatCurve(env, T + 0x60u, age, pl.s7));
             m.wf(p + 0x1Cu, floatCurve(env, T + 0x8Cu, age, pl.s7));
@@ -968,11 +1038,11 @@ namespace p3fes_native_effects
         {
             bool valid = false;
             uint32_t q[4];
-            __m128 vf[32];
+            __m128 vf[10]; // kBasisRegs
             __m128 acc;
         };
-        BasisEntry g_basis[8];
-        uint32_t g_basisNext = 0u;
+        constexpr uint32_t kBasisEntries = 128u; // direct mapped by a hash of the quaternion
+        BasisEntry g_basis[kBasisEntries];
         constexpr int kBasisRegs[] = {1, 2, 3, 4, 5, 6, 28, 29, 30, 31};
 
         // The whole call. The plan comes from the precheck, so nothing here can bail out.
@@ -1036,7 +1106,7 @@ namespace p3fes_native_effects
             const float f20 = m.rf(T + rangeOff);
             const float r = randFloat(env);
             const float f2 = FPU_SUB_S(f25, f20);
-            const float acc = FPU_ADD_S(0.0f, f2);
+            const float acc = addZero(f2);
             const float f1 = FPU_ADD_S(acc, FPU_MUL_S(f20, r));
             return useBase ? FPU_MUL_S(m.rf(T + baseOff), f1) : f1;
         };
@@ -1071,7 +1141,7 @@ namespace p3fes_native_effects
             const float f20 = m.rf(T + 0x6Cu);
             const float r = randFloat(env);
             const float f2 = FPU_SUB_S(f25, f20);
-            const float acc = FPU_ADD_S(0.0f, f2);
+            const float acc = addZero(f2);
             m.wf(s3 + 0x30u, FPU_ADD_S(acc, FPU_MUL_S(f20, r)));
         }
         if (pl.type != 2u)
@@ -1079,7 +1149,7 @@ namespace p3fes_native_effects
             const float f20 = m.rf(T + 0x98u);
             const float r = randFloat(env);
             const float f2 = FPU_SUB_S(f25, f20);
-            const float acc = FPU_ADD_S(0.0f, f2);
+            const float acc = addZero(f2);
             m.wf(s3 + 0x38u, FPU_ADD_S(acc, FPU_MUL_S(f20, r)));
             if (pl.type == 1u)
             {
@@ -1110,19 +1180,19 @@ namespace p3fes_native_effects
             {
                 const float f1 = m.rf(s3 + 4u * k);
                 const float f0 = m.rf(s4 + 4u * k);
-                const float acc = FPU_ADD_S(0.0f, f0);
+                const float acc = addZero(f0);
                 m.wf(s4 + 4u * k, FPU_ADD_S(acc, FPU_MUL_S(f1, f3)));
             }
             {
                 const float f1 = m.rf(s3 + 0x28u);
                 const float f0 = m.rf(s3 + 0x18u);
-                const float acc = FPU_ADD_S(0.0f, f0);
+                const float acc = addZero(f0);
                 m.wf(s3 + 0x18u, FPU_ADD_S(acc, FPU_MUL_S(f1, f20)));
             }
             {
                 const float f1 = m.rf(s3 + 0x24u);
                 const float f0 = m.rf(s3 + 0x20u);
-                const float acc = FPU_ADD_S(0.0f, f0);
+                const float acc = addZero(f0);
                 m.wf(s3 + 0x20u, FPU_ADD_S(acc, FPU_MUL_S(f1, f20)));
             }
             const float sn = psSin(env, m.rf(s3 + 0x18u));
@@ -1131,7 +1201,7 @@ namespace p3fes_native_effects
             {
                 const float f2 = m.rf(s3 + 0xCu + 4u * k);
                 const float f1 = m.rf(s4 + 4u * k);
-                const float acc = FPU_ADD_S(0.0f, f1);
+                const float acc = addZero(f1);
                 m.wf(s4 + 4u * k, FPU_ADD_S(acc, FPU_MUL_S(f2, f4)));
             }
             m.wf(s3 + 0x18u, FPU_ADD_S(m.rf(s3 + 0x18u), m.rf(s3 + 0x28u)));
@@ -1160,45 +1230,58 @@ namespace p3fes_native_effects
         --s0;
         }
 
-        // one live particle (0x32B7D4..0x32B918)
+        // one live particle (0x32B7D4..0x32B918). The recompiled code stores the position twice (once per move) and the
+        // attributes twice (curve value, then scaled); only the final values are observable, so they are kept in registers
+        // and written once. The slot (P) and its data block (Q) never overlap (precheck).
         template <bool kTime>
         __attribute__((noinline)) void aliveStep(Env &env, const Plan &pl, uint32_t s3, uint32_t s4, int32_t s5, float f27)
         {
-            Mem &m = env.m;
-            // ---- live particle (0x32B7D4) ------------------------------------------------------------------------
+            Mem m = env.m;
             SegTimerT<kTime> tal(SEG_ALIVE);
-            ++g_c.particles;
+            ++env.live;
+            const float ang = m.rf(s3 + 0x18u);
+            const float f0 = [&] { SegTimerT<kTime> ts(SEG_SIN); return psSin(env, ang); }();
+            const float f1 = m.rf(s3 + 0x1Cu);
+            const float f2 = FPU_SUB_S(f0, f1);
+            const float f3 = FPU_MUL_S(m.rf(s3 + 0x20u), f2);
+            const float fAge = cvtsw(s5);
+            const float acc0 = addZero(m.rf(s3 + 0x2Cu));
+            const float f3b = FPU_SUB_S(acc0, FPU_MUL_S(f27, fAge));
+            for (uint32_t k = 0u; k < 3u; ++k)
             {
-                const float f0 = psSin(env, m.rf(s3 + 0x18u));
-                const float f1 = m.rf(s3 + 0x1Cu);
-                const float f2 = FPU_SUB_S(f0, f1);
-                const float f3 = FPU_MUL_S(m.rf(s3 + 0x20u), f2);
-                for (uint32_t k = 0u; k < 3u; ++k)
-                {
-                    const float g2 = m.rf(s3 + 0xCu + 4u * k);
-                    const float g1 = m.rf(s4 + 4u * k);
-                    const float acc = FPU_ADD_S(0.0f, g1);
-                    m.wf(s4 + 4u * k, FPU_ADD_S(acc, FPU_MUL_S(g2, f3)));
-                }
-                const float fAge = cvtsw(s5);
-                const float acc0 = FPU_ADD_S(0.0f, m.rf(s3 + 0x2Cu));
-                const float f3b = FPU_SUB_S(acc0, FPU_MUL_S(f27, fAge));
-                for (uint32_t k = 0u; k < 3u; ++k)
-                {
-                    const float g2 = m.rf(s3 + 4u * k);
-                    const float g1 = m.rf(s4 + 4u * k);
-                    const float acc = FPU_ADD_S(0.0f, g1);
-                    m.wf(s4 + 4u * k, FPU_ADD_S(acc, FPU_MUL_S(g2, f3b)));
-                }
-                m.wf(s3 + 0x18u, FPU_ADD_S(m.rf(s3 + 0x18u), m.rf(s3 + 0x28u)));
-                m.wf(s3 + 0x20u, FPU_ADD_S(m.rf(s3 + 0x20u), m.rf(s3 + 0x24u)));
-                m.wf(s3 + 0x1Cu, f0);
+                const float p = m.rf(s4 + 4u * k);
+                const float a1 = addZero(p);
+                const float r1 = FPU_ADD_S(a1, FPU_MUL_S(m.rf(s3 + 0xCu + 4u * k), f3));
+                const float a2 = addZero(r1);
+                m.wf(s4 + 4u * k, FPU_ADD_S(a2, FPU_MUL_S(m.rf(s3 + 4u * k), f3b)));
             }
-            particleAttrs(env, pl, s4, s5);
-            m.wf(s4 + 0x18u, FPU_MUL_S(m.rf(s4 + 0x18u), m.rf(s3 + 0x30u)));
-            m.wf(s4 + 0x1Cu, FPU_MUL_S(m.rf(s4 + 0x1Cu), m.rf(s3 + 0x38u)));
-            m.wf(s4 + 0x1Cu, FPU_ADD_S(m.rf(s4 + 0x1Cu), m.rf(s3 + 0x34u)));
-            trailUpdate(env, pl, s4);
+            m.wf(s3 + 0x18u, FPU_ADD_S(ang, m.rf(s3 + 0x28u)));
+            m.wf(s3 + 0x20u, FPU_ADD_S(m.rf(s3 + 0x20u), m.rf(s3 + 0x24u)));
+            m.wf(s3 + 0x1Cu, f0);
+            CurveEntry *e = env.curve;
+            float f18, f1c;
+            if (e && static_cast<uint32_t>(s5) < static_cast<uint32_t>(pl.s7) && (e->have[s5] & 7u) == 7u)
+            {
+                const uint32_t a = static_cast<uint32_t>(s5);
+                env.calls += 4u;
+                env.cSet = true;
+                env.cVal = (e->have[a] & 8u) != 0u;
+                m.w32(s4 + 0x14u, e->color[a]);
+                f18 = e->f18[a];
+                f1c = e->f1c[a];
+            }
+            else
+            {
+                particleAttrs(env, pl, s4, s5);
+                f18 = m.rf(s4 + 0x18u);
+                f1c = m.rf(s4 + 0x1Cu);
+            }
+            m.wf(s4 + 0x18u, FPU_MUL_S(f18, m.rf(s3 + 0x30u)));
+            m.wf(s4 + 0x1Cu, FPU_ADD_S(FPU_MUL_S(f1c, m.rf(s3 + 0x38u)), m.rf(s3 + 0x34u)));
+            if (pl.tc != 0u)
+                trailUpdate(env, pl, s4);
+            else
+                ++env.calls;
             m.w32(s4 + 0x10u, static_cast<uint32_t>(s5 + 1));
         }
 
@@ -1214,39 +1297,41 @@ namespace p3fes_native_effects
             env.cInv255 = m.rf(gp - 0x7EA4u);
 
             // 0x32AFC4..0x32AFC8: vf10 = orientation, 0x357E30 builds the rotation
+            {
+            SegTimerT<kTime> tBasis(SEG_BASIS);
             u.vf[10] = m.ld4(T + 0x10u);
             ++env.calls;
             {
                 uint32_t q[4];
                 std::memcpy(q, env.rdram + ((T + 0x10u) & PS2_RAM_MASK), 16u);
-                BasisEntry *hit = nullptr;
-                for (uint32_t i = 0u; g_curveCache && i < 8u; ++i)
-                    if (g_basis[i].valid && std::memcmp(g_basis[i].q, q, 16u) == 0)
-                    {
-                        hit = &g_basis[i];
-                        break;
-                    }
-                if (hit)
+                BasisEntry &slot = g_basis[((q[0] * 0x9E3779B1u) ^ (q[1] * 0x85EBCA6Bu) ^ (q[2] * 0xC2B2AE35u) ^ (q[3] * 0x27D4EB2Fu)) >> 25];
+                if (g_curveCache && slot.valid && slot.q[0] == q[0] && slot.q[1] == q[1] && slot.q[2] == q[2] && slot.q[3] == q[3])
                 {
-                    for (int r : kBasisRegs)
-                        u.vf[r] = hit->vf[r];
-                    u.acc = hit->acc;
+                    for (int i = 0; i < 10; ++i)
+                        u.vf[kBasisRegs[i]] = slot.vf[i];
+                    u.acc = slot.acc;
                 }
                 else
                 {
                     basis357E30(u);
-                    BasisEntry &e = g_basis[g_basisNext++ & 7u];
-                    e.valid = true;
-                    std::memcpy(e.q, q, 16u);
-                    for (int r : kBasisRegs)
-                        e.vf[r] = u.vf[r];
-                    e.acc = u.acc;
+                    ++g_c.basisMiss;
+                    slot.valid = true;
+                    std::memcpy(slot.q, q, 16u);
+                    for (int i = 0; i < 10; ++i)
+                        slot.vf[i] = u.vf[kBasisRegs[i]];
+                    slot.acc = u.acc;
                 }
             }
+            }
             CurveEntry *curve = nullptr;
-            if (g_curveCache)
-                curve = findCurve(env.rdram, T, s7, fbits(env.cInv255));
+            {
+                SegTimerT<kTime> tCurve(SEG_CURVE);
+                if (g_curveCache)
+                    curve = findCurve(env.rdram, T, s7, fbits(env.cInv255));
+            }
             env.curve = curve;
+            g_c.s7Sum += static_cast<uint64_t>(s7);
+            g_c.nSum += pl.N;
 
             int32_t s0 = 0;
             bool burst = false; // s6
@@ -1287,7 +1372,7 @@ namespace p3fes_native_effects
                     float g1 = FPU_SUB_S(cRate, m.rf(T + 0x28u));
                     const float f3 = FPU_MUL_S(g1, r);
                     const float f2 = u32ToFloat(m.r32(T + 0x24u));
-                    const float acc = FPU_ADD_S(0.0f, m.rf(E + 0x14u));
+                    const float acc = addZero(m.rf(E + 0x14u));
                     m.wf(E + 0x14u, FPU_ADD_S(acc, FPU_MUL_S(f2, f3)));
                 }
                 // 0x32B184
@@ -1367,6 +1452,7 @@ namespace p3fes_native_effects
                 }
                 aliveStep<kTime>(env, pl, s3, s4, s5, f27);
             }
+            g_c.particles += env.live;
             if (kTime)
             {
                 g_seg[SEG_LOOP] += delta(tLoop0, stamp());
@@ -1395,9 +1481,13 @@ namespace p3fes_native_effects
 
         void loadVu(Vu &u, const R5900Context *ctx)
         {
-            for (int i : {0, 1, 2, 3, 4, 5, 6, 10, 28, 29, 30, 31})
-                u.vf[i] = ctx->vu0_vf[i];
-            u.acc = ctx->vu0_acc;
+            // 0x357E30 writes every lane of the registers it leaves behind (the rotation rows) and the lanes it reads of the
+            // others (vf1.xyz, vf2..vf6) itself, so nothing but the constant vf0 has to come from the guest context
+            (void)ctx;
+            for (int i : {1, 2, 3, 4, 5, 6, 10, 28, 29, 30, 31})
+                u.vf[i] = _mm_setzero_ps();
+            u.vf[0] = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+            u.acc = _mm_setzero_ps();
         }
         void storeVu(const Vu &u, R5900Context *ctx)
         {
@@ -1810,9 +1900,9 @@ namespace p3fes_native_effects
             {
                 if (g_mode == Mode::Log && ctx->pc == kEntry)
                 {
-                    const uint64_t t0 = g_timeMode == 2 ? stamp() : nowNs();
+                    const uint64_t t0 = g_timeMode >= 2 ? stamp() : nowNs();
                     g_orig(rdram, ctx, runtime);
-                    if (g_timeMode == 2)
+                    if (g_timeMode >= 2)
                     {
                         g_hu[0][0] += delta(t0, stamp());
                         ++g_hn[0][0];
@@ -1884,7 +1974,7 @@ namespace p3fes_native_effects
                 else
                 {
                     SegTimer tt(SEG_TOTAL);
-                    const uint64_t th0 = g_timeMode == 2 ? stamp() : 0u;
+                    const uint64_t th0 = g_timeMode >= 2 ? stamp() : 0u;
                     Vu vu;
                     loadVu(vu, ctx);
                     runEmitter(env, pl, vu);
@@ -1895,7 +1985,7 @@ namespace p3fes_native_effects
                         ++g_c.native;
                         chargeCycles(runtime, env.calls * 8u + env.edges * 32u);
                     }
-                    if (g_timeMode == 2)
+                    if (g_timeMode >= 2)
                     {
                         g_hu[1][0] += delta(th0, stamp());
                         ++g_hn[1][0];
@@ -1926,21 +2016,22 @@ namespace p3fes_native_effects
         {
             uint64_t calls = 0u, native = 0u, fallback = 0u, verified = 0u, verifiedFull = 0u, bad = 0u, unwound = 0u, regBad = 0u;
             uint64_t ops[4] = {};
+            uint64_t tick = 0u;
             uint64_t fuzzRuns = 0u, fuzzBad = 0u;
         };
         SmallStats g_stForAll, g_stScale, g_stTranslate;
         GuestFunction g_origForAll = nullptr, g_origScale = nullptr, g_origTranslate = nullptr, g_colorCb = nullptr;
         constexpr uint32_t kForAllAtomics = 0x004916D0u, kColorCallback = 0x0034D0D0u, kMatrixScale = 0x004C33D0u, kMatrixTranslate = 0x004C35D0u;
-        // measured on the console (shop, A/B inside one run): the three helpers together save ~0.05 M instructions per frame
-        // (0.4 %), about what hooking costs them (the generated callers lose their direct-call path): off unless asked for
-        bool g_enForAll = false, g_enScale = false, g_enTranslate = false;
+        // all on by default: the whole set saves 0.9 M instructions per shop frame on the console (A/B inside one run); each piece
+        // is verified clean on every scene (hooking a directly called function costs ~75 instructions per call, the bodies save more)
+        bool g_enForAll = true, g_enScale = true, g_enTranslate = true;
 
         // Generic verify: the native body runs journaled on a private context, is rolled back and the original runs.
         // Compared: every byte the native body wrote (against what the original left), the whole RAM on every 32nd check,
         // callee-saved registers, $v0 and the return pc.
         template <class Native>
         void verifySmall(SmallStats &st, const char *name, GuestFunction orig, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
-                         uint32_t ra, Native &&native)
+                         uint32_t ra, Native &&native, bool compareV0 = true)
         {
             const bool full = st.verified < 16u || (st.verified % 32u) == 0u;
             if (full)
@@ -2021,7 +2112,7 @@ namespace p3fes_native_effects
                 }
             }
             (void)spr; // the native bodies only touch plain RAM
-            bool regBad = getRegU32(ctx, 2) != getRegU32(&nctx, 2);
+            bool regBad = (compareV0 && getRegU32(ctx, 2) != getRegU32(&nctx, 2)) || ctx->fcr31 != nctx.fcr31;
             for (int reg : {16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 31})
                 regBad = regBad || getRegU32(ctx, reg) != getRegU32(&saved, reg);
             for (int i = 20; i < 32; ++i)
@@ -2141,11 +2232,11 @@ namespace p3fes_native_effects
                 g_origForAll(rdram, ctx, runtime);
                 return;
             }
-            const uint64_t t0 = g_timeMode == 2 ? stamp() : 0u;
+            const uint64_t t0 = g_timeMode >= 2 ? stamp() : 0u;
             if (g_mode == Mode::Log)
             {
                 g_origForAll(rdram, ctx, runtime);
-                if (g_timeMode == 2)
+                if (g_timeMode >= 2)
                 {
                     g_hu[0][1] += delta(t0, stamp());
                     ++g_hn[0][1];
@@ -2165,8 +2256,8 @@ namespace p3fes_native_effects
             }
             if (g_mode == Mode::Verify)
             {
-                ++g_verifyTick;
-                if ((g_verifyTick % g_verifyEvery) == 0u)
+                ++g_stForAll.tick;
+                if ((g_stForAll.tick % g_verifyEvery) == 0u)
                 {
                     for (uint32_t k = 0u; k < g_fuzzPerCall; ++k)
                         fuzzForAll(g_stForAll, rdram, ctx, runtime, ra, static_cast<uint32_t>(g_verifyTick * 2654435761ull) ^ (k * 0x85EBCA6Bu));
@@ -2181,7 +2272,7 @@ namespace p3fes_native_effects
             ctx->pc = ra;
             ++g_stForAll.native;
             chargeCycles(runtime, env.calls * 8u + env.edges * 32u);
-            if (g_timeMode == 2)
+            if (g_timeMode >= 2)
             {
                 g_hu[1][1] += delta(t0, stamp());
                 ++g_hn[1][1];
@@ -2379,6 +2470,597 @@ namespace p3fes_native_effects
             std::memcpy(rdram + S, saved, sizeof(saved));
         }
 
+
+        // ---- RwMatrixRotate(M, axis, angle in degrees, op) with op 0 (replace) ----------------------------------------------
+        // 0x4C31B0 builds the axis-angle matrix with sinf/cosf and 0x4C2FC0 (RotateOneMinusCosineSine). For op 0 the second
+        // routine fills a temporary matrix on its stack (three pad words of it are never written: stale stack words that are
+        // copied into the pads of M, read here from the same stack addresses) and copies it into M; other ops multiply and
+        // run the original. sinf/cosf must be the host functions (a huge angle or the guest versions run the original).
+        void fuzzRotate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t ra, uint32_t seed);
+        constexpr uint32_t kMatrixRotate = 0x004C31B0u;
+        SmallStats g_stRotate;
+        GuestFunction g_origRotate = nullptr;
+        bool g_enRotate = true;
+
+        inline bool rotateArgs(Env &env, uint32_t M, uint32_t axis, uint64_t op, float angleDeg)
+        {
+            if (op != 0u || !rangeOk(M, 0x40u) || !rangeOk(axis, 12u) || ((M | axis) & 3u) != 0u || overlap(M, 0x40u, axis, 12u) ||
+                !rangeOk(env.sp - 0x200u, 0x100u))
+                return false;
+            if (g_sinMode == 0)
+                probeSin(env);
+            if (g_cosMode == 0)
+                probeCos(env);
+            if (g_sinMode != 1 || g_cosMode != 1)
+                return false;
+            const float rad = FPU_MUL_S(bitsf(0x3C8EFA35u), angleDeg);
+            return nativeSinArg(rad);
+        }
+
+        void rotateRun(Env &env, uint32_t M, uint32_t axis, float angleDeg)
+        {
+            Mem m = env.m;
+            R5900Context *ctx = env.ctx;
+            const float one = 1.0f;
+            const float f20 = FPU_MUL_S(bitsf(0x3C8EFA35u), angleDeg);
+            const float y0 = m.rf(axis + 4u), x0 = m.rf(axis), z0 = m.rf(axis + 8u);
+            float acc = FPU_MUL_S(y0, y0);
+            acc = FPU_ADD_S(acc, FPU_MUL_S(x0, x0));
+            const float len2 = FPU_ADD_S(acc, FPU_MUL_S(z0, z0));
+            float f3 = ps2FpuSqrt(ctx->fcr31, len2);
+            if (!cLe(env, f3, 0.0f))
+                f3 = ps2FpuDivide(ctx->fcr31, one, f3);
+            const float x = FPU_MUL_S(x0, f3), y = FPU_MUL_S(y0, f3), z = FPU_MUL_S(z0, f3);
+            env.calls += 3u; // sinf, cosf, 0x4C2FC0
+            const float sn = hostSinf(f20);
+            const float cs = hostCosf(f20);
+            const float omc = FPU_SUB_S(one, cs);
+            const float acc1 = addZero(one);
+            auto diag = [&](float v) { return FPU_SUB_S(one, FPU_MUL_S(FPU_SUB_S(acc1, FPU_MUL_S(v, v)), omc)); };
+            const float m00 = diag(x), m11 = diag(y), m22 = diag(z);
+            const float f3x = FPU_MUL_S(x, sn);
+            const float f6 = FPU_MUL_S(FPU_MUL_S(y, z), omc);
+            const float f5 = FPU_MUL_S(FPU_MUL_S(z, x), omc);
+            const float f0 = FPU_MUL_S(z, sn);
+            const float f4 = FPU_MUL_S(FPU_MUL_S(x, y), omc);
+            const float f2 = FPU_MUL_S(y, sn);
+            // stale words of the temporary matrix: sp(entry) - 0x50 (0x4C31B0 frame) - 0xB0 (0x4C2FC0 frame) + 0x60 + word
+            const uint32_t tmp = env.sp - 0x50u - 0xB0u + 0x60u;
+            const uint32_t stale7 = m.r32(tmp + 0x1Cu), stale11 = m.r32(tmp + 0x2Cu), stale15 = m.r32(tmp + 0x3Cu);
+            m.wf(M + 0x00u, m00);
+            m.wf(M + 0x04u, FPU_ADD_S(f4, f0));
+            m.wf(M + 0x08u, FPU_SUB_S(f5, f2));
+            m.w32(M + 0x0Cu, 3u);
+            m.wf(M + 0x10u, FPU_SUB_S(f4, f0));
+            m.wf(M + 0x14u, m11);
+            m.wf(M + 0x18u, FPU_ADD_S(f6, f3x));
+            m.w32(M + 0x1Cu, stale7);
+            m.wf(M + 0x20u, FPU_ADD_S(f5, f2));
+            m.wf(M + 0x24u, FPU_SUB_S(f6, f3x));
+            m.wf(M + 0x28u, m22);
+            m.w32(M + 0x2Cu, stale11);
+            m.w32(M + 0x30u, 0u);
+            m.w32(M + 0x34u, 0u);
+            m.w32(M + 0x38u, 0u);
+            m.w32(M + 0x3Cu, stale15);
+            env.edges += 7u;
+            if (env.cSet)
+                ctx->fcr31 = env.cVal ? (ctx->fcr31 | 0x800000u) : (ctx->fcr31 & ~0x800000u);
+        }
+
+        void rotateHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_stRotate.calls;
+            maybeLog();
+            if (!g_enRotate || g_mode == Mode::Off || ctx->pc != kMatrixRotate)
+            {
+                g_origRotate(rdram, ctx, runtime);
+                return;
+            }
+            const uint64_t t0 = g_timeMode >= 2 ? stamp() : 0u;
+            const uint32_t M = getRegU32(ctx, 4), axis = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+            const float angle = ctx->f[12];
+            Env env{rdram, runtime, ctx, Mem{rdram, nullptr}};
+            env.gp = getRegU32(ctx, 28);
+            env.sp = getRegU32(ctx, 29);
+            if (g_mode == Mode::Log || !rotateArgs(env, M, axis, GPR_U64(ctx, 6), angle))
+            {
+                if (g_mode != Mode::Log)
+                    ++g_stRotate.fallback;
+                g_origRotate(rdram, ctx, runtime);
+                if (g_mode == Mode::Log && g_timeMode >= 2)
+                {
+                    g_hu[0][4] += delta(t0, stamp());
+                    ++g_hn[0][4];
+                }
+                return;
+            }
+            if (g_mode == Mode::Verify)
+            {
+                ++g_stRotate.tick;
+                if ((g_stRotate.tick % g_verifyEvery) == 0u)
+                {
+                    for (uint32_t k = 0u; k < g_fuzzPerCall; ++k)
+                        fuzzRotate(rdram, ctx, runtime, ra, static_cast<uint32_t>(g_verifyTick * 2246822519ull) ^ (k * 0x9E3779B1u));
+                    verifySmall(g_stRotate, "RwMatrixRotate", g_origRotate, rdram, ctx, runtime, ra, [&](Env &e, R5900Context &c)
+                                {
+                                    rotateRun(e, M, axis, angle);
+                                    setV0(&c, M);
+                                });
+                    return;
+                }
+                g_origRotate(rdram, ctx, runtime);
+                return;
+            }
+            rotateRun(env, M, axis, angle);
+            setV0(ctx, M);
+            ctx->pc = ra;
+            ++g_stRotate.native;
+            chargeCycles(runtime, env.calls * 8u + env.edges * 32u);
+            if (g_timeMode >= 2)
+            {
+                g_hu[1][4] += delta(t0, stamp());
+                ++g_hn[1][4];
+            }
+        }
+
+        void fuzzRotate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t ra, uint32_t seed)
+        {
+            Rng rng{seed ? seed : 1u};
+            const uint32_t sp = getRegU32(ctx, 29);
+            const uint32_t S = ((sp - 0x60000u) & ~0xFFu) + 0xE000u;
+            if (S < 0x200000u)
+                return;
+            uint8_t saved[0x100];
+            std::memcpy(saved, rdram + S, sizeof(saved));
+            Mem m{rdram, nullptr};
+            const uint32_t M = S, axis = S + 0x80u;
+            for (uint32_t o = 0u; o < 0x40u; o += 4u)
+                m.wf(M + o, rng.any());
+            for (uint32_t o = 0u; o < 12u; o += 4u)
+                m.wf(axis + o, rng.below(5u) == 0u ? rng.any() : rng.flt(-1.0f, 1.0f));
+            if (rng.below(8u) == 0u)
+                for (uint32_t o = 0u; o < 12u; o += 4u)
+                    m.wf(axis + o, 0.0f);
+            const float angle = rng.below(4u) == 0u ? rng.any() : rng.flt(-720.0f, 720.0f);
+            R5900Context fctx = *ctx;
+            fctx.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(M));
+            fctx.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(axis));
+            fctx.r[6] = _mm_set_epi64x(0, 0);
+            fctx.f[12] = angle;
+            fctx.fcr31 = rng.next() & 0x00FFFFFFu & ~0x0u;
+            Env env{rdram, runtime, &fctx, Mem{rdram, nullptr}};
+            env.gp = getRegU32(ctx, 28);
+            env.sp = sp;
+            if (!rotateArgs(env, M, axis, 0u, angle))
+            {
+                std::memcpy(rdram + S, saved, sizeof(saved));
+                return;
+            }
+            ++g_stRotate.fuzzRuns;
+            const uint64_t before = g_stRotate.bad;
+            verifySmall(g_stRotate, "RwMatrixRotate(fuzz)", g_origRotate, rdram, &fctx, runtime, ra, [&](Env &e, R5900Context &c)
+                        {
+                            rotateRun(e, M, axis, angle);
+                            setV0(&c, M);
+                        });
+            if (g_stRotate.bad != before)
+            {
+                ++g_stRotate.fuzzBad;
+            }
+            std::memcpy(rdram + S, saved, sizeof(saved));
+        }
+
+
+        // ---- 0x3275D0, draw variant 1 without local space: effect particles -> the sky pipeline's vertex streams ------------
+        //
+        // The draw object D ([D+0x4C] = the effect's emitter block, [D+0x50] = the pipeline object, [D+0xC] = variant) is
+        // drawn by 0x3275D0 through a jump table. Variant 1 with the local-space flag clear does: 0x477050 (advance the ring
+        // of stream descriptors of the pipeline object), four 0x474640 (position / colour / size / angle stream: base and
+        // stride from the descriptors, each also ORs a flag into the object), then for every live slot of the emitter the
+        // position, colour word, normalised angle (the slot's angle is written back) and size*scale are stored into the
+        // four streams, 0x4747F0 (merges the flag words) and, when something was drawn, the material colour, a flag, the
+        // vertex count and the draw is queued (0x323860 -> 0x321140: a singly linked list per layer). All of these
+        // callees are small and pure on guest memory, so they are inlined; nothing here calls the guest.
+        constexpr uint32_t kDraw = 0x003275D0u;
+        SmallStats g_stDraw;
+        GuestFunction g_origDraw = nullptr;
+        bool g_enDraw = true;
+
+        struct DrawPlan
+        {
+            uint32_t D = 0u, s3 = 0u, P = 0u, s1 = 0u, s6 = 0u, B = 0u, R = 0u, M = 0u;
+            uint32_t N = 0u, live = 0u;
+            bool ring = false;       // 0x477050 advances the ring
+            int32_t newIdx = 0;
+            bool copyEntries = false;
+            uint32_t ent[9] = {};
+            uint32_t ptr[4] = {}, stride[4] = {}; // position, colour, size, angle streams
+            uint32_t k4580 = 0u;
+            uint32_t listSlot = 0u;
+            uint32_t flagBits = 0u;
+            float f3 = 0.0f, f4 = 0.0f, f2 = 0.0f, scale = 0.0f;
+        };
+
+        inline bool dfail(int) { return false; } // (print the line number here to see why a precheck refuses)
+
+        bool drawPrecheck(Env &env, uint32_t D, float scale, DrawPlan &pl)
+        {
+            const Mem &m = env.m;
+            const uint32_t gp = env.gp;
+            if (!rangeOk(D, 0x60u) || (D & 3u) != 0u || !rangeOk(gp - 0x7F40u, 0x100u) || !rangeOk(gp - 0x4600u, 0x500u))
+                return dfail(__LINE__);
+            pl.D = D;
+            pl.scale = scale;
+            pl.s3 = m.r32(D + 0x4Cu);
+            if (!rangeOk(pl.s3, 0x30u) || (pl.s3 & 3u) != 0u)
+                return dfail(__LINE__);
+            const int32_t n = m.ri32(pl.s3 + 8u);
+            if (n <= 0 || n > 0x1000 || m.r32(pl.s3 + 0x10u) == 0u)
+                return dfail(__LINE__); // the original's early exits
+            pl.N = static_cast<uint32_t>(n);
+            pl.P = m.r32(pl.s3 + 0x18u);
+            const uint32_t pBytes = pl.N * 0x20u;
+            if (!rangeOk(pl.P, pBytes) || (pl.P & 3u) != 0u)
+                return dfail(__LINE__);
+            uint16_t variant;
+            std::memcpy(&variant, env.rdram + D + 0xCu, 2u);
+            if (variant != 1u || (m.r32(pl.s3 + 0xCu) & 1u) != 0u)
+                return dfail(__LINE__);
+            const uint32_t pipe = m.r32(D + 0x50u);
+            if (!rangeOk(pipe, 0x20u) || (pipe & 3u) != 0u)
+                return dfail(__LINE__);
+            pl.s1 = m.r32(pipe + 0x10u);
+            pl.s6 = m.r32(pl.s3 + 0x20u);
+            pl.k4580 = m.r32(gp - 0x4580u);
+            if (!rangeOk(pl.s6, 0x60u) || !rangeOk(pl.s1 + pl.k4580, 4u) || pl.s1 + pl.k4580 < pl.s1)
+                return dfail(__LINE__);
+            pl.B = m.r32(pl.s1 + pl.k4580);
+            if (!rangeOk(pl.B, 0x100u) || (pl.B & 3u) != 0u)
+                return dfail(__LINE__);
+            pl.R = m.r32(pl.B + 0x9Cu);
+            if (!rangeOk(pl.R, 0x400u) || (pl.R & 3u) != 0u)
+                return dfail(__LINE__);
+            // 0x477050 (virtual)
+            pl.ring = m.r32(pl.R + 0xD8u) != 0u;
+            if (pl.ring)
+            {
+                const int32_t idx = m.ri32(pl.R + 0xE4u), cnt = m.ri32(pl.R + 0xE8u);
+                pl.newIdx = idx < cnt ? idx + 1 : 0;
+                if (cnt != 0)
+                {
+                    pl.copyEntries = true;
+                    if (pl.newIdx < 0 || pl.newIdx > 0x1000 || !rangeOk(pl.R + 0x140u + 36u * static_cast<uint32_t>(pl.newIdx), 36u))
+                        return dfail(__LINE__);
+                    for (uint32_t k = 0u; k < 3u; ++k)
+                        for (uint32_t j = 0u; j < 3u; ++j)
+                            pl.ent[k * 3u + j] = m.r32(pl.R + 0x140u + 36u * static_cast<uint32_t>(pl.newIdx) + 12u * k + 4u * j);
+                }
+            }
+            // 0x474640 x4 (virtual): the descriptors as they will be after the ring advance
+            auto bv = [&](uint32_t off) -> uint32_t
+            {
+                if (pl.copyEntries)
+                    for (uint32_t k = 0u; k < 3u; ++k)
+                        for (uint32_t j = 0u; j < 3u; ++j)
+                            if (off == 0x54u + 0x18u * k + 8u * j)
+                                return pl.ent[k * 3u + j];
+                return m.r32(pl.B + off);
+            };
+            // entries land at B+0x54+0x18k, +0x5C+0x18k, +0x64+0x18k
+            static const uint32_t kMask[4] = {1u, 2u, 4u, 0x20u};
+            // 0x474640 reads the stream (base, stride) pairs at descriptor+4/+8 (id 1), +0x24/+0x28 (2), +0x1C/+0x20 (4), +0x34/+0x38 (0x20);
+            // the descriptor is B+0x50
+            static const uint32_t kBase[4] = {0x54u, 0x74u, 0x6Cu, 0x84u};
+            const uint32_t avail = m.r32(pl.B + 0xA8u), over = m.r32(pl.B + 0xA4u);
+            for (int i = 0; i < 4; ++i)
+            {
+                // 0x474640: a stream the pipeline object does not have, or one without a base, comes back as base 0 / stride
+                // 0 and the loop of 0x3275D0 stores through it all the same (to the words at address 0); only a real one
+                // marks its flag
+                bool present = (avail & kMask[i]) != 0u;
+                pl.ptr[i] = present ? bv(kBase[i]) : 0u;
+                pl.stride[i] = present ? bv(kBase[i] + 4u) : 0u;
+                if (present && over != 0u)
+                    pl.stride[i] = over;
+                if (pl.ptr[i] == 0u)
+                {
+                    present = false;
+                    pl.stride[i] = 0u;
+                }
+                if (present)
+                    pl.flagBits |= 0x40000000u | kMask[i];
+            }
+            // live slots and their angles; the angle loops need a sane step
+            pl.f3 = m.rf(gp - 0x7EA0u);
+            pl.f4 = m.rf(gp - 0x7E98u);
+            pl.f2 = m.rf(gp - 0x7E88u);
+            const uint32_t stepBits = fbits(pl.f3);
+            if (stepBits < 0x3F800000u || stepBits > 0x46000000u) // 1.0 .. 8192.0
+                return dfail(__LINE__);
+            uint32_t live = 0u;
+            for (uint32_t i = 0u; i < pl.N; ++i)
+            {
+                const uint32_t slot = pl.P + 0x20u * i;
+                if (m.ri32(slot + 0x10u) < 0)
+                    continue;
+                ++live;
+                if ((m.r32(slot + 0x1Cu) & 0x7FFFFFFFu) > 0x447A0000u) // |angle| <= 1000 (also excludes exponent 255)
+                    return dfail(__LINE__);
+            }
+            pl.live = live;
+            // streams: 4-aligned, small positive stride, inside RAM, away from everything that is read afterwards
+            struct Rg { uint32_t a, n; };
+            // (R is only read before the first stream store, exactly as in the original: no entry for it)
+            Rg avoid[6] = {{pl.P, pBytes}, {D, 0x60u}, {pl.s3, 0x30u}, {pl.s6, 0x60u}, {pl.B, 0x100u}, {pl.s1 + pl.k4580, 4u}};
+            for (int i = 0; i < 4; ++i)
+            {
+                if (pl.ptr[i] == 0u)
+                    continue; // the stores land on the words at address 0 (stride 0): nothing else is touched
+                if ((pl.ptr[i] & 3u) != 0u || pl.stride[i] == 0u || pl.stride[i] > 0x400u || (pl.stride[i] & 3u) != 0u)
+                    return dfail(__LINE__);
+                const uint32_t len = pl.stride[i] * (live ? live : 1u) + 16u;
+                if (!rangeOk(pl.ptr[i], len))
+                    return dfail(__LINE__);
+                for (const Rg &r : avoid)
+                    if (overlap(pl.ptr[i], len, r.a, r.n))
+                        return dfail(__LINE__);
+            }
+            // streams at address 0 must not alias the data the loop reads either
+            for (const Rg &r : avoid)
+                if (overlap(0u, 16u, r.a, r.n))
+                    return dfail(__LINE__);
+            if (live != 0u)
+            {
+                const uint32_t v = m.r32(pl.s1 + 0x18u);
+                if (!rangeOk(v, 0x24u) || (v & 3u) != 0u)
+                    return dfail(__LINE__);
+                const uint32_t w = m.r32(v + 0x20u);
+                if (!rangeOk(w, 4u) || (w & 3u) != 0u)
+                    return dfail(__LINE__);
+                pl.M = m.r32(w);
+                const uint32_t node = m.r32(D + 0x50u);
+                uint16_t layer, idx;
+                std::memcpy(&layer, env.rdram + gp - 0x62C8u, 2u);
+                std::memcpy(&idx, env.rdram + pl.s6 + 0x54u, 2u);
+                pl.listSlot = 0x957920u + static_cast<uint32_t>(layer) * 28u + static_cast<uint32_t>(idx) * 4u;
+                if (!rangeOk(pl.M, 8u) || !rangeOk(pl.listSlot, 4u) || !rangeOk(node, 0x20u) || overlap(pl.listSlot, 4u, node + 0x18u, 4u) ||
+                    overlap(pl.M + 4u, 4u, pl.listSlot, 4u) || overlap(pl.M, 8u, pl.B, 0x100u) ||
+                    overlap(pl.listSlot, 4u, pl.B, 0x100u))
+                    return dfail(__LINE__);
+                for (int i = 0; i < 4; ++i)
+                    if (pl.ptr[i] != 0u && (overlap(pl.ptr[i], pl.stride[i] * live + 16u, pl.M, 8u) || overlap(pl.ptr[i], pl.stride[i] * live + 16u, pl.listSlot, 4u) ||
+                        overlap(pl.ptr[i], pl.stride[i] * live + 16u, node, 0x20u)))
+                        return dfail(__LINE__);
+                if (overlap(0u, 16u, pl.M, 8u) || overlap(0u, 16u, pl.listSlot, 4u) || overlap(0u, 16u, node, 0x20u))
+                    return dfail(__LINE__);
+            }
+            return true;
+        }
+
+        void drawRun(Env &env, const DrawPlan &pl)
+        {
+            Mem m = env.m;
+            const float f21 = FPU_MUL_S(m.rf(pl.D + 0x54u), pl.scale);
+            const float f20 = FPU_MUL_S(m.rf(pl.D + 0x58u), pl.scale);
+            env.calls += 8u; // 0x477050, 4 x 0x474640, 0x4747F0, 0x323860 (-> 0x321140)
+            // 0x477050
+            if (pl.ring)
+            {
+                m.w32(pl.R + 0xE4u, static_cast<uint32_t>(pl.newIdx));
+                if (pl.copyEntries)
+                    for (uint32_t k = 0u; k < 3u; ++k)
+                    {
+                        m.w32(pl.B + 0x54u + 0x18u * k, pl.ent[k * 3u + 0u]);
+                        m.w32(pl.B + 0x5Cu + 0x18u * k, pl.ent[k * 3u + 1u]);
+                        m.w32(pl.B + 0x64u + 0x18u * k, pl.ent[k * 3u + 2u]);
+                    }
+            }
+            // four 0x474640: the flag word of the pipeline object collects 0x40000000 | stream id
+            const uint32_t flags3C = m.r32(pl.B + 0x3Cu) | pl.flagBits;
+            uint32_t p0 = pl.ptr[0], p1 = pl.ptr[1], p2 = pl.ptr[2], p3 = pl.ptr[3];
+            uint32_t drawn = 0u;
+            for (uint32_t i = 0u; i < pl.N; ++i)
+            {
+                const uint32_t slot = pl.P + 0x20u * i;
+                if (m.ri32(slot + 0x10u) < 0)
+                    continue;
+                m.w32(p0, m.r32(slot));
+                m.w32(p0 + 4u, m.r32(slot + 4u));
+                m.w32(p0 + 8u, m.r32(slot + 8u));
+                p0 += pl.stride[0];
+                m.w32(p1, m.r32(slot + 0x14u));
+                p1 += pl.stride[1];
+                float f0 = m.rf(slot + 0x1Cu);
+                if (cLe(env, f0, pl.f4))
+                {
+                    if (cLt(env, f0, pl.f2))
+                        for (;;)
+                        {
+                            if (!cLt(env, f0, pl.f2))
+                                break;
+                            f0 = FPU_ADD_S(f0, pl.f3);
+                            ++env.edges;
+                        }
+                }
+                else
+                    for (;;)
+                    {
+                        if (cLe(env, f0, pl.f4))
+                            break;
+                        f0 = FPU_SUB_S(f0, pl.f3);
+                        ++env.edges;
+                    }
+                m.wf(slot + 0x1Cu, f0);
+                m.wf(p3, f0);
+                p3 += pl.stride[3];
+                const float f1 = m.rf(slot + 0x18u);
+                m.wf(p2, FPU_MUL_S(f21, f1));
+                m.wf(p2 + 4u, FPU_MUL_S(f20, f1));
+                p2 += pl.stride[2];
+                ++drawn;
+            }
+            if (pl.N > 1u)
+                env.edges += pl.N - 1u;
+            // 0x4747F0
+            m.w32(pl.B + 0x40u, m.r32(pl.B + 0x40u) | flags3C);
+            m.w32(pl.B + 0x3Cu, 0u);
+            if (drawn != 0u)
+            {
+                m.w32(pl.M + 4u, m.r32(pl.D + 4u));
+                m.w32(pl.B + 0x40u, m.r32(pl.B + 0x40u) | 0x00800000u);
+                m.w32(pl.B + 4u, drawn);
+                const uint32_t node = m.r32(pl.D + 0x50u);
+                m.w32(node + 0x18u, m.r32(pl.listSlot));
+                m.w32(pl.listSlot, node);
+            }
+            if (env.cSet)
+                env.ctx->fcr31 = env.cVal ? (env.ctx->fcr31 | 0x800000u) : (env.ctx->fcr31 & ~0x800000u);
+        }
+
+        void drawHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_stDraw.calls;
+            maybeLog();
+            if (!g_enDraw || g_mode == Mode::Off || ctx->pc != kDraw)
+            {
+                g_origDraw(rdram, ctx, runtime);
+                return;
+            }
+            const uint64_t t0 = g_timeMode >= 2 ? stamp() : 0u;
+            const uint32_t ra = getRegU32(ctx, 31);
+            Env env{rdram, runtime, ctx, Mem{rdram, nullptr}};
+            env.gp = getRegU32(ctx, 28);
+            env.sp = getRegU32(ctx, 29);
+            DrawPlan pl;
+            if (g_mode == Mode::Log || !drawPrecheck(env, getRegU32(ctx, 4), ctx->f[12], pl))
+            {
+                if (g_mode != Mode::Log)
+                    ++g_stDraw.fallback;
+                g_origDraw(rdram, ctx, runtime);
+                if (g_mode == Mode::Log && g_timeMode >= 2)
+                {
+                    g_hu[0][5] += delta(t0, stamp());
+                    ++g_hn[0][5];
+                }
+                return;
+            }
+            if (g_mode == Mode::Verify)
+            {
+                ++g_stDraw.tick;
+                if ((g_stDraw.tick % g_verifyEvery) == 0u)
+                {
+                    verifySmall(g_stDraw, "Draw 0x3275D0", g_origDraw, rdram, ctx, runtime, ra, [&](Env &e, R5900Context &) { drawRun(e, pl); }, false);
+                    return;
+                }
+                g_origDraw(rdram, ctx, runtime);
+                return;
+            }
+            drawRun(env, pl);
+            ctx->pc = ra;
+            ++g_stDraw.native;
+            chargeCycles(runtime, env.calls * 8u + env.edges * 32u);
+            if (g_timeMode >= 2)
+            {
+                g_hu[1][5] += delta(t0, stamp());
+                ++g_hn[1][5];
+            }
+        }
+
+
+        // ---- 0x4CB7F0 RwFrameTransform(frame, matrix, op 0) ------------------------------------------------------------------
+        // op 0 copies the matrix over the frame's modelling matrix (frame+0x10, 0x40 bytes: 0x4C3760) and marks the frame
+        // tree dirty (flag bits of the root at [frame+0xA0] and, if it was clean, the root joins the list headed at 0x96012C).
+        constexpr uint32_t kFrameTransform = 0x004CB7F0u, kDirtyList = 0x0096012Cu;
+        SmallStats g_stFrame;
+        GuestFunction g_origFrame = nullptr;
+        bool g_enFrame = true;
+
+        bool frameArgs(const Env &env, uint32_t F, uint32_t M, uint64_t op)
+        {
+            const Mem &m = env.m;
+            if (op != 0u || !rangeOk(F, 0xB0u) || !rangeOk(M, 0x40u) || ((F | M) & 3u) != 0u || !rangeOk(kDirtyList, 4u))
+                return false;
+            const uint32_t R = m.r32(F + 0xA0u);
+            if (!rangeOk(R, 0x10u) || (R & 3u) != 0u)
+                return false;
+            const uint32_t X = m.r32(kDirtyList);
+            if (!rangeOk(X, 8u))
+                return false;
+            struct Rg { uint32_t a, n; };
+            // written: the copy, the root's header and the list; read afterwards: the root pointer, the list head
+            const Rg r[6] = {{M, 0x40u}, {F + 0x10u, 0x40u}, {F + 0xA0u, 4u}, {kDirtyList, 4u}, {X, 8u}, {R, 0x10u}};
+            for (int i = 0; i < 6; ++i)
+                for (int j = i + 1; j < 6; ++j)
+                    if (overlap(r[i].a, r[i].n, r[j].a, r[j].n))
+                        return false;
+            // the root may be the frame itself: its header (+0..+0xF) is outside the copy and the root pointer
+            return true;
+        }
+
+        void frameRun(Env &env, uint32_t F, uint32_t M)
+        {
+            Mem m = env.m;
+            env.calls += 1u;
+            for (uint32_t i = 0u; i < 16u; ++i)
+                m.w32(F + 0x10u + 4u * i, m.r32(M + 4u * i));
+            env.edges += 7u;
+            const uint32_t a1 = m.r8(m.r32(F + 0xA0u) + 3u);
+            if ((a1 & 3u) == 0u)
+            {
+                const uint32_t R = m.r32(F + 0xA0u);
+                const uint32_t X = m.r32(kDirtyList);
+                m.w32(R + 8u, X);
+                m.w32(m.r32(F + 0xA0u) + 0xCu, kDirtyList);
+                const uint32_t v1 = m.r32(F + 0xA0u);
+                m.w32(m.r32(kDirtyList) + 4u, v1 + 8u);
+                m.w32(kDirtyList, m.r32(F + 0xA0u) + 8u);
+            }
+            m.w8(m.r32(F + 0xA0u) + 3u, static_cast<uint8_t>(a1 | 3u));
+            m.w8(F + 3u, static_cast<uint8_t>(m.r8(F + 3u) | 0xCu));
+        }
+
+        void frameHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_stFrame.calls;
+            maybeLog();
+            if (!g_enFrame || g_mode == Mode::Off || g_mode == Mode::Log || ctx->pc != kFrameTransform)
+            {
+                g_origFrame(rdram, ctx, runtime);
+                return;
+            }
+            const uint32_t F = getRegU32(ctx, 4), M = getRegU32(ctx, 5), ra = getRegU32(ctx, 31);
+            Env env{rdram, runtime, ctx, Mem{rdram, nullptr}};
+            env.gp = getRegU32(ctx, 28);
+            env.sp = getRegU32(ctx, 29);
+            if (!frameArgs(env, F, M, GPR_U64(ctx, 6)))
+            {
+                ++g_stFrame.fallback;
+                g_origFrame(rdram, ctx, runtime);
+                return;
+            }
+            if (g_mode == Mode::Verify)
+            {
+                ++g_stFrame.tick;
+                if ((g_stFrame.tick % g_verifyEvery) == 0u)
+                {
+                    verifySmall(g_stFrame, "RwFrameTransform", g_origFrame, rdram, ctx, runtime, ra, [&](Env &e, R5900Context &c)
+                                {
+                                    frameRun(e, F, M);
+                                    setV0(&c, F);
+                                });
+                    return;
+                }
+                g_origFrame(rdram, ctx, runtime);
+                return;
+            }
+            frameRun(env, F, M);
+            setV0(ctx, F);
+            ctx->pc = ra;
+            ++g_stFrame.native;
+            chargeCycles(runtime, env.calls * 8u + env.edges * 32u);
+        }
+
         template <bool kScale>
         void matrixHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
@@ -2412,11 +3094,11 @@ namespace p3fes_native_effects
                 setV0(&c, M);
             };
             const int hid = kScale ? 2 : 3;
-            const uint64_t t0 = g_timeMode == 2 ? stamp() : 0u;
+            const uint64_t t0 = g_timeMode >= 2 ? stamp() : 0u;
             if (g_mode == Mode::Log)
             {
                 orig(rdram, ctx, runtime);
-                if (g_timeMode == 2)
+                if (g_timeMode >= 2)
                 {
                     g_hu[0][hid] += delta(t0, stamp());
                     ++g_hn[0][hid];
@@ -2425,8 +3107,8 @@ namespace p3fes_native_effects
             }
             if (g_mode == Mode::Verify)
             {
-                ++g_verifyTick;
-                if ((g_verifyTick % g_verifyEvery) == 0u)
+                ++st.tick;
+                if ((st.tick % g_verifyEvery) == 0u)
                 {
                     ++st.ops[op];
                     for (uint32_t k = 0u; k < g_fuzzPerCall; ++k)
@@ -2440,7 +3122,7 @@ namespace p3fes_native_effects
             run(env, *ctx);
             ctx->pc = ra;
             ++st.native;
-            if (g_timeMode == 2)
+            if (g_timeMode >= 2)
             {
                 g_hu[1][hid] += delta(t0, stamp());
                 ++g_hn[1][hid];
@@ -2469,6 +3151,9 @@ namespace p3fes_native_effects
         // P3FES_EFFECTS_TIMEFN=addr[,addr...] (with P3FES_EFFECTS_TIME=2, measurement only): pass-through wrappers that
         // report the PMU instructions of the game thread per call of those functions, measured like the helpers above
         uint64_t g_tfUnits[4] = {}, g_tfCalls[4] = {};
+        uint64_t g_hist[16] = {}, g_histN = 0u, g_histLive = 0u;
+        inline uint32_t r32At(const uint8_t *r, uint32_t a) { uint32_t v; std::memcpy(&v, r + (a & PS2_RAM_MASK), 4u); return v; }
+        inline uint32_t r16At(const uint8_t *r, uint32_t a) { uint16_t v; std::memcpy(&v, r + (a & PS2_RAM_MASK), 2u); return v; }
         uint32_t g_tfAddr[4] = {};
         GuestFunction g_tfOrig[4] = {};
         uint32_t g_tfCount = 0u;
@@ -2479,6 +3164,27 @@ namespace p3fes_native_effects
             {
                 g_tfOrig[I](rdram, ctx, runtime);
                 return;
+            }
+            if (g_tfAddr[I] == 0x003275D0u)
+            {
+                // measurement: variant, local-space flag, slots and live particles of the draw
+                const uint32_t a0 = getRegU32(ctx, 4);
+                const uint32_t variant = r16At(rdram, a0 + 0xCu) & 7u;
+                const uint32_t blk = r32At(rdram, a0 + 0x4Cu);
+                if (blk != 0u && blk < kRamSize - 0x100u)
+                {
+                    const uint32_t n = r32At(rdram, blk + 4u), pp = r32At(rdram, blk + 0x18u);
+                    const uint32_t local = r32At(rdram, blk + 0xCu) & 1u;
+                    if (variant < 8u && n < 0x1000u && pp < kRamSize - n * 0x20u)
+                    {
+                        uint32_t live = 0u;
+                        for (uint32_t i = 0u; i < n; ++i)
+                            live += static_cast<int32_t>(r32At(rdram, pp + i * 0x20u + 0x10u)) >= 0 ? 1u : 0u;
+                        ++g_hist[variant * 2u + local];
+                        g_histN += n;
+                        g_histLive += live;
+                    }
+                }
             }
             const uint64_t t0 = stamp();
             g_tfOrig[I](rdram, ctx, runtime);
@@ -2514,7 +3220,7 @@ namespace p3fes_native_effects
                      (unsigned long long)g_c.expired, (unsigned long long)g_c.trailInit, (unsigned long long)g_c.trailLow,
                      (unsigned long long)g_c.trailHigh, (unsigned long long)g_c.sinGuest, (unsigned long long)g_c.guestFail);
         {
-            const struct { const char *name; const SmallStats *st; } smalls[] = {{"forAllAtomics", &g_stForAll}, {"matrixScale", &g_stScale}, {"matrixTranslate", &g_stTranslate}};
+            const struct { const char *name; const SmallStats *st; } smalls[] = {{"forAllAtomics", &g_stForAll}, {"matrixScale", &g_stScale}, {"matrixTranslate", &g_stTranslate}, {"matrixRotate", &g_stRotate}, {"draw 0x3275D0", &g_stDraw}, {"frameTransform", &g_stFrame}};
             for (const auto &sm : smalls)
                 if (sm.st->calls)
                     std::fprintf(stderr, "[p3fes-effects] %s: calls=%llu native=%llu fallback=%llu | verify checked=%llu (full %llu) bad=%llu regBad=%llu unwound=%llu ops=%llu/%llu/%llu fuzz=%llu bad=%llu\n", sm.name,
@@ -2523,6 +3229,11 @@ namespace p3fes_native_effects
                                  (unsigned long long)sm.st->regBad, (unsigned long long)sm.st->unwound, (unsigned long long)sm.st->ops[0],
                                  (unsigned long long)sm.st->ops[1], (unsigned long long)sm.st->ops[2], (unsigned long long)sm.st->fuzzRuns, (unsigned long long)sm.st->fuzzBad);
         }
+        std::fprintf(stderr, "[p3fes-effects] attrs hit=%llu miss=%llu nocache=%llu curveEntryMiss=%llu basisMiss=%llu avg s7=%.1f avg N=%.1f\n",
+                     (unsigned long long)g_c.attrHit, (unsigned long long)g_c.attrMiss, (unsigned long long)g_c.attrNoCache,
+                     (unsigned long long)g_c.curveEntryMiss, (unsigned long long)g_c.basisMiss,
+                     g_c.native + g_c.verified ? static_cast<double>(g_c.s7Sum) / static_cast<double>(g_c.native + g_c.verified) : 0.0,
+                     g_c.native + g_c.verified ? static_cast<double>(g_c.nSum) / static_cast<double>(g_c.native + g_c.verified) : 0.0);
         if (g_c.fbAlias)
         {
             std::fprintf(stderr, "[p3fes-effects] alias reasons:");
@@ -2542,6 +3253,10 @@ namespace p3fes_native_effects
                          (unsigned long long)g_c.verifyRegBad, (unsigned long long)g_c.verifyUnwound, (unsigned long long)g_c.verifySoft);
         if (g_timeMode == 2 && g_segN[SEG_TOTAL])
         {
+            std::fprintf(stderr, "[p3fes-effects] stamp cost %llu instr; parts per call: basis %.0f curve %.0f; sin per live particle %.0f\n", (unsigned long long)g_stampCost,
+                         static_cast<double>(g_seg[SEG_BASIS]) / static_cast<double>(g_segN[SEG_TOTAL]),
+                         static_cast<double>(g_seg[SEG_CURVE]) / static_cast<double>(g_segN[SEG_TOTAL]),
+                         g_segN[SEG_SIN] ? static_cast<double>(g_seg[SEG_SIN]) / static_cast<double>(g_segN[SEG_SIN]) : 0.0);
             const double calls = static_cast<double>(g_segN[SEG_TOTAL]);
             auto per = [&](int seg) { return static_cast<double>(g_seg[seg]) / calls - static_cast<double>(g_stampCost) * static_cast<double>(g_segN[seg]) / calls; };
             std::fprintf(stderr,
@@ -2549,14 +3264,27 @@ namespace p3fes_native_effects
                          (unsigned long long)g_stampCost, per(SEG_PRE), per(SEG_SETUP), per(SEG_LOOP), per(SEG_ALIVE), per(SEG_SPAWN),
                          static_cast<double>(g_segN[SEG_ALIVE]) / calls, static_cast<double>(g_segN[SEG_SPAWN]) / calls, per(SEG_POST), per(SEG_TOTAL));
         }
-        if (g_timeMode == 2)
+        if (g_timeMode >= 2)
         {
-            static const char *const names[4] = {"particles 0x32AF30", "forAllAtomics", "matrixScale", "matrixTranslate"};
-            for (int i = 0; i < 4; ++i)
+            static const char *const names[6] = {"particles 0x32AF30", "forAllAtomics", "matrixScale", "matrixTranslate", "matrixRotate", "draw 0x3275D0"};
+            for (int i = 0; i < 6; ++i)
                 for (int k = 0; k < 2; ++k)
                     if (g_hn[k][i])
                         std::fprintf(stderr, "[p3fes-effects] %s %s: %.0f instr/call over %llu calls\n", names[i], k ? "native" : "original",
                                      static_cast<double>(g_hu[k][i]) / static_cast<double>(g_hn[k][i]), (unsigned long long)g_hn[k][i]);
+        }
+        {
+            uint64_t tot = 0u;
+            for (uint64_t h : g_hist)
+                tot += h;
+            if (tot)
+            {
+                std::fprintf(stderr, "[p3fes-effects] 0x3275D0 draws (variant,local):");
+                for (int i = 0; i < 16; ++i)
+                    if (g_hist[i])
+                        std::fprintf(stderr, " v%d/l%d=%llu", i / 2, i & 1, (unsigned long long)g_hist[i]);
+                std::fprintf(stderr, " avg slots %.1f avg live %.2f\n", static_cast<double>(g_histN) / static_cast<double>(tot), static_cast<double>(g_histLive) / static_cast<double>(tot));
+            }
         }
         for (uint32_t i = 0u; i < g_tfCount; ++i)
             if (g_tfCalls[i])
@@ -2589,17 +3317,33 @@ namespace p3fes_native_effects
             g_verifyFull = static_cast<uint32_t>(std::strtoul(e, nullptr, 10));
         const char *timing = std::getenv("P3FES_EFFECTS_TIME");
         g_time = timing && *timing == '1';
-        g_timeMode = timing && *timing == '2' ? 2 : 0;
-        if (g_timeMode == 2)
+        g_timeMode = timing && *timing == '2' ? 2 : (timing && *timing == '3' ? 3 : 0);
+        if (g_timeMode >= 2)
         {
-            uint64_t acc = 0u;
-            for (int i = 0; i < 400; ++i)
+            const uint64_t c0 = stamp();
+            for (int i = 0; i < 1000; ++i)
+                (void)stamp();
+            const uint64_t c1 = stamp();
+            g_stampCost = delta(c0, c1) / 1001u; // instructions that one stamp() adds to whatever is measured around it
+            // micro costs (instructions per operation) for the log
+            volatile float sink = 0.0f;
+            float x = 0.1f;
+            const uint64_t t0 = stamp();
+            for (int i = 0; i < 1000; ++i)
             {
-                const uint64_t a = stamp();
-                const uint64_t b = stamp();
-                acc += delta(a, b);
+                sink = hostSinf(x);
+                x += 0.0371f;
             }
-            g_stampCost = acc / 400u;
+            const uint64_t t1 = stamp();
+            float a = 1.0f;
+            for (int i = 0; i < 1000; ++i)
+            {
+                a = FPU_ADD_S(a, 0.001f);
+                a = FPU_MUL_S(a, 1.0001f);
+            }
+            sink = a;
+            const uint64_t t2 = stamp();
+            std::fprintf(stderr, "[p3fes-effects] stamp cost %llu instr; micro: sinf %u instr/call, ps2 add+mul pair %u instr\n", (unsigned long long)g_stampCost, delta(t0, t1) / 1000u, delta(t1, t2) / 1000u);
         }
         g_trace = std::getenv("P3FES_EFFECTS_TRACE") != nullptr;
         if (const char *e = std::getenv("P3FES_EFFECTS_CACHE"); e && *e == '0')
@@ -2616,7 +3360,7 @@ namespace p3fes_native_effects
             return false;
         }
         bool enAf30 = true;
-        if (const char *e = std::getenv("P3FES_EFFECTS_TIMEFN"); e && *e && g_timeMode == 2)
+        if (const char *e = std::getenv("P3FES_EFFECTS_TIMEFN"); e && *e && g_timeMode >= 2)
         {
             const char *list = e;
             while (*list && g_tfCount < 4u)
@@ -2631,13 +3375,13 @@ namespace p3fes_native_effects
                     ++g_tfCount;
             }
             enAf30 = false;
-            g_enForAll = g_enScale = g_enTranslate = false;
+            g_enForAll = g_enScale = g_enTranslate = g_enRotate = g_enDraw = g_enFrame = false;
         }
         else if (const char *e = std::getenv("P3FES_EFFECTS_PROBE"); e && *e)
         {
             // measurement: only the probes, no native path
             enAf30 = false;
-            g_enForAll = g_enScale = g_enTranslate = false;
+            g_enForAll = g_enScale = g_enTranslate = g_enRotate = g_enDraw = g_enFrame = false;
             const char *list = e;
             while (*list && g_probeCount < 4u)
             {
@@ -2658,13 +3402,16 @@ namespace p3fes_native_effects
         {
             const std::string list = std::string(",") + e + ",";
             if (list == ",all,")
-                g_enForAll = g_enScale = g_enTranslate = true;
+                g_enForAll = g_enScale = g_enTranslate = g_enRotate = g_enDraw = g_enFrame = true;
             else
             {
                 enAf30 = list.find(",af30,") != std::string::npos;
                 g_enForAll = list.find(",forall,") != std::string::npos;
                 g_enScale = list.find(",scale,") != std::string::npos;
                 g_enTranslate = list.find(",translate,") != std::string::npos;
+                g_enRotate = list.find(",rotate,") != std::string::npos;
+                g_enDraw = list.find(",draw,") != std::string::npos;
+                g_enFrame = list.find(",frame,") != std::string::npos;
             }
         }
         g_colorCb = runtime.lookupFunction(kColorCallback);
@@ -2672,7 +3419,10 @@ namespace p3fes_native_effects
         const bool h1 = g_enForAll && installOne(runtime, kForAllAtomics, &forAllHook, g_origForAll);
         const bool h2 = g_enScale && installOne(runtime, kMatrixScale, &matrixHook<true>, g_origScale);
         const bool h3 = g_enTranslate && installOne(runtime, kMatrixTranslate, &matrixHook<false>, g_origTranslate);
-        if (g_alternate > 0 && g_mode == Mode::On && (h0 || h1 || h2 || h3 || g_probeCount != 0u))
+        const bool h4 = g_enRotate && installOne(runtime, kMatrixRotate, &rotateHook, g_origRotate);
+        const bool h5 = g_enDraw && installOne(runtime, kDraw, &drawHook, g_origDraw);
+        const bool h6 = g_enFrame && installOne(runtime, kFrameTransform, &frameHook, g_origFrame);
+        if (g_alternate > 0 && g_mode == Mode::On && (h0 || h1 || h2 || h3 || h4 || h5 || h6 || g_probeCount != 0u))
         {
             // measurement: a host thread swaps the hooks for the original functions and back every <seconds> (the game thread
             // keeps its direct calls to the generated functions while they are off, the same as without this file)
@@ -2683,6 +3433,9 @@ namespace p3fes_native_effects
             if (h1) swaps[n++] = {kForAllAtomics, &forAllHook, g_origForAll};
             if (h2) swaps[n++] = {kMatrixScale, &matrixHook<true>, g_origScale};
             if (h3) swaps[n++] = {kMatrixTranslate, &matrixHook<false>, g_origTranslate};
+            if (h4) swaps[n++] = {kMatrixRotate, &rotateHook, g_origRotate};
+            if (h5) swaps[n++] = {kDraw, &drawHook, g_origDraw};
+            if (h6) swaps[n++] = {kFrameTransform, &frameHook, g_origFrame};
             for (uint32_t i = 0u; i < g_probeCount; ++i)
                 swaps[n++] = {g_probeAddr[i], kProbeStubs[i], g_probeOrig[i]};
             static PS2Runtime *rt = &runtime;
@@ -2704,8 +3457,8 @@ namespace p3fes_native_effects
                             }
                         }).detach();
         }
-        std::fprintf(stderr, "[p3fes-native] effects mode=%s hooks: particles(0x32AF30)=%u forAllAtomics=%u matrixScale=%u matrixTranslate=%u\n",
-                     g_mode == Mode::Verify ? "verify" : (g_mode == Mode::Log ? "log" : "on"), h0 ? 1u : 0u, h1 ? 1u : 0u, h2 ? 1u : 0u, h3 ? 1u : 0u);
-        return h0 || h1 || h2 || h3 || g_probeCount != 0u || g_tfCount != 0u;
+        std::fprintf(stderr, "[p3fes-native] effects mode=%s hooks: particles(0x32AF30)=%u forAllAtomics=%u matrixScale=%u matrixTranslate=%u matrixRotate=%u draw=%u frame=%u\n",
+                     g_mode == Mode::Verify ? "verify" : (g_mode == Mode::Log ? "log" : "on"), h0 ? 1u : 0u, h1 ? 1u : 0u, h2 ? 1u : 0u, h3 ? 1u : 0u, h4 ? 1u : 0u, h5 ? 1u : 0u, h6 ? 1u : 0u);
+        return h0 || h1 || h2 || h3 || h4 || h5 || h6 || g_probeCount != 0u || g_tfCount != 0u;
     }
 }
