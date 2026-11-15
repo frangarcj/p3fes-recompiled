@@ -182,6 +182,7 @@ if(PS2X_IS_VITA AND PS2X_VITA_SDL2_SHIM)
         SceAudio_stub
         SceAVConfig_stub
         SceAudioIn_stub
+        SceAudioIn_stub
         SceSysmodule_stub
         SceHid_stub
         SceMotion_stub
@@ -218,6 +219,7 @@ elseif(PS2X_IS_VITA)
         SceLibKernel_stub
         SceAudio_stub
         SceAVConfig_stub
+        SceAudioIn_stub
         SceTouch_stub
         SceHid_stub
         SceMotion_stub

@@ -4,6 +4,7 @@
 
 #if defined(PLATFORM_VITA)
 #include <psp2/audioout.h>
+#include <psp2/audioin.h>
 #include <psp2/avconfig.h>
 #include <psp2/kernel/threadmgr.h>
 #endif
@@ -316,10 +317,16 @@ namespace p3fes_native_bgm
         public:
             bool open()
             {
-                port_ = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN,
+                // P3FES_BGM_PORT=bgm: ask for a BGM-type port first (the movie player uses one).
+                static const bool preferBgmPort = [] {
+                    const char *value = std::getenv("P3FES_BGM_PORT");
+                    return value && value[0] == 'b';
+                }();
+                port_ = preferBgmPort ? -1 : sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN,
                                             static_cast<int>(kFramesPerBuffer),
                                             static_cast<int>(kSampleRate),
                                             SCE_AUDIO_OUT_MODE_STEREO);
+                startMicDump();
                 // Only one MAIN port may exist; when the SPU2 output (SDL) already has it, use a BGM port.
                 if (port_ < 0)
                     port_ = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, static_cast<int>(kFramesPerBuffer),
@@ -341,7 +348,70 @@ namespace p3fes_native_bgm
                 return true;
             }
             int id() const { return port_; }
-            bool output(const int16_t *samples) { return sceAudioOutOutput(port_, samples) >= 0; }
+            // P3FES_MIC_DUMP=<seconds>: record the console's own microphone (16 kHz mono s16) from
+            // the first music start into ux0:data/p3fes/mic-dump.raw. With P3FES_BGM_TEST_TONE=1 and
+            // the speaker on, the recording shows whether the tone leaves the console unbroken,
+            // without a listener.
+            static void startMicDump()
+            {
+                static bool started = false;
+                const char *value = std::getenv("P3FES_MIC_DUMP");
+                const int seconds = value ? std::atoi(value) : 0;
+                if (started || seconds <= 0 || seconds > 120)
+                    return;
+                started = true;
+                std::thread([seconds] {
+                    constexpr int kGrain = 256, kRate = 16000;
+                    // The RAW port: the VOICE one returned all zeros for a steady tone (its
+                    // processing gates it). P3FES_MIC_DUMP_VOICE=1 selects VOICE.
+                    const bool voice = std::getenv("P3FES_MIC_DUMP_VOICE") != nullptr;
+                    const int port = sceAudioInOpenPort(voice ? SCE_AUDIO_IN_PORT_TYPE_VOICE : SCE_AUDIO_IN_PORT_TYPE_RAW,
+                                                        kGrain, kRate, SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
+                    std::fprintf(stderr, "[native-bgm] mic port=%08X status0=%08X status1=%08X status2=%08X\n",
+                                 static_cast<unsigned>(port), static_cast<unsigned>(sceAudioInGetStatus(0)),
+                                 static_cast<unsigned>(sceAudioInGetStatus(1)), static_cast<unsigned>(sceAudioInGetStatus(2)));
+                    if (port < 0)
+                        return;
+                    std::vector<int16_t> pcm(static_cast<size_t>(seconds) * kRate / kGrain * kGrain);
+                    size_t done = 0u;
+                    int failures = 0;
+                    while (done + kGrain <= pcm.size() && failures < 100)
+                    {
+                        if (sceAudioInInput(port, pcm.data() + done) >= 0)
+                            done += kGrain;
+                        else
+                            ++failures;
+                    }
+                    sceAudioInReleasePort(port);
+                    if (FILE *file = std::fopen("ux0:data/p3fes/mic-dump.raw", "wb"))
+                    {
+                        std::fwrite(pcm.data(), sizeof(int16_t), done, file);
+                        std::fclose(file);
+                    }
+                    std::fprintf(stderr, "[native-bgm] mic dump samples=%u failures=%d\n",
+                                 static_cast<unsigned>(done), failures);
+                }).detach();
+            }
+            // The caller refills its block right after this returns. Hand the port a buffer that
+            // stays untouched for the next few blocks instead (P3FES_BGM_OUT_BUFFERS, default 4;
+            // 1 = pass the caller's buffer as before): a steady test tone came out chopped on the
+            // console although every block was delivered on time.
+            bool output(const int16_t *samples)
+            {
+                static const unsigned count = [] {
+                    const char *value = std::getenv("P3FES_BGM_OUT_BUFFERS");
+                    const int parsed = value ? std::atoi(value) : 4;
+                    return static_cast<unsigned>(parsed >= 1 && parsed <= 8 ? parsed : 4);
+                }();
+                if (count == 1u)
+                    return sceAudioOutOutput(port_, samples) >= 0;
+                alignas(64) static int16_t buffers[8][kFramesPerBuffer * kChannels];
+                static unsigned next = 0u;
+                int16_t *const out = buffers[next];
+                next = (next + 1u) % count;
+                std::memcpy(out, samples, sizeof(buffers[0]));
+                return sceAudioOutOutput(port_, out) >= 0;
+            }
             void close()
             {
                 sceAudioOutOutput(port_, nullptr);
