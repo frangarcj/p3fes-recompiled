@@ -650,6 +650,13 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# Optimisation level of the recompiled game code only (the runner target), e.g. -O2 or -Os; empty keeps the
+# build type's level. The Vita's 32 KB instruction cache misses ~33 times per 1000 instructions on this code.
+set(PS2X_RUNNER_OPT "" CACHE STRING "Extra optimisation flag for the recompiled game code")
+if(PS2X_RUNNER_OPT)
+    target_compile_options(ps2EntryRunner PRIVATE "${PS2X_RUNNER_OPT}")
+endif()
+
 # Profile-guided placement of the recompiled code (p3fes/scripts/perf/make_hot_header.py): the header re-declares the
 # functions a profile saw with __attribute__((hot)), so they land together in .text.hot.
 set(PS2X_HOT_FUNCTIONS_H "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_hot_functions.h")
