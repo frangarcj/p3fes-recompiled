@@ -914,6 +914,13 @@ if(PS2X_IS_VITA)
     # base than the link address and the first veneer call (memset from _start)
     # jumps into unrelated code. Position-independent veneers need no relocation.
     target_link_options(ps2EntryRunner PRIVATE "-Wl,--pic-veneer")
+    # Diagnostic: count pthread mutex locks per thread and time a std::mutex (platform/vita/mutex_diag.cpp).
+    option(PS2X_MUTEX_DIAG "Intercept pthread_mutex_lock on the Vita to count locks per thread" OFF)
+    if(PS2X_MUTEX_DIAG)
+        target_sources(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/mutex_diag.cpp")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/mutex_diag.cpp" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+        target_link_options(ps2EntryRunner PRIVATE "-Wl,--wrap=pthread_mutex_lock")
+    endif()
     # Keep room after the text for vita-elf-create's SCE data (see link_pad.ld).
     target_link_options(ps2EntryRunner PRIVATE "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/platform/vita/link_pad.ld")
     if(PS2X_VITA_SDL2_SHIM)

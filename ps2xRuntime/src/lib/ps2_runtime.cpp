@@ -1527,7 +1527,13 @@ namespace ps2_ee_sample
                 if ((word & 1u) != 0u)
                     native += n;
             std::fprintf(stderr, "[ee-sample] total=%u native=%u functions=%u\n", total, native, static_cast<unsigned>(sorted.size()));
-            for (size_t i = 0; i < sorted.size() && i < 40u; ++i)
+            // PS2X_EE_SAMPLE_TOP=n: how many functions each window lists (default 40).
+            static const size_t top = [] {
+                const char *value = std::getenv("PS2X_EE_SAMPLE_TOP");
+                const long parsed = value ? std::atol(value) : 40;
+                return static_cast<size_t>(parsed > 0 && parsed <= 4000 ? parsed : 40);
+            }();
+            for (size_t i = 0; i < sorted.size() && i < top; ++i)
                 std::fprintf(stderr, "[ee-sample] pc=%08X n=%u%s\n", sorted[i].first & ~3u, sorted[i].second,
                              (sorted[i].first & 1u) != 0u ? " native" : "");
             counts.clear();
