@@ -439,6 +439,9 @@ namespace
     using p3fes::native_renderer::TextureData;
     using p3fes::native_renderer::Vertex;
 
+    extern "C" uint64_t ps2xFrameHistNowUs();               // EeScheduler.cpp (0 unless PS2X_FRAME_HIST / PS2X_STALL_DIAG)
+    extern "C" void ps2xFrameHistNoteHash(uint64_t startUs);    // EeScheduler.cpp: time of one content-hash check
+    extern "C" void ps2xFrameHistNoteDynamic(uint64_t startUs); // EeScheduler.cpp: time of one dynamic-geometry rebuild
     // What the producer remembers about a mesh it already defined to the present layer.
     struct DefinedMeshInfo
     {
@@ -449,6 +452,9 @@ namespace
         // once a change is seen the draw is rebuilt and sent as a transient mesh every time.
         mutable uint64_t contentHash = 0u; // 0: not tracked (large, lit or skinned geometry)
         mutable bool dynamic = false;
+        // P3FES_DYNAMIC_GEOMETRY_PATCH=1: the full decode of a dynamic mesh, kept so that later draws only refresh the
+        // positions, prelight and UVs from guest memory (the hash covers the first two) instead of decoding again.
+        mutable std::shared_ptr<const MeshData> decoded;
     };
     std::unordered_map<MeshId, DefinedMeshInfo> g_definedMeshes;
     struct DefinedMeshSlot
@@ -2635,13 +2641,42 @@ namespace
         bool drawDynamic = false;
         if (definedMesh->contentHash != 0u)
         {
+            const uint64_t hashStart = ps2xFrameHistNowUs();
             if (!definedMesh->dynamic &&
                 geometryContentHash(rdram, summary.vertexData, summary.prelitData, summary.vertices) != definedMesh->contentHash)
                 definedMesh->dynamic = true;
+            ps2xFrameHistNoteHash(hashStart);
             if (definedMesh->dynamic)
             {
-                MeshId dynamicId = 0u;
-                drawDynamic = decodeNativeMesh(rdram, summary, dynamicMesh, dynamicId) && dynamicId == meshId;
+                static const bool patch = [] { const char *v = std::getenv("P3FES_DYNAMIC_GEOMETRY_PATCH"); return v && *v == '1'; }();
+                const uint64_t dynStart = ps2xFrameHistNowUs(); // 0 unless PS2X_FRAME_HIST / PS2X_STALL_DIAG
+                const MeshData *cached = definedMesh->decoded.get();
+                if (patch && cached && cached->vertices.size() == summary.vertices && summary.vertexData &&
+                    guestPointer(summary.vertexData, summary.vertices * 12u) &&
+                    (!cached->hasPrelight || (summary.prelitData && guestPointer(summary.prelitData, summary.vertices * 4u))) &&
+                    (summary.uv0Data == 0u || guestPointer(summary.uv0Data, summary.vertices * 8u)))
+                {
+                    dynamicMesh = *cached;
+                    for (uint32_t i = 0u; i < summary.vertices; ++i)
+                    {
+                        Vertex &v = dynamicMesh.vertices[i];
+                        std::memcpy(v.position.data(), rdram + summary.vertexData + i * 12u, 12u);
+                        if (summary.uv0Data)
+                            std::memcpy(v.texCoord.data(), rdram + summary.uv0Data + i * 8u, 8u);
+                        if (cached->hasPrelight)
+                            std::memcpy(v.color.data(), rdram + summary.prelitData + i * 4u, 4u);
+                    }
+                    drawDynamic = true;
+                }
+                else
+                {
+                    MeshId dynamicId = 0u;
+                    drawDynamic = decodeNativeMesh(rdram, summary, dynamicMesh, dynamicId) && dynamicId == meshId;
+                    // Only plain meshes (no second UV set, no skin) can be patched; others keep the full decode.
+                    if (patch && drawDynamic && !dynamicMesh.skinned && (summary.geometryFlags & kGeometryTextured2Flag) == 0u)
+                        definedMesh->decoded = std::make_shared<const MeshData>(dynamicMesh);
+                }
+                ps2xFrameHistNoteDynamic(dynStart);
             }
         }
 

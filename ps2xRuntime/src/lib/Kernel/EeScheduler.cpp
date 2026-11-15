@@ -63,7 +63,7 @@ namespace
     uint64_t g_fhPacingUs = 0u, g_fhEventUs = 0u, g_fhPacingCount = 0u, g_fhEventCount = 0u;
     uint64_t g_fhCapFields = 0u;
     // Host-thread hand-off waits (p3fes_native_present producer side), added through ps2xFrameHistAddLock.
-    uint64_t g_fhLockUs = 0u, g_fhIoUs = 0u, g_fhIoCount = 0u, g_fhIoBytes = 0u, g_fhLastIo = 0u;
+    uint64_t g_fhLockUs = 0u, g_fhIoUs = 0u, g_fhIoCount = 0u, g_fhIoBytes = 0u, g_fhLastIo = 0u, g_fhDynUs = 0u, g_fhDynCount = 0u, g_fhLastDynUs = 0u, g_fhLastDynCount = 0u, g_fhHashUs = 0u, g_fhHashCount = 0u, g_fhLastHashUs = 0u, g_fhLastHashCount = 0u;
     struct FhBucket { unsigned n = 0; double wall = 0, cpu = 0, pace = 0, evt = 0, lock = 0, io = 0; unsigned cap = 0; };
     constexpr int kFhBuckets = 7; // 1..6 fields, 7 = more
     FhBucket g_fhBuckets[kFhBuckets];
@@ -154,6 +154,12 @@ namespace
                              static_cast<unsigned long long>(g_slipCount - lastCount), (g_slipSavedUs - lastSaved) / 1000.0);
                 lastCount = g_slipCount; lastSaved = g_slipSavedUs;
             }
+            std::fprintf(stderr, "[fhist]   dynamic geometry: %.2f rebuilds/frame, %.2f ms/frame\n",
+                         total ? double(g_fhDynCount - g_fhLastDynCount) / total : 0.0, total ? (g_fhDynUs - g_fhLastDynUs) / 1000.0 / total : 0.0);
+            std::fprintf(stderr, "[fhist]   content-hash checks: %.1f/frame, %.2f ms/frame\n",
+                         total ? double(g_fhHashCount - g_fhLastHashCount) / total : 0.0, total ? (g_fhHashUs - g_fhLastHashUs) / 1000.0 / total : 0.0);
+            g_fhLastHashUs = g_fhHashUs; g_fhLastHashCount = g_fhHashCount;
+            g_fhLastDynUs = g_fhDynUs; g_fhLastDynCount = g_fhDynCount;
             std::fprintf(stderr, "[fhist]   previous report took %.1f ms to print\n", g_fhPrintMs);
             g_fhPrintMs = (fhNowUs() - printStart) / 1000.0;
             for (FhBucket &b : g_fhBuckets) b = FhBucket{};
@@ -163,97 +169,23 @@ namespace
     }
 }
 
-#if defined(__vita__)
-// PS2X_STALL_DIAG=1 (Vita): a sampler thread looks at the game thread every millisecond and logs each
-// stretch (>= 20 ms) in which it consumed no CPU: what the kernel says it waits on (status, wait type,
-// object), what the scheduler was doing (tag), how often it was preempted, and which threads held its core.
-namespace
-{
-    struct StallOccupant { SceUID tid; int pid; int pri; unsigned count; };
-    int stallSamplerEntry(SceSize, void *arg)
-    {
-        const SceUID game = *static_cast<SceUID *>(arg);
-        uint64_t lastRun = 0u, lastWall = 0u, epStart = 0u;
-        uint32_t epPreempt0 = 0u, epIntr0 = 0u;
-        bool inEp = false;
-        unsigned epSamples = 0u, epTag[3] = {0, 0, 0}, epStatus[3] = {0, 0, 0};
-        uint32_t epWaitType = 0u; SceUID epWaitId = 0; unsigned epWaitCount = 0u;
-        StallOccupant occ[12];
-        unsigned occCount = 0u, lines = 0u;
-        for (;;)
-        {
-            sceKernelDelayThread(1000);
-            SceKernelThreadInfo info{};
-            info.size = sizeof(info);
-            if (sceKernelGetThreadInfo(game, &info) < 0)
-                continue;
-            const uint64_t now = sceKernelGetProcessTimeWide();
-            const bool idle = lastWall != 0u && (info.runClocks - lastRun) < 100u && now - lastWall >= 500u;
-            lastRun = info.runClocks;
-            lastWall = now;
-            if (idle)
-            {
-                if (!inEp)
-                {
-                    inEp = true; epStart = now; epSamples = 0u; epWaitCount = 0u; occCount = 0u;
-                    epTag[0] = epTag[1] = epTag[2] = 0u; epStatus[0] = epStatus[1] = epStatus[2] = 0u;
-                    epPreempt0 = info.threadPreemptCount; epIntr0 = info.intrPreemptCount;
-                }
-                ++epSamples;
-                ++epTag[g_stallTag.load(std::memory_order_relaxed) % 3];
-                ++epStatus[(info.status & SCE_THREAD_RUNNING) ? 0 : ((info.status & SCE_THREAD_READY) ? 1 : 2)];
-                if ((info.status & SCE_THREAD_WAITING) && (epWaitCount == 0u || epWaitId == info.waitId))
-                { epWaitType = info.waitType; epWaitId = info.waitId; ++epWaitCount; }
-                SceKernelThreadRunStatus rs{};
-                rs.size = sizeof(rs);
-                if (sceKernelGetThreadRunStatus(game, &rs) >= 0 && info.lastExecutedCpuId >= 0 && info.lastExecutedCpuId < 4)
-                {
-                    const auto &c = rs.cpuInfo[info.lastExecutedCpuId];
-                    unsigned i = 0u;
-                    for (; i < occCount; ++i) if (occ[i].tid == c.threadId) break;
-                    if (i == occCount && occCount < 12u) occ[occCount++] = {c.threadId, c.processId, c.priority, 0u};
-                    if (i < occCount) ++occ[i].count;
-                }
-            }
-            else if (inEp)
-            {
-                inEp = false;
-                const double ms = (now - epStart) / 1000.0;
-                if (ms >= 20.0 && lines < 400u)
-                {
-                    ++lines;
-                    char occText[256]; occText[0] = 0;
-                    for (unsigned i = 0u; i < occCount; ++i)
-                    {
-                        SceKernelThreadInfo oi{}; oi.size = sizeof(oi);
-                        const bool known = sceKernelGetThreadInfo(occ[i].tid, &oi) >= 0;
-                        std::snprintf(occText + std::strlen(occText), sizeof(occText) - std::strlen(occText), " %s/p%d x%u",
-                                      known ? oi.name : "foreign", occ[i].pri, occ[i].count);
-                    }
-                    std::fprintf(stderr, "[stall] t=%.2f dur=%.0f ms tag(run/pace/event)=%u/%u/%u status(run/ready/wait)=%u/%u/%u wait=0x%X/0x%X x%u preempt=+%u intr=+%u core-held-by:%s\n",
-                                 now / 1e6, ms, epTag[0], epTag[1], epTag[2], epStatus[0], epStatus[1], epStatus[2],
-                                 static_cast<unsigned>(epWaitType), static_cast<unsigned>(epWaitId), epWaitCount,
-                                 static_cast<unsigned>(info.threadPreemptCount - epPreempt0), static_cast<unsigned>(info.intrPreemptCount - epIntr0), occText);
-                }
-            }
-        }
-        return 0;
-    }
-    void startStallSampler()
-    {
-        static SceUID gameId = 0;
-        static bool started = false;
-        if (started || !stallDiagOn()) return;
-        started = true;
-        gameId = sceKernelGetThreadId();
-        const SceUID t = sceKernelCreateThread("p3fes-stall", stallSamplerEntry, 0x30, 0x4000, 0, 0, nullptr);
-        if (t >= 0) sceKernelStartThread(t, sizeof(gameId), &gameId);
-    }
-}
-#else
+// (PS2X_STALL_DIAG sampler thread removed: with priority 0x40 it hung the game at boot on the console; the stalls it was
+// meant to find were the diagnostic log writes themselves, see [fhist] 'previous report took'.)
 namespace { inline void startStallSampler() {} }
-#endif
+
 extern "C" void ps2xFrameHistAddLock(uint64_t us) { g_fhLockUs += us; }
+extern "C" void ps2xFrameHistNoteHash(uint64_t startUs)
+{
+    if (startUs == 0u) return;
+    g_fhHashUs += fhNowUs() - startUs;
+    ++g_fhHashCount;
+}
+extern "C" void ps2xFrameHistNoteDynamic(uint64_t startUs)
+{
+    if (startUs == 0u) return;
+    g_fhDynUs += fhNowUs() - startUs;
+    ++g_fhDynCount;
+}
 extern "C" uint64_t ps2xFrameHistNowUs() { return (frameHistOn() || stallDiagOn()) ? fhNowUs() : 0u; }
 // Host file reads (ps2_iop_host.cpp): summed per frame; one slower than 20 ms is logged with its size.
 extern "C" void ps2xFrameHistNoteRead(uint64_t startUs, size_t bytes)

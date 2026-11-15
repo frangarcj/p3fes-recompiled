@@ -283,11 +283,17 @@ void reportResources()
     const auto now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
     if (seconds < 5.0) return;
-    std::lock_guard lock(g_mutex);
+    // The lock only covers reading the size: printing under it blocked the game thread for the length of the log
+    // write (10-40 ms to ux0:) every five seconds.
+    size_t retiredCount = 0;
+    {
+        std::lock_guard lock(g_mutex);
+        retiredCount = g_retiredTextures.size();
+    }
     std::fprintf(stderr, "[native-present] fps=%.2f uploads=%llu deletes=%llu textures=%u pending-retire=%u\n",
         (g_presentedFrames - frames) / seconds,
         static_cast<unsigned long long>(g_textureUploads - uploads),
-        static_cast<unsigned long long>(g_textureDeletes), static_cast<unsigned>(g_textureDefinitionCount.load(std::memory_order_relaxed)), static_cast<unsigned>(g_retiredTextures.size()));
+        static_cast<unsigned long long>(g_textureDeletes), static_cast<unsigned>(g_textureDefinitionCount.load(std::memory_order_relaxed)), static_cast<unsigned>(retiredCount));
     std::fprintf(stderr,
         "[native-frame] draws=%u meshes=%u color-clears-after-mesh=%u matrices=%u pos=%.3f,%.3f,%.3f z=%.6f,%.6f,%.6f\n",
         g_lastFrameDraws, g_lastFrameMeshes, g_lastFrameColorClearsAfterMesh,
