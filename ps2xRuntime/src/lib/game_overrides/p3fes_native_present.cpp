@@ -1770,13 +1770,89 @@ bool renderHostFrame()
                              screen.textureName.c_str(), w, h, edgeU, px, vTop, vBottom, xl, xr, worst, flat ? 1 : 0);
             return flat;
         };
+        // Spinning art made of several pieces (the shop menu's disc: four rotated quads of one texture around one
+        // centre). The box of a rotated piece changes with the angle, so the per-draw rules below (a backdrop
+        // by extent, a piece touching an edge pinned to it) gave different pieces of the same disc different
+        // placements, and the placement changed again as the disc turned: the disc tore along the seams of its
+        // pieces, the viewports of the placements cut it with straight edges, and it flickered. The pieces
+        // overlapping each other are placed as one: pinned to the edge their joint box touches (both: stretched),
+        // centred otherwise. A cluster is the same on every frame of the spin: the box of the pieces
+        // always reaches the same edges, as the turn is about the centre.
+        static const bool placeSpinningPieces = [] { const char *v = std::getenv("P3FES_WS_SPINNING"); return !v || *v != '0'; }(); // =0: per-draw rules only
+        if (menuFrame && placeSpinningPieces)
+        {
+            constexpr size_t kMaxPieces = 48u;
+            constexpr float kJoin = 6.0f;
+            static std::vector<int32_t> pieces, pieceRoot;
+            pieces.clear();
+            for (size_t slot = 0; slot < frame.draws.size() && pieces.size() <= kMaxPieces; ++slot)
+            {
+                const auto *screen = std::get_if<ScreenDraw>(&frame.draws[slot]);
+                if (!screen || screen->lines || screen->vertices.size() != 6u || screen->textureName.empty() || drawLayer[slot] < 0 ||
+                    !layers[static_cast<size_t>(drawLayer[slot])].mixed)
+                    continue;
+                const auto &v = screen->vertices;
+                float xl = v[0].x, xr = xl, yt = v[0].y, yb = yt;
+                for (const ScreenVertex &p : v)
+                {
+                    xl = std::min(xl, p.x); xr = std::max(xr, p.x);
+                    yt = std::min(yt, p.y); yb = std::max(yb, p.y);
+                }
+                bool rotated = false;
+                for (const ScreenVertex &p : v)
+                    rotated = rotated || (std::fabs(p.x - xl) > 0.01f && std::fabs(p.x - xr) > 0.01f) ||
+                              (std::fabs(p.y - yt) > 0.01f && std::fabs(p.y - yb) > 0.01f);
+                if (rotated)
+                    pieces.push_back(static_cast<int32_t>(slot));
+            }
+            if (pieces.size() >= 2u && pieces.size() <= kMaxPieces)
+            {
+                pieceRoot.resize(pieces.size());
+                for (size_t i = 0; i < pieces.size(); ++i)
+                    pieceRoot[i] = static_cast<int32_t>(i);
+                const auto root = [&](int32_t i) {
+                    while (pieceRoot[static_cast<size_t>(i)] != i)
+                        i = pieceRoot[static_cast<size_t>(i)];
+                    return i;
+                };
+                for (size_t i = 0; i < pieces.size(); ++i)
+                    for (size_t j = i + 1; j < pieces.size(); ++j)
+                    {
+                        const size_t sa = static_cast<size_t>(pieces[i]), sb = static_cast<size_t>(pieces[j]);
+                        const auto &a = drawBox[sa], &b = drawBox[sb];
+                        if (drawLayer[sa] == drawLayer[sb] &&
+                            std::get<ScreenDraw>(frame.draws[sa]).textureName == std::get<ScreenDraw>(frame.draws[sb]).textureName &&
+                            a[0] <= b[1] + kJoin && b[0] <= a[1] + kJoin && a[2] <= b[3] + kJoin && b[2] <= a[3] + kJoin)
+                            pieceRoot[static_cast<size_t>(root(static_cast<int32_t>(i)))] = root(static_cast<int32_t>(j));
+                    }
+                for (size_t i = 0; i < pieces.size(); ++i)
+                {
+                    const int32_t r = root(static_cast<int32_t>(i));
+                    float x0 = 1e9f, x1 = -1e9f;
+                    size_t members = 0u;
+                    for (size_t j = 0; j < pieces.size(); ++j)
+                        if (root(static_cast<int32_t>(j)) == r)
+                        {
+                            x0 = std::min(x0, drawBox[static_cast<size_t>(pieces[j])][0]);
+                            x1 = std::max(x1, drawBox[static_cast<size_t>(pieces[j])][1]);
+                            ++members;
+                        }
+                    if (members < 2u)
+                        continue;
+                    const float sw = std::get<ScreenDraw>(frame.draws[static_cast<size_t>(pieces[i])]).sourceWidth;
+                    const bool touchLeft = x0 <= 0.5f, touchRight = x1 >= sw - 0.5f;
+                    drawMenu[static_cast<size_t>(pieces[i])] = static_cast<uint8_t>(
+                        touchLeft && touchRight ? Placement::Stretch : touchLeft ? Placement::Left : touchRight ? Placement::Right : Placement::Centre);
+                }
+            }
+        }
         for (size_t slot = 0; slot < frame.draws.size(); ++slot)
         {
             const auto *screen = std::get_if<ScreenDraw>(&frame.draws[slot]);
             if (!screen || screen->vertices.empty() || drawLayer[slot] < 0)
                 continue;
             const ScreenLayer &layer = layers[static_cast<size_t>(drawLayer[slot])];
-            if (!layer.mixed)
+            if (!layer.mixed || drawMenu[slot] != kMenuNone)
                 continue;
             const LayerTexture *texture = drawLayerTexture[slot] >= 0 ? &layerTextures[static_cast<size_t>(drawLayerTexture[slot])] : nullptr;
             const float sw = screen->sourceWidth, sh = screen->sourceHeight;
