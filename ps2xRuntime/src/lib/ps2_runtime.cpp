@@ -350,7 +350,15 @@ namespace
     thread_local DispatchHistory g_dispatchHistory;
     // counts dispatched jumps (not calls), to tell an implicit return from a tail jump that goes back to the called
     // function's entry (SotC fork, c4c20e8).
-    thread_local uint64_t g_guestJumpSerial = 0u;
+    // Only the EE thread dispatches guest code, so a plain (non thread local) counter does the same job; the Vita's
+    // emulated TLS made every dispatched call pay a call into __emutls_get_address for it. Wraparound after 2^32
+    // jumps inside one callee is irrelevant (equality test only).
+    std::atomic<uint32_t> g_guestJumpSerial{0u};
+    inline uint32_t guestJumpSerial() noexcept { return g_guestJumpSerial.load(std::memory_order_relaxed); }
+    inline void bumpGuestJumpSerial() noexcept
+    {
+        g_guestJumpSerial.store(g_guestJumpSerial.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+    }
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -1944,6 +1952,181 @@ static constinit std::atomic<uint32_t> g_callTraceSetting{2u};
     }
 }
 
+// PS2X_DCALL_DIAG=1: every 5 s, how many guest transfers went through the dispatcher per game frame
+// (PS2X_PERF_DIAG=frames + PS2X_PERF_FRAME_PC count the frames): direct calls (jal) taken there although the EE budget
+// was not exhausted (the table entry is a hook or wrapper rather than the generated symbol), direct calls taken there
+// because the budget ran out, indirect calls (jalr) and jumps, plus the top targets of the first and third group and
+// the targets whose callee came back without setting the PC (the dispatcher then supplies the return address: the
+// hooks a direct-call fast path in PS2_CALL_DIRECT would have to keep working).
+static std::unordered_map<uint32_t, uint64_t> g_pcFixTargets;
+[[gnu::cold, gnu::noinline]] static void pcFixDiag(uint32_t targetPc) { ++g_pcFixTargets[targetPc]; }
+
+[[gnu::cold, gnu::noinline]] static void directCallDiag(uint32_t targetPc, PS2Runtime::GuestBranchKind kind, bool budgetLeft)
+{
+    static std::unordered_map<uint32_t, uint64_t> hooked, indirect;
+    static uint64_t budgetCalls = 0, hookedCalls = 0, indirectCalls = 0, jumps = 0;
+    static auto last = std::chrono::steady_clock::now();
+    static uint64_t lastFlips = 0;
+    if (kind == PS2Runtime::GuestBranchKind::DirectCall)
+    {
+        if (budgetLeft)
+        {
+            ++hooked[targetPc];
+            ++hookedCalls;
+        }
+        else
+            ++budgetCalls;
+    }
+    else if (kind == PS2Runtime::GuestBranchKind::IndirectCall)
+    {
+        ++indirect[targetPc];
+        ++indirectCalls;
+    }
+    else
+        ++jumps;
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - last).count() < 5.0)
+        return;
+    const uint64_t flips = ps2_perf::guestFlips.load(std::memory_order_relaxed);
+    const double frames = static_cast<double>(flips - lastFlips);
+    const double inv = frames > 0 ? 1.0 / frames : 0.0;
+    auto top = [&](std::unordered_map<uint32_t, uint64_t> &m, const char *label)
+    {
+        std::vector<std::pair<uint64_t, uint32_t>> v;
+        for (const auto &e : m)
+            v.push_back({e.second, e.first});
+        std::sort(v.begin(), v.end(), [](const auto &l, const auto &r) { return l.first > r.first; });
+        std::fprintf(stderr, "[dcall-%s]", label);
+        for (size_t i = 0; i < v.size() && i < 15; ++i)
+            std::fprintf(stderr, " %08X=%.1f", v[i].second, v[i].first * inv);
+        std::fprintf(stderr, "\n");
+        m.clear();
+    };
+    std::fprintf(stderr, "[dcall] frames=%.0f hooked/frame=%.1f budget/frame=%.1f indirect/frame=%.1f jumps/frame=%.1f top:",
+                 frames, hookedCalls * inv, budgetCalls * inv, indirectCalls * inv, jumps * inv);
+    {
+        std::vector<std::pair<uint64_t, uint32_t>> v;
+        for (const auto &e : hooked)
+            v.push_back({e.second, e.first});
+        std::sort(v.begin(), v.end(), [](const auto &l, const auto &r) { return l.first > r.first; });
+        for (size_t i = 0; i < v.size() && i < 15; ++i)
+            std::fprintf(stderr, " %08X=%.1f", v[i].second, v[i].first * inv);
+        std::fprintf(stderr, "\n");
+    }
+    top(indirect, "indirect");
+    top(g_pcFixTargets, "pcfix");
+    hooked.clear();
+    hookedCalls = budgetCalls = indirectCalls = jumps = 0;
+    lastFlips = flips;
+    last = now;
+}
+
+// Everything in dispatchGuestBranch that is only wanted by diagnostics is folded into one word that is computed once:
+// the branch ring, call tracing, the EE sampler, the direct-call counters and the frame-trace build. The common path
+// then reads one global instead of five settings, three function-local-static guards and a TLS slot.
+static constinit std::atomic<uint32_t> g_dispatchDiagMask{2u}; // 2 = not computed yet
+static constinit std::atomic<uint32_t> g_perfFramePc{0u};      // PS2X_PERF_FRAME_PC when frame counting is on
+
+// PS2X_DISPATCH_AB=ab|legacy|lean (Vita with libperf, needs PS2X_PERF_DIAG=frames + PS2X_PERF_FRAME_PC): measures what the
+// dispatcher's old per-call overhead cost inside ONE run. "legacy" adds, to every dispatched transfer, the operations the
+// lean path no longer does (a thread-local counter, the function-local-static guards of the perf/sampler settings, the
+// branch-ring and call-trace setting reads); "ab" alternates lean and legacy every PS2X_DISPATCH_AB_FRAMES (60) game
+// frames and prints the game thread's instructions per game frame for each, so the comparison does not depend on two
+// runs reaching the same scene state.
+static constinit std::atomic<uint32_t> g_dispatchLegacy{0u};
+#if defined(PLATFORM_VITA) && defined(PS2X_VITA_LIBPERF)
+extern "C" int ps2x_vita_pmu_read_fast(uint32_t *instr, uint32_t *cycles);
+#endif
+
+[[gnu::noinline]] static void legacyDispatchOverhead(uint32_t targetPc)
+{
+    static thread_local volatile uint64_t s_legacySerial = 0u; // the old g_guestJumpSerial: an emulated-TLS call on the Vita
+    s_legacySerial = s_legacySerial + 1u;
+    // The old guestEntry(): countFrames() and the framePc static (two guard checks); not called itself, it would count
+    // the frame twice.
+    static const uint32_t s_framePcGuard = [] { return static_cast<uint32_t>(g_perfFramePc.load(std::memory_order_relaxed) + 1u); }();
+    volatile bool sink = ps2_perf::countFrames() ^ (targetPc == s_framePcGuard) ^ ps2_ee_sample::enabled() ^
+                         branchRingEnabled() ^ branchRingEnabled();
+    (void)sink;
+}
+
+[[gnu::cold, gnu::noinline]] static void dispatchAbFrame()
+{
+    static const char *mode = std::getenv("PS2X_DISPATCH_AB");
+    static const uint32_t segFrames = []
+    {
+        const char *v = std::getenv("PS2X_DISPATCH_AB_FRAMES");
+        const long n = v ? std::strtol(v, nullptr, 10) : 60;
+        return static_cast<uint32_t>(n > 0 ? n : 60);
+    }();
+    struct Acc { uint64_t instr = 0, frames = 0; };
+    static Acc acc[2];
+    static uint32_t inSeg = 0, state = 0, lastInstr = 0;
+    static bool started = false;
+    static const auto t0 = std::chrono::steady_clock::now();
+    if (!started)
+    {
+        started = true;
+        state = (mode && mode[0] == 'l' && mode[1] == 'e' && mode[2] == 'g') ? 1u : 0u;
+        g_dispatchLegacy.store(state, std::memory_order_relaxed);
+    }
+    if (++inSeg < segFrames)
+        return;
+    inSeg = 0;
+#if defined(PLATFORM_VITA) && defined(PS2X_VITA_LIBPERF)
+    uint32_t instr = 0, cycles = 0;
+    if (ps2x_vita_pmu_read_fast(&instr, &cycles))
+    {
+        static bool havePrev = false;
+        if (havePrev)
+        {
+            const uint32_t delta = instr - lastInstr;
+            acc[state].instr += delta;
+            acc[state].frames += segFrames;
+            std::fprintf(stderr, "[dispatch-ab] t=%.1f seg=%s %.3f Minstr/frame | lean %.3f (%llu frames) legacy %.3f (%llu frames)\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                         state ? "legacy" : "lean", delta / 1e6 / segFrames,
+                         acc[0].frames ? acc[0].instr / 1e6 / acc[0].frames : 0.0, static_cast<unsigned long long>(acc[0].frames),
+                         acc[1].frames ? acc[1].instr / 1e6 / acc[1].frames : 0.0, static_cast<unsigned long long>(acc[1].frames));
+        }
+        havePrev = true;
+        lastInstr = instr;
+    }
+#endif
+    if (mode && mode[0] == 'a')
+    {
+        state ^= 1u;
+        g_dispatchLegacy.store(state, std::memory_order_relaxed);
+    }
+}
+
+[[gnu::cold, gnu::noinline]] static uint32_t initializeDispatchDiagMask() noexcept
+{
+    uint32_t mask = 0u;
+    if (branchRingEnabled())
+        mask |= 1u;
+    if (std::getenv("PS2X_EE_TRACE_CALLS") != nullptr)
+        mask |= 2u; // traceGuestBranch resolves g_callTraceSetting itself on its first call
+    else
+        g_callTraceSetting.store(0u, std::memory_order_relaxed);
+    if (ps2_ee_sample::enabled())
+        mask |= 4u;
+    if (std::getenv("PS2X_DCALL_DIAG") != nullptr)
+        mask |= 8u;
+    if (std::getenv("PS2X_DISPATCH_AB") != nullptr)
+        mask |= 32u;
+#if defined(PS2X_P3FES_FRAME_TRACE)
+    mask |= 16u;
+#endif
+    if (ps2_perf::countFrames())
+    {
+        const char *value = std::getenv("PS2X_PERF_FRAME_PC");
+        g_perfFramePc.store(value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u, std::memory_order_relaxed);
+    }
+    g_dispatchDiagMask.store(mask, std::memory_order_relaxed);
+    return mask;
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1952,17 +2135,32 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
-    if (branchRingEnabled())
-    {
-        const uint32_t k = g_branchRingPos.fetch_add(1) & 255u;
-        g_branchRing[k] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind};
-    }
+    uint32_t diagMask = g_dispatchDiagMask.load(std::memory_order_relaxed);
+    if (__builtin_expect(diagMask == 2u, 0))
+        diagMask = initializeDispatchDiagMask();
 
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
-    if (g_callTraceSetting.load(std::memory_order_relaxed) != 0u)
-        traceGuestBranch(rdram, ctx, targetPc, sourcePc);
+    if (__builtin_expect(diagMask != 0u, 0))
+    {
+        if ((diagMask & 1u) != 0u)
+        {
+            const uint32_t k = g_branchRingPos.fetch_add(1) & 255u;
+            g_branchRing[k] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind};
+        }
+        if ((diagMask & 8u) != 0u)
+            directCallDiag(targetPc, kind, m_eeBudget > 8);
+        if ((diagMask & 32u) != 0u)
+        {
+            if (targetPc == g_perfFramePc.load(std::memory_order_relaxed))
+                dispatchAbFrame();
+            if (g_dispatchLegacy.load(std::memory_order_relaxed) != 0u)
+                legacyDispatchOverhead(targetPc);
+        }
+        if (g_callTraceSetting.load(std::memory_order_relaxed) != 0u)
+            traceGuestBranch(rdram, ctx, targetPc, sourcePc);
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -1974,7 +2172,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!isCall)
     {
-        ++g_guestJumpSerial;
+        bumpGuestJumpSerial();
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -2038,36 +2236,48 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (branchRingEnabled())
+    if (__builtin_expect((diagMask & 1u) != 0u, 0))
         pushDispatchPc(targetPc); // what lookupFunction did
     const uint32_t entryPc = ctx->pc;
     const uint64_t checkpointSerial = m_eeCheckpointSerial;
-    const uint64_t jumpSerial = g_guestJumpSerial;
-    ps2_perf::guestEntry(targetPc); // also counts calls that do not return to the dispatcher.
-#if defined(PS2X_P3FES_FRAME_TRACE)
+    const uint32_t jumpSerial = guestJumpSerial();
+    // Entries to the PS2X_PERF_FRAME_PC function (also those that do not return to the dispatcher). Every call to it
+    // is dispatched: the function is wrapped (perfFrameTrampoline), so the table never holds its generated symbol.
+    if (__builtin_expect(targetPc == g_perfFramePc.load(std::memory_order_relaxed), 0) && targetPc != 0u)
+        ps2_perf::guestEntry(targetPc);
+    if (__builtin_expect(diagMask == 0u, 1))
     {
-        p3fes_frame_trace::GuestScope frameTraceScope(targetPc, sourcePc);
-        targetFn(rdram, ctx, this);
-    }
-#else
-    if (ps2_ee_sample::enabled())
-    {
-        ps2_ee_sample::Scope sampleScope(targetPc);
         targetFn(rdram, ctx, this);
     }
     else
     {
-        targetFn(rdram, ctx, this);
-    }
+#if defined(PS2X_P3FES_FRAME_TRACE)
+        {
+            p3fes_frame_trace::GuestScope frameTraceScope(targetPc, sourcePc);
+            targetFn(rdram, ctx, this);
+        }
+#else
+        if ((diagMask & 4u) != 0u)
+        {
+            ps2_ee_sample::Scope sampleScope(targetPc);
+            targetFn(rdram, ctx, this);
+        }
+        else
+        {
+            targetFn(rdram, ctx, this);
+        }
 #endif
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
 
-    if (ctx->pc == entryPc && m_eeCheckpointSerial == checkpointSerial && jumpSerial == g_guestJumpSerial)
+    if (ctx->pc == entryPc && m_eeCheckpointSerial == checkpointSerial && jumpSerial == guestJumpSerial())
     {
+        if (__builtin_expect((diagMask & 8u) != 0u, 0))
+            pcFixDiag(targetPc);
         ctx->pc = fallthroughPc;
     }
 
