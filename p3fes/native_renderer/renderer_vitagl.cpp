@@ -115,6 +115,16 @@ bool meshBenchEnabled()
     return enabled;
 }
 
+// P3FES_MESH_INSTANCES=0: one baked vertex buffer per mesh part, as before.
+bool meshInstancesEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_INSTANCES");
+        return !(value && *value == '0');
+    }();
+    return enabled;
+}
+
 bool meshReuseEnabled()
 {
     static const bool enabled = [] {
@@ -164,6 +174,18 @@ struct DrawPart
     std::vector<GpuVertex> gpuVertices;
     std::vector<GpuSkinPart> gpuSkinParts;
     detail::StaticVertexCacheKey staticVertexCache;
+    // One mesh is often drawn several times a frame with different model matrices (shop props).
+    // The baked colours depend on the model matrix, so a single buffer per part was re-baked
+    // for every copy, every frame. Other copies' buffers are parked here with their keys;
+    // vertexBuffer / staticVertexCache above are the slot in use.
+    struct Instance
+    {
+        GLuint vertexBuffer = 0;
+        detail::StaticVertexCacheKey key;
+        std::uint32_t usedFrame = 0;
+    };
+    std::vector<Instance> instances;
+    std::uint32_t slotUsedFrame = 0;
     std::vector<std::uint8_t> usedBones; // skinned: bones with a usable weight in this part
     detail::SkinLayout skinLayout;       // skinned: rigid runs per bone, then blended vertices (mesh_regen.h)
     bool lighting = false;
@@ -673,6 +695,9 @@ void deleteParts(std::vector<DrawPart> &parts)
         }
         if (part.vertexBuffer)
             glDeleteBuffers(1, &part.vertexBuffer);
+        for (DrawPart::Instance &instance : part.instances)
+            if (instance.vertexBuffer)
+                glDeleteBuffers(1, &instance.vertexBuffer);
         if (part.indexBuffer)
             glDeleteBuffers(1, &part.indexBuffer);
     }
@@ -1118,6 +1143,7 @@ public:
 
     void beginFrame(const Camera &camera, ClearColor clear) override
     {
+        ++m_instanceFrame;
         m_screenZLayers.clear();
         m_camera = camera;
         BeginDrawing(); // holds ps2xVitaGlMutex until EndDrawing
@@ -1229,6 +1255,47 @@ public:
         glEnableClientState(GL_VERTEX_ARRAY);
         for (DrawPart &part : found->second)
         {
+            if (meshInstancesEnabled() && !part.skinned && part.staticVertexCache.valid &&
+                part.staticVertexCache.model != model &&
+                part.gpuVertices.size() == part.sourceVertices.size())
+            {
+                constexpr std::size_t kMaxInstances = 24u;
+                DrawPart::Instance *hit = nullptr, *oldest = nullptr;
+                for (DrawPart::Instance &instance : part.instances)
+                {
+                    if (instance.key.valid && instance.key.model == model)
+                    {
+                        hit = &instance;
+                        break;
+                    }
+                    if (instance.usedFrame != m_instanceFrame && (!oldest || instance.usedFrame < oldest->usedFrame))
+                        oldest = &instance;
+                }
+                if (!hit && part.slotUsedFrame == m_instanceFrame)
+                {
+                    // The slot in use was baked for another copy drawn this frame: park it.
+                    if (part.instances.size() < kMaxInstances)
+                    {
+                        DrawPart::Instance fresh;
+                        glGenBuffers(1, &fresh.vertexBuffer);
+                        glBindBuffer(GL_ARRAY_BUFFER, fresh.vertexBuffer);
+                        glBufferData(GL_ARRAY_BUFFER,
+                                     static_cast<GLsizei>(part.gpuVertices.size() * sizeof(GpuVertex)),
+                                     part.gpuVertices.data(), GL_STATIC_DRAW);
+                        part.instances.push_back(std::move(fresh));
+                        hit = &part.instances.back();
+                    }
+                    else
+                        hit = oldest; // may be null: every slot was used this frame, re-bake in place
+                }
+                if (hit)
+                {
+                    std::swap(part.vertexBuffer, hit->vertexBuffer);
+                    std::swap(part.staticVertexCache, hit->key);
+                    std::swap(part.slotUsedFrame, hit->usedFrame);
+                }
+            }
+            part.slotUsedFrame = m_instanceFrame;
             glBindBuffer(GL_ARRAY_BUFFER, part.vertexBuffer);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, part.indexBuffer);
             const auto &color = part.materialIndex < state.materialColors.size()
@@ -2443,6 +2510,7 @@ private:
     bool m_ownsWindow = false;
     bool m_in3D = false;
     bool m_gpuSkinEnabled = false;
+    std::uint32_t m_instanceFrame = 0; // counts beginFrame calls, for DrawPart::Instance::usedFrame
     SkinProgram m_skinProgram{};
     std::uint64_t m_gpuSkinReportFrames = 0;
     // Time inside drawScreenPrimitive by phase (P3FES_RESOURCE_DIAG), microseconds since the last report.
