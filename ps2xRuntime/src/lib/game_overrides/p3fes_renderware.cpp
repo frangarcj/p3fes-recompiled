@@ -4721,6 +4721,8 @@ namespace
     constexpr uint32_t kPtankSetupSpr3d = 0x00479170u;
     constexpr uint32_t kPtankPosNCPSPR = 0x0047E9E0u;
     constexpr uint32_t kPtankColorPP = 0x004838E0u;
+    constexpr uint32_t kPtankUV2 = 0x00485750u;  // rpPTankSkyInsUV2: one (u0, v0, u1, v1) window per particle
+    constexpr uint32_t kPtankUV2C = 0x00485EF0u; // rpPTankSkyInsUV2C: one constant window for the tank
     constexpr uint32_t kPtankMaxParticles = 4096u;
 
     bool drawNativePtankSprites(uint8_t *rdram, uint32_t atomic, uint32_t tank, int32_t countSigned,
@@ -4756,11 +4758,35 @@ namespace
             (rotData && !fits(rotData, rotStride, 4u)))
             return false;
         float uv[4] = {0.0f, 0.0f, 1.0f, 1.0f}; // u0, v0, u1, v1
-        for (uint32_t i = 0u; i < 4u; ++i)
+        // The tank's UV callback (+0x2C): UV2C keeps one window for every particle in the table (+0x90); UV2 reads
+        // a window per particle from the lock table's column 7 ({data, stride} at +0x3C/+0x40, 4 floats u0 v0 u1 v1,
+        // corners (u0,v1) (u1,v1) (u1,v0) (u0,v0), the same order as the constant window). Reading the constant
+        // window of a UV2 tank gave a degenerate (0,0,0,1) window: one texel column.
+        uint32_t uvCallback = 0u, uvData = 0u, uvStride = 0u;
+        readGuest(rdram, tank + 0x2Cu, uvCallback);
+        bool perParticleUv = false;
+        // P3FES_PTANK_UV2=0: the previous behaviour (the constant window for every tank, textureless junk tanks drawn).
+        static const bool ptankUv2 = [] { const char *v = std::getenv("P3FES_PTANK_UV2"); return !v || *v != '0'; }();
+        if (uvCallback == kPtankUV2 && ptankUv2)
         {
-            float value = 0.0f;
-            if (readGuest(rdram, table + 0x90u + i * 4u, value) && std::isfinite(value))
-                uv[i] = value;
+            if (!readGuest(rdram, table + 0x3Cu, uvData) || !readGuest(rdram, table + 0x40u, uvStride) || !uvData ||
+                !fits(uvData, uvStride, 16u))
+            {
+                static unsigned failLines = 0u;
+                if (failLines++ < 20u)
+                    std::fprintf(stderr, "[p3fes-ptank-uvfail] tank=%X count=%u uvData=%X uvStride=%X posData=%X\n", tank, count, uvData, uvStride, posData);
+                return false;
+            }
+            perParticleUv = true;
+        }
+        else
+        {
+            for (uint32_t i = 0u; i < 4u; ++i)
+            {
+                float value = 0.0f;
+                if (readGuest(rdram, table + 0x90u + i * 4u, value) && std::isfinite(value))
+                    uv[i] = value;
+            }
         }
 
         AtomicSummary summary;
@@ -4787,6 +4813,27 @@ namespace
             drawState.blendEnabled = true;
             drawState.materialBlends.assign(std::max<std::size_t>(drawState.materialColors.size(), 1u), *blendOverride);
         }
+        {
+            // A material that names a texture (non-zero pointer) whose raster does not resolve is an unconfigured
+            // tank (e.g. texture word 0xD4 and every UV 0x7FFFFFFF, seen on a Bufu effect twin): drawn without a
+            // texture its 36..236 unit sprites are solid additive squares. Such a tank draws nothing here.
+            // A material with no texture at all (pointer 0) is a deliberate flat-colour tank and is still drawn.
+            if (ptankUv2 && (drawState.materialTextures.empty() || drawState.materialTextures[0].empty()))
+            {
+                uint32_t matArray = 0u, material = 0u, texture = 0u;
+                if (readGuest(rdram, summary.geometry + kGeometryMatListArrayOffset, matArray) && matArray &&
+                    readGuest(rdram, matArray, material) && material && readGuest(rdram, material + kMaterialTextureOffset, texture) && texture)
+                {
+                    static bool logged = false;
+                    if (!logged)
+                    {
+                        logged = true;
+                        std::fprintf(stderr, "[p3fes-native] particle tank %08X has an unresolvable texture (0x%X): not drawn\n", tank, texture);
+                    }
+                    return true;
+                }
+            }
+        }
         drawState.cullMode = MeshDrawState::CullMode::None;
         drawState.materialColors.assign(1u, {255u, 255u, 255u, 255u});
 
@@ -4805,8 +4852,8 @@ namespace
             mesh.materials[0].textureName = drawState.materialTextures[0];
         const float cornerS[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
         const float cornerT[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
-        const float cornerU[4] = {uv[0], uv[2], uv[2], uv[0]};
-        const float cornerV[4] = {uv[3], uv[3], uv[1], uv[1]};
+        float cornerU[4] = {uv[0], uv[2], uv[2], uv[0]};
+        float cornerV[4] = {uv[3], uv[3], uv[1], uv[1]};
         uint32_t quads = 0u;
         for (uint32_t i = 0u; i < count; ++i)
         {
@@ -4820,6 +4867,26 @@ namespace
             if (rotData)
                 readGuest(rdram, rotData + i * rotStride, angle);
             std::memcpy(rgba.data(), rdram + colorData + i * colorStride, 4u);
+            if (perParticleUv)
+            {
+                float window[4] = {};
+                for (uint32_t k = 0u; k < 4u; ++k)
+                    readGuest(rdram, uvData + i * uvStride + k * 4u, window[k]);
+                if (!std::isfinite(window[0]) || !std::isfinite(window[1]) || !std::isfinite(window[2]) || !std::isfinite(window[3]))
+                {
+                    static unsigned badLines = 0u;
+                    static const bool badDiag = [] { const char *v = std::getenv("P3FES_PTANK_DIAG"); return v && *v == '1'; }();
+                    if (badDiag && i == 0u && badLines++ < 400u)
+                    {
+                        uint32_t raw[4] = {};
+                        for (uint32_t k = 0u; k < 4u; ++k) readGuest(rdram, uvData + i * uvStride + k * 4u, raw[k]);
+                        std::fprintf(stderr, "[p3fes-ptank-baduv] tank=%X particle=%u of %u uvData=%X stride=%X raw=%08X,%08X,%08X,%08X\n", tank, i, count, uvData, uvStride, raw[0], raw[1], raw[2], raw[3]);
+                    }
+                    continue;
+                }
+                cornerU[0] = cornerU[3] = window[0]; cornerU[1] = cornerU[2] = window[2];
+                cornerV[0] = cornerV[1] = window[3]; cornerV[2] = cornerV[3] = window[1];
+            }
             if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) || !std::isfinite(size[0]) ||
                 !std::isfinite(size[1]) || !std::isfinite(angle))
                 continue;
@@ -4866,6 +4933,18 @@ namespace
                 readGuest(rdram, kRwTest1, test1);
                 readGuest(rdram, kRwRenderFlags, flags);
                 const auto &c0 = mesh.vertices[0].color;
+                float sizeMin = 1e30f, sizeMax = -1e30f, firstUv[4] = {};
+                for (uint32_t q = 0u; q < count; ++q)
+                {
+                    float sw = 0.0f;
+                    readGuest(rdram, sizeData + q * sizeStride, sw);
+                    sizeMin = std::min(sizeMin, sw); sizeMax = std::max(sizeMax, sw);
+                }
+                if (perParticleUv)
+                    for (uint32_t k = 0u; k < 4u; ++k)
+                        readGuest(rdram, uvData + k * 4u, firstUv[k]);
+                std::fprintf(stderr, "[p3fes-ptank-state] tank=%X uvcb=%X size=%.1f..%.1f particle0-uv=%.3f,%.3f,%.3f,%.3f\n", tank, uvCallback, sizeMin, sizeMax,
+                             firstUv[0], firstUv[1], firstUv[2], firstUv[3]);
                 std::fprintf(stderr, "[p3fes-ptank] frame=%llu quads=%u tex=%s alpha1=%llX test1=%llX flags=%llX blend=%d(%u/%u) override=%d first-rgba=%u,%u,%u,%u uv=%.2f,%.2f,%.2f,%.2f\n",
                              static_cast<unsigned long long>(g_nativeFrameNumber), quads,
                              drawState.materialTextures.empty() ? "-" : drawState.materialTextures[0].c_str(),
@@ -5045,6 +5124,41 @@ namespace
         (void)ctx;
         (void)runtime;
 #endif
+    }
+
+    // GS reference runs (P3FES_NATIVE_RW=0) with P3FES_PTANK_GSDIAG=1: one line per particle tank draw with the state the
+    // original pipeline reads (material texture word, UV callback and the first per-particle UV words), then the
+    // original runs unchanged. Used to compare the tanks of a native run with the ones the original draws.
+    std::atomic<PS2Runtime::RecompiledFunction> g_originalPtankRender{nullptr};
+    void p3fesPtankGsDiag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static unsigned lines = 0u;
+        if (ctx && lines < 4000u)
+        {
+            const uint32_t atomic = reg32(ctx, 4u);
+            uint32_t pluginOffset = 0u, tank = 0u, geometry = 0u, matArray = 0u, material = 0u, texture = 0u, raster = 0u;
+            int32_t count = 0;
+            if (readGuest(rdram, kPtankAtomicExtensionOffset, pluginOffset) && pluginOffset && guestPointer(atomic + pluginOffset, 4u) &&
+                readGuest(rdram, atomic + pluginOffset, tank) && tank && guestPointer(tank, 0x100u) && readGuest(rdram, tank + 4u, count) && count > 0)
+            {
+                uint32_t uvCallback = 0u, uvData = 0u, uvStride = 0u, uvWord = 0u, rasterWord = 0u, posData = 0u;
+                readGuest(rdram, tank + 0x2Cu, uvCallback);
+                readGuest(rdram, tank + 0x50u + 0x3Cu, uvData);
+                readGuest(rdram, tank + 0x50u + 0x40u, uvStride);
+                readGuest(rdram, tank + 0x50u + 0x04u, posData);
+                if (uvData && guestPointer(uvData, 16u)) readGuest(rdram, uvData, uvWord);
+                readGuest(rdram, atomic + 0x18u, geometry); // RpAtomic geometry
+                if (geometry && readGuest(rdram, geometry + kGeometryMatListArrayOffset, matArray) && matArray && readGuest(rdram, matArray, material) && material)
+                    readGuest(rdram, material + kMaterialTextureOffset, texture);
+                if (texture && guestPointer(texture, 4u)) readGuest(rdram, texture + kTextureRasterOffset, raster);
+                if (raster && guestPointer(raster, 4u)) readGuest(rdram, raster, rasterWord);
+                std::fprintf(stderr, "[p3fes-ptank-gs] tank=%X atomic=%X count=%d material=%X texture=%X raster=%X uvcb=%X uv0=%08X pos=%X\n", tank, atomic, count,
+                             material, texture, raster, uvCallback, uvWord, posData);
+                ++lines;
+            }
+        }
+        if (PS2Runtime::RecompiledFunction original = g_originalPtankRender.load(std::memory_order_acquire))
+            original(rdram, ctx, runtime);
     }
 
     void p3fesGsColorMaskOn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -5398,6 +5512,16 @@ namespace
             // GS reference runs (P3FES_NATIVE_RW=0): the debug warp harness is inert unless a P3FES_WARP* variable
             // is set, so a warped scene can be rendered by the game's own GS path for comparison.
             p3fes_debug_warp::install(runtime);
+            // P3FES_PTANK_GSDIAG=1: log the state of every particle tank the original pipeline draws (see p3fesPtankGsDiag).
+            if (const char *gsDiag = std::getenv("P3FES_PTANK_GSDIAG"); gsDiag && *gsDiag == '1')
+            {
+                PS2Runtime::RecompiledFunction ptank = runtime.lookupFunction(kPtankAtomicRender);
+                if (ptank && ptank != &p3fesPtankGsDiag)
+                {
+                    g_originalPtankRender.store(ptank, std::memory_order_release);
+                    runtime.replaceFunction(kPtankAtomicRender, &p3fesPtankGsDiag);
+                }
+            }
 #endif
             return;
         }
