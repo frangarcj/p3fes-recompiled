@@ -17,7 +17,9 @@ The game's MIPS R5900 code is statically recompiled to C++ and run on a reimplem
 </div>
 
 > [!IMPORTANT]
-> No game files are included: no ELF, IRX modules, `.CVM` archives or code generated from them.
+> This repository contains no game files: no ELF, IRX modules, `.CVM` archives or code generated from them.
+> The PS Vita beta VPK on the [Releases](https://github.com/ppkkkkk/p3fes-recompiled/releases) page holds the
+> recompiled executable code (a Vita app is one static binary), but no game data.
 > You need **your own copy** of Persona 3 FES, NTSC-U, PS2 ID **`SLUS-21621`**, matching the
 > [Redump record](http://redump.org/disc/4125/). The port is built against that disc's executable:
 >
@@ -126,6 +128,25 @@ third_party/pcsx2-vu/  Subset of PCSX2 at 646df006a used by kzvu
 ```
 
 </details>
+
+## PS Vita beta
+
+1. You need a PS Vita or PS TV with HENkaku/Ensō and taiHEN, and about 6 GB free on `ux0:`.
+2. Install the VPK from the latest [prerelease](https://github.com/ppkkkkk/p3fes-recompiled/releases) with VitaShell.
+3. Open the **[data tool](https://ppkkkkk.github.io/p3fes-recompiled/)**, pick your `SLUS-21621` ISO and save the zip.
+   The zip is built in your browser and nothing is uploaded. It holds the game files, the music converted to WAV and
+   (optionally, ~10-15 min) the movies converted to H.264 for the Vita's decoder.
+4. Extract the zip at the root of `ux0:` (it creates `ux0:data/p3fes/`) and start the game.
+
+Updates only need the new VPK; saves (`ux0:data/p3fes/memcards/`) are kept. For bug reports attach
+`ux0:data/p3fes/runtime.log`.
+
+Releases are built by [`release-vita.yml`](.github/workflows/release-vita.yml) with
+[`build_vita_release.sh`](p3fes/scripts/release/build_vita_release.sh): it recompiles `SLUS_216.21` (kept in a private
+repository, SHA-1 checked, never cached or uploaded), builds the pinned VitaSDK, vitaShaRK and vitaGL, and publishes
+only the VPK, `SHA256SUMS` and the notes. Start a release with *Run workflow* on `main` and a tag such as
+`v0.1.0-beta.1` (that keeps the build caches; a pushed tag rebuilds from scratch). The data tool lives in
+[`web/`](web/) and is deployed to GitHub Pages by [`pages.yml`](.github/workflows/pages.yml).
 
 ## Building
 

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Movie converter harness</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; max-width: 60em; }
+  pre { background: #111; color: #ddd; padding: 8px; max-height: 24em; overflow: auto; white-space: pre-wrap; }
+  progress { width: 100%; }
+</style>
+</head>
+<body>
+<h1>SFD to MP4 harness</h1>
+<p>
+  <label>SFD file <input type="file" id="file" accept=".sfd,.SFD"></label>
+  <label>threads
+    <select id="threads"><option>auto</option><option>st</option><option>mt</option></select></label>
+  <button id="go">Convert</button>
+</p>
+<p>Query parameters: <code>sfd=URL</code> (fetch + auto-run), <code>stem=NAME</code>, <code>threads=st|mt|auto</code>,
+  <code>preset=veryfast</code>, <code>seq=A,B,C</code> (one converter, several <code>/sfd/</code> movies, failures reported per stem), <code>blob=1</code> (pass a Blob), <code>core=BASEURL</code> (core dist/esm folder), <code>caps=1</code> (dump ffmpeg codecs/formats), <code>coi=1</code> (load coi-serviceworker from <code>/coi-serviceworker.js</code>).</p>
+<progress id="bar" max="1" value="0"></progress>
+<p id="status">idle</p>
+<p id="dl"></p>
+<pre id="log"></pre>
+<script>
+  // Opt-in cross-origin isolation through the service worker (GitHub Pages cannot send
+  // COOP/COEP). The script must live at the site root so its scope covers every page.
+  if (new URLSearchParams(location.search).get('coi') === '1') {
+    document.write('<script src="/coi-serviceworker.js"><\/script>');
+  }
+</script>
+<script type="module" src="./harness.js"></script>
+</body>
+</html>

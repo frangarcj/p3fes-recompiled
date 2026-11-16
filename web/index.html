@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="sw.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P3FES Vita data builder</title>
+<meta name="description" content="Builds the data folder for the Persona 3 FES PS Vita port from your own disc image, entirely in your browser.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%231565c0%27/%3E%3Cpath d=%27M4 4h5a3 3 0 010 6H6v2H4z%27 fill=%27%23fff%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="titlebar">
+      <h1 data-i18n="title">Persona 3 FES for PS Vita: data builder</h1>
+      <button id="langBtn" class="ghost" type="button" aria-label="Language">ES</button>
+    </div>
+    <p class="lead" data-i18n="lead"></p>
+    <p class="privacy" data-i18n="privacy"></p>
+  </header>
+
+  <section id="needs" class="card muted">
+    <h2 data-i18n="needTitle">What you need</h2>
+    <ul>
+      <li data-i18n="need1"></li>
+      <li data-i18n="need2"></li>
+      <li data-i18n="need3"></li>
+    </ul>
+  </section>
+
+  <section id="pick" class="card">
+    <h2 data-i18n="step1">1. Choose your game</h2>
+    <div id="drop" class="drop">
+      <div class="row">
+        <button id="isoBtn" type="button" class="primary" data-i18n="pickIso">Choose ISO file</button>
+        <button id="folderBtn" type="button" data-i18n="pickFolder">Choose extracted folder</button>
+        <button id="filesBtn" type="button" class="link" data-i18n="pickFiles">or pick loose files</button>
+      </div>
+      <p class="hint" data-i18n="dropHint">You can also drop the .iso here.</p>
+    </div>
+    <input id="isoInput" type="file" accept=".iso,.bin,.img" hidden>
+    <input id="folderInput" type="file" webkitdirectory hidden>
+    <input id="filesInput" type="file" multiple hidden>
+    <p id="gameStatus" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="options" class="card" hidden>
+    <h2 data-i18n="step2">2. Options</h2>
+    <label class="check"><input id="allMovies" type="checkbox" checked><span data-i18n="allMovies">Convert all movies (slow, ~30-60 min)</span></label>
+    <p id="moviesHelp" class="hint"></p>
+    <p id="moviesMissing" class="warn" hidden data-i18n="moviesMissing"></p>
+  </section>
+
+  <section id="build" class="card" hidden>
+    <h2 data-i18n="step3">3. Build</h2>
+    <div class="row">
+      <button id="startBtn" type="button" class="primary big" data-i18n="start">Build the ZIP</button>
+      <p id="startHelp" class="hint"></p>
+    </div>
+  </section>
+
+  <section id="progress" class="card" hidden aria-live="polite">
+    <ol id="stepList" class="steps"></ol>
+    <div class="barwrap"><div id="bar" class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><span id="barFill"></span></div></div>
+    <div class="stats"><span id="stepText"></span><span id="detailText"></span></div>
+    <div class="stats"><span id="speedText"></span><span id="etaText"></span></div>
+    <div class="row"><button id="cancelBtn" type="button" data-i18n="cancel">Cancel</button></div>
+    <details id="logBox"><summary data-i18n="log">Technical log</summary><pre id="log"></pre></details>
+  </section>
+
+  <section id="done" class="card ok" hidden>
+    <h2 data-i18n="doneTitle">Done. Now put it on your Vita.</h2>
+    <p id="doneSummary"></p>
+    <p id="doneSkipped" class="warn" hidden></p>
+    <ol class="instructions">
+      <li data-i18n="inst1"></li>
+      <li data-i18n="inst2"></li>
+      <li data-i18n="inst3"></li>
+      <li data-i18n="inst4"></li>
+    </ol>
+    <div class="row">
+      <a id="releasesLink" class="button primary" href="https://github.com/ppkkkkk/p3fes-recompiled/releases" target="_blank" rel="noopener" data-i18n="releases">Open the releases page</a>
+      <button id="againBtn" type="button" data-i18n="again">Build another</button>
+    </div>
+  </section>
+
+  <section id="error" class="card bad" hidden role="alert">
+    <h2 data-i18n="errTitle">Something went wrong</h2>
+    <p id="errText"></p>
+    <details id="errDetails"><summary data-i18n="log">Technical log</summary><pre id="errLog"></pre></details>
+  </section>
+
+  <footer>
+    <p data-i18n="footer">Persona 3 FES is a trademark of ATLUS / SEGA. This tool contains no game data and is not affiliated with them.</p>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
