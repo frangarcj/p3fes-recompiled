@@ -1,0 +1,300 @@
+name: Release PS Vita beta
+
+# Builds the PS Vita VPK from the user's SLUS_216.21 (fetched from a private repository) and publishes it as a GitHub
+# prerelease. Runs on a pushed tag v* or by hand with a tag input.
+#
+# Secrets and variables (Settings -> Secrets and variables -> Actions):
+#   secret   P3FES_INPUTS_TOKEN  fine-grained PAT, only the private inputs repository, permission "Contents: Read"
+#   variable P3FES_INPUTS_REPO   owner/name of the private repository holding SLUS_216.21 at its root
+#   variable P3FES_VITAGL_REPO   owner/name of the vitaGL fork that contains VITAGL_COMMIT (default ppkkkkk/vitaGL)
+#
+# The ELF, the generated C++ and the objects of the build never become workflow artifacts. The only artifact is the
+# final dist/ (VPK + SHA256SUMS + release notes), which is also what the release publishes.
+#
+# Caches (toolchain, ccache) are scoped to the ref that created them: a run started by a tag push can only reuse
+# caches of the default branch, and the caches it saves are visible to that tag alone. Prefer starting releases with
+# "Run workflow" on main (workflow_dispatch, it creates the tag): its caches are then saved on main and the next
+# release is incremental. A tag push still works, it just rebuilds everything (~2 h).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and publish, e.g. v0.1.0 or v0.1.0-beta.2 (created on the selected commit if missing)'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-vita
+  cancel-in-progress: false
+
+env:
+  # --- VitaSDK: official autobuild, GCC 15.2.0 like the local SDK (see the note in the release docs) ---
+  VITASDK_TAG: sdk-snapshot-20260926.790.1
+  VITASDK_ASSET: vitasdk-x86_64-linux-gnu-2026-09-26_08-31-53.tar.bz2
+  VITASDK_SHA256: 87b111ff350c1f36bde1c2923e57467c1f86b044d54bc616631260486f2a512c
+  # --- vdpm packages (https://github.com/vitasdk/packages, rolling "master" release): verified by SHA-256 ---
+  PKG_SDL2_SHA256: f7318878817e5268fd991a2796d83a544c7688d0c98f510e4d6c9d3b07725e5b
+  PKG_MATHNEON_SHA256: a27601332424dd1e1ba595102a1be9095176b592213d30fec37af3c3510248c0
+  PKG_SHACCCGEXT_SHA256: ded53f55e59a39b32cc1167d8a00f46b239e9844eb8a65870d3dba2f30fa88ba
+  PKG_TAIHEN_SHA256: afced213d9d308a665ef91809fd728614a92ec31b2fcf61cf1f6a3e98bec4014
+  # --- vitaShaRK: the vdpm package is too old (no is_shark_online / shader association); upstream master is needed ---
+  VITASHARK_COMMIT: df24065e65098b2d1ac533760109ad4367573f28
+  # --- vitaGL: the user's fork (repository variable P3FES_VITAGL_REPO) at a pinned commit. These Makefile options
+  # reproduce the installed libvitaGL.a of the development machine (identical code and data in all 30 objects). ---
+  VITAGL_COMMIT: 8a47034e078f7c39aa45e43493d7fe360a52a871
+  VITAGL_FLAGS: >-
+    NO_SPLASHSCREEN=1 NO_TEX_COMBINER=1 HAVE_SHARK_LOG=1 USE_SCRATCH_MEMORY=1 LOG_ERRORS=1
+    SHARED_RENDERTARGETS=2 DRAW_SPEEDHACK=2 PRIMITIVES_SPEEDHACK=1 INDICES_DRAW_SPEEDHACK=1
+  # Bump when the setup steps below change in a way the pins above do not capture (invalidates the toolchain cache).
+  DEPS_REV: r1
+
+jobs:
+  build:
+    name: Build VPK
+    if: github.repository == 'ppkkkkk/p3fes-recompiled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      VITASDK: /home/runner/vitasdk
+      CCACHE_DIR: /home/runner/ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPRESS: '1'
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime,locale
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then tag=$INPUT_TAG; else
+            [ "$REF_TYPE" = tag ] || { echo "::error::not a tag push"; exit 1; }
+            tag=$REF_NAME
+          fi
+          if ! [[ $tag =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::tag '$tag' must look like v1.2.3 or v1.2.3-beta.1"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space and install build tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build ccache unzip
+          df -h /
+
+      # ---------------------------------------------------------------------------------------------------------
+      # Toolchain: VitaSDK + vdpm packages + vitaShaRK + vitaGL, built once and cached as a whole
+      # ---------------------------------------------------------------------------------------------------------
+      - name: Toolchain cache key
+        id: deps
+        env:
+          VITAGL_REPO: ${{ vars.P3FES_VITAGL_REPO || 'ppkkkkk/vitaGL' }}
+        run: |
+          key=$(printf '%s\n' "$DEPS_REV" "$VITASDK_TAG" "$VITASDK_SHA256" "$PKG_SDL2_SHA256" "$PKG_MATHNEON_SHA256" \
+            "$PKG_SHACCCGEXT_SHA256" "$PKG_TAIHEN_SHA256" "$VITASHARK_COMMIT" "$VITAGL_REPO" "$VITAGL_COMMIT" \
+            "$VITAGL_FLAGS" | sha256sum | cut -c1-24)
+          echo "key=vita-toolchain-$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore toolchain cache
+        id: cache-sdk
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/vitasdk
+          key: ${{ steps.deps.outputs.key }}
+
+      - name: Install the pinned VitaSDK and its packages
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          dest=$(dirname "$VITASDK")
+          mkdir -p "$dest"
+          curl -fsSL -o "$work/sdk.tar.bz2" \
+            "https://github.com/vitasdk/autobuilds/releases/download/$VITASDK_TAG/$VITASDK_ASSET"
+          echo "$VITASDK_SHA256  $work/sdk.tar.bz2" | sha256sum -c -
+          tar -xjf "$work/sdk.tar.bz2" -C "$dest"
+          [ "$(realpath "$dest/vitasdk")" = "$(realpath "$VITASDK")" ] || mv "$dest/vitasdk" "$VITASDK"
+          cat "$VITASDK/version_info.txt"
+          for spec in "sdl2:$PKG_SDL2_SHA256" "libmathneon:$PKG_MATHNEON_SHA256" \
+                      "SceShaccCgExt:$PKG_SHACCCGEXT_SHA256" "taihen:$PKG_TAIHEN_SHA256"; do
+            pkg=${spec%%:*}; sum=${spec#*:}
+            curl -fsSL -o "$work/$pkg.tar.xz" "https://github.com/vitasdk/packages/releases/download/master/$pkg.tar.xz"
+            echo "$sum  $work/$pkg.tar.xz" | sha256sum -c -
+            tar -xJf "$work/$pkg.tar.xz" -C "$VITASDK/arm-vita-eabi"
+          done
+          rm -rf "$work"
+
+      - name: Build vitaShaRK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          export PATH="$VITASDK/bin:$PATH"
+          git clone --quiet https://github.com/Rinnegatamante/vitaShaRK "$RUNNER_TEMP/vitaShaRK"
+          cd "$RUNNER_TEMP/vitaShaRK"
+          git checkout --quiet "$VITASHARK_COMMIT"
+          [ "$(git rev-parse HEAD)" = "$VITASHARK_COMMIT" ]
+          make -j"$(nproc)" install
+
+      - name: Build vitaGL
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        env:
+          VITAGL_REPO: ${{ vars.P3FES_VITAGL_REPO || 'ppkkkkk/vitaGL' }}
+        run: |
+          set -euo pipefail
+          export PATH="$VITASDK/bin:$PATH"
+          git clone --quiet "https://github.com/$VITAGL_REPO" "$RUNNER_TEMP/vitaGL"
+          cd "$RUNNER_TEMP/vitaGL"
+          git checkout --quiet "$VITAGL_COMMIT"
+          [ "$(git rev-parse HEAD)" = "$VITAGL_COMMIT" ]
+          # word splitting of VITAGL_FLAGS into separate make variables is intended
+          # shellcheck disable=SC2086
+          make -j"$(nproc)" $VITAGL_FLAGS install
+          # a record of what the cached toolchain was built from
+          {
+            echo "vitaGL $VITAGL_REPO@$VITAGL_COMMIT $VITAGL_FLAGS"
+            echo "vitaShaRK $VITASHARK_COMMIT"
+            echo "VitaSDK $VITASDK_TAG"
+          } > "$VITASDK/p3fes-deps.txt"
+
+      - name: Save toolchain cache
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/vitasdk
+          key: ${{ steps.deps.outputs.key }}
+
+      - name: Show the toolchain
+        run: |
+          cat "$VITASDK/p3fes-deps.txt"
+          "$VITASDK/bin/arm-vita-eabi-gcc" --version | head -n 1
+
+      # ---------------------------------------------------------------------------------------------------------
+      # The game executable: never echoed, never cached, never uploaded
+      # ---------------------------------------------------------------------------------------------------------
+      - name: Fetch SLUS_216.21 from the private inputs repository
+        env:
+          INPUTS_TOKEN: ${{ secrets.P3FES_INPUTS_TOKEN }}
+          INPUTS_REPO: ${{ vars.P3FES_INPUTS_REPO || 'ppkkkkk/p3fes-ci-inputs' }}
+        run: |
+          set +x
+          [ -n "$INPUTS_TOKEN" ] || { echo "::error::secret P3FES_INPUTS_TOKEN is not set"; exit 1; }
+          dir="$RUNNER_TEMP/p3fes-inputs"
+          mkdir -p "$dir"
+          chmod 700 "$dir"
+          curl -fsSL --retry 3 -o "$dir/SLUS_216.21" \
+            -H "Authorization: Bearer $INPUTS_TOKEN" \
+            -H "Accept: application/vnd.github.raw+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$INPUTS_REPO/contents/SLUS_216.21" \
+            || { echo "::error::could not fetch SLUS_216.21 from the inputs repository"; rm -rf "$dir"; exit 1; }
+          got=$(sha1sum "$dir/SLUS_216.21" | cut -d' ' -f1)
+          if [ "$got" != 3929cd7c02be944f25ec6b924e5f1eab9bc5e9cb ]; then
+            echo "::error::SLUS_216.21 has an unexpected SHA-1 ($got)"; rm -rf "$dir"; exit 1
+          fi
+          echo "SLUS_216.21 fetched, SHA-1 ok"
+
+      # ---------------------------------------------------------------------------------------------------------
+      # Build (host recompiler -> recompile -> install generated sources -> Vita configure + build -> dist/)
+      # ---------------------------------------------------------------------------------------------------------
+      - name: Restore ccache
+        id: cache-ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/ccache
+          key: ccache-vita-${{ github.run_id }}
+          restore-keys: |
+            ccache-vita-
+
+      - name: Build the VPK
+        id: build
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          p3fes/scripts/release/build_vita_release.sh \
+            --elf "$RUNNER_TEMP/p3fes-inputs/SLUS_216.21" \
+            --version "$TAG" \
+            --vitasdk "$VITASDK" \
+            --commit "${GITHUB_SHA:0:12}" \
+            --work "$RUNNER_TEMP/p3fes-work" \
+            --out "$GITHUB_WORKSPACE/dist" \
+            --jobs "$(nproc)" \
+            --overwrite-generated
+          ccache --show-stats
+
+      - name: Save ccache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /home/runner/ccache
+          key: ccache-vita-${{ github.run_id }}
+
+      - name: Remove the game executable and generated sources
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/p3fes-inputs" "$RUNNER_TEMP/p3fes-work"
+          find ps2xRuntime/src/runner -mindepth 1 -delete 2>/dev/null || true
+          rm -f ps2xRuntime/include/ps2_recompiled_functions.h ps2xRuntime/include/ps2_recompiled_stubs.h
+
+      - name: Upload dist (VPK, SHA256SUMS, release notes only)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vita-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish prerelease
+    needs: build
+    if: github.repository == 'ppkkkkk/p3fes-recompiled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vita-dist
+          path: dist
+
+      - name: Create or update the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          vpk="dist/P3FES-Vita-$TAG.vpk"
+          # whitelist again: exactly the VPK, SHA256SUMS and the notes
+          [ "$(find dist -type f | wc -l)" -eq 3 ] && [ "$(find dist | wc -l)" -eq 4 ] \
+            && [ -f "$vpk" ] && [ -f dist/SHA256SUMS ] && [ -f dist/RELEASE_NOTES.md ] \
+            || { echo "::error::dist/ does not hold exactly the expected files"; find dist; exit 1; }
+          (cd dist && sha256sum -c SHA256SUMS)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$vpk" dist/SHA256SUMS --clobber
+            gh release edit "$TAG" --prerelease --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "$TAG" "$vpk" dist/SHA256SUMS \
+              --prerelease --target "$TARGET_SHA" --title "Persona 3 FES for PS Vita $TAG" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi

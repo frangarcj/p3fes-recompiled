@@ -34,3 +34,4 @@ memcards/
 build-*/
 p3fes/output/
 __pycache__/
+/dist/
