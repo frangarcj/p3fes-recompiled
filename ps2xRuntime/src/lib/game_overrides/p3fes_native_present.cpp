@@ -2109,9 +2109,16 @@ bool renderHostFrame()
     // dialogue panel (the "mixed" layers) is therefore placed draw by draw, see classifyMixedDraws: backdrops
     // and strips are stretched, art touching an edge is pinned to it, flat bars touching an edge are extended
     // to it, and everything else stays in one centred block, so that groups keep their layout.
+    //
+    // One kind of layer is exempt in a menu frame: a HUD element anchored in a screen corner that the menu merely
+    // draws over (the date and time of day, which the shop and the save screen keep on show). Such a layer is
+    // compact, reaches one side edge and the top or the bottom edge. It is one object (a banner, its text and its
+    // icons) and its draws must stay together: placed draw by draw, only the banner overhanging the edge was
+    // pinned and the rest fell into the centred block, so the widget came apart. It keeps the layer rules.
     struct ScreenLayer
     {
         float z, x0, x1, width;
+        float y0 = 1e9f, y1 = -1e9f, height = 448.0f; // vertical extent and the source's height (corner test)
         bool hasStrip = false; // some texture's draws span most of the width (a dialogue box, a wide panel)
         bool mixed = false;    // placed draw by draw (see above)
         float untexturedArea = 0.0f, untexturedSolidArea = 0.0f, untexturedSolidLargest = 0.0f, untexturedX0 = 1e9f, untexturedX1 = -1e9f; // draws without texture
@@ -2231,6 +2238,7 @@ bool renderHostFrame()
             if (layerIndex < 0)
             {
                 layers.push_back({z, 1e9f, -1e9f, screen->sourceWidth});
+                layers.back().height = screen->sourceHeight;
                 layerIndex = static_cast<int32_t>(layers.size() - 1);
             }
             ScreenLayer *layer = &layers[static_cast<size_t>(layerIndex)];
@@ -2259,6 +2267,8 @@ bool renderHostFrame()
             }
             layer->x0 = std::min(layer->x0, bx0);
             layer->x1 = std::max(layer->x1, bx1);
+            layer->y0 = std::min(layer->y0, by0);
+            layer->y1 = std::max(layer->y1, by1);
             if (texture)
             {
                 texture->x0 = std::min(texture->x0, bx0);
@@ -2362,10 +2372,16 @@ bool renderHostFrame()
             menuFrame = menuFrame || (texture.opaqueArea >= 0.7f * 640.0f * 448.0f && texture.opaqueLargest >= 0.3f * 640.0f * 448.0f && texture.x0 <= 0.15f * 640.0f && texture.x1 >= 0.85f * 640.0f);
         for (const ScreenLayer &layer : layers) // a flat solid backdrop (the save screen); a fade is not solid until it is complete
             menuFrame = menuFrame || (layer.untexturedSolidArea >= 0.7f * 640.0f * 448.0f && layer.untexturedSolidLargest >= 0.3f * 640.0f * 448.0f && layer.untexturedX0 <= 0.15f * 640.0f && layer.untexturedX1 >= 0.85f * 640.0f);
+        // P3FES_WS_MENU_CORNERS=0: every layer of a menu frame is placed draw by draw, as before.
+        static const bool menuCorners = [] { const char *v = std::getenv("P3FES_WS_MENU_CORNERS"); return !v || *v != '0'; }();
         for (ScreenLayer &layer : layers)
         {
             const bool left = layer.x0 <= 0.5f, right = layer.x1 >= layer.width - 0.5f;
-            layer.mixed = menuFrame || (left && right);
+            // A corner element (see the comment above): compact, one side edge, and the top or the bottom edge.
+            const float visible = std::min(layer.x1, layer.width) - std::max(layer.x0, 0.0f);
+            const bool corner = menuCorners && left != right && visible <= 0.6f * layer.width &&
+                                (layer.y0 <= 0.5f || layer.y1 >= layer.height - 0.5f);
+            layer.mixed = (menuFrame && !corner) || (left && right);
             anyMixed = anyMixed || layer.mixed;
         }
         drawMenu.assign(frame.draws.size(), kMenuNone);
@@ -2526,7 +2542,14 @@ bool renderHostFrame()
             // between them, edge to edge. Flat, gradient or abstract: stretching it is the right thing.
             const float coverage = texture ? texture->area : layer.untexturedArea;
             const float gx0 = texture ? texture->x0 : layer.untexturedX0, gx1 = texture ? texture->x1 : layer.untexturedX1;
-            if (coverage >= 0.7f * sw * sh && gx0 <= 0.15f * sw && gx1 >= 0.85f * sw &&
+            // The group test says the layer HAS a backdrop, not that every big flat draw of it is part of it: the message
+            // box of the memory-card screens ("Checking memory card...", "Load this file?", "Save successful.": flat, 84..624
+            // of 640, drawn on top of the slot list and the "LOAD DATA" label) is one of the group's flat draws, and stretched
+            // it moved its left edge from 193 px to 126 px and covered the label. In a menu frame a flat draw is part of the
+            // backdrop only if it reaches a side edge itself (as the textured backdrop pieces do). P3FES_WS_PANEL_STRETCH=1: as before.
+            static const bool panelStretch = [] { const char *v = std::getenv("P3FES_WS_PANEL_STRETCH"); return v && *v == '1'; }();
+            const bool insideMargins = menuFrame && !texture && !panelStretch && x0 > 0.02f * sw && x1 < 0.98f * sw;
+            if (coverage >= 0.7f * sw * sh && gx0 <= 0.15f * sw && gx1 >= 0.85f * sw && !insideMargins &&
                 (!menuFrame || (x1 - x0) * (drawBox[slot][3] - drawBox[slot][2]) >= 0.1f * sw * sh)) // in a menu not the small pieces drawn at the same Z
                 placement = Placement::Stretch;
             else if (x0 <= 0.02f * sw && x1 >= 0.98f * sw) // a strip across the whole screen, edge to edge (its end caps may sit a few units in)
