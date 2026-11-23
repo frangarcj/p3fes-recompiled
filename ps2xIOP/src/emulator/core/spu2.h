@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -36,6 +37,9 @@ namespace ps2x::iop::detail
         static constexpr uint16_t StatxDmaReady = 0x0080u;
 
         Spu2();
+        ~Spu2();
+        Spu2(const Spu2 &) = delete;
+        Spu2 &operator=(const Spu2 &) = delete;
         void reset();
 
         // Acceso a registros (direccion fisica del IOP, 16 bits)
@@ -80,8 +84,24 @@ namespace ps2x::iop::detail
 
         // Advances to the given IOP cycle (one sample every CyclesPerSample cycles). Stretches in which nothing can
         // change state (no active voice, no ADMA input, no live PCM stream) are emitted as silence in bulk.
+        // On return every sample due by `iopCycle` has been rendered.
         void advanceTo(uint64_t iopCycle);
         void step(); // one 48 kHz sample
+
+        // Lazy service (on unless PS2X_SPU2_LAZY=0 or the SPU2 diagnostics are on; setLazy() overrides). The IOP emulator calls serviceTo() where it
+        // used to call advanceTo(): the SPU2 clock advances exactly as before (so canSkipServiceAt and the idle jumps see
+        // the same thing), but the samples that fell due are only counted (m_owed) and rendered in one go the next time
+        // something could tell the difference: any register read or write, RAM or DMA access, PCM stream call, an IRQ or
+        // ADMA event that could be raised, a bound of kLazyMaxSamples, or settle() (the emulator calls it at the end of
+        // each run). Samples are rendered with the register state they would have had at the service point, because the
+        // state can only change through the accesses above, which render first; the PCM stream is bit-identical to
+        // advanceTo()'s (spu2_equivalence_tests --lazy). Saves the per-call setup, the output lock and the stream lock
+        // that advanceTo() pays every few hundred IOP cycles.
+        void setLazy(bool enabled) noexcept { m_lazy = enabled; }
+        [[nodiscard]] bool lazy() const noexcept { return m_lazy; }
+        void serviceTo(uint64_t iopCycle);
+        void settle() { catchUp(); } // render every owed sample now (no-op when none is owed)
+        static constexpr uint64_t kLazyMaxSamples = 96u; // 2 ms: longest a sample may wait to be rendered
         [[nodiscard]] bool takeInterrupt() noexcept;
 
         // PS2X_SPU2_BATCH=1 (default off): the sample producer stages rendered frames locally and publishes them to
@@ -130,6 +150,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint64_t bulkSamplesForTest() const noexcept { return m_bulkSamples; }
 
     private:
+        void catchUp() { if (m_owed != 0u) catchUpSlow(); } // before anything that reads or changes state
+        void catchUpSlow();
+        void renderOwed();
+        [[nodiscard]] bool mustRenderNow() const noexcept;
         [[nodiscard]] uint16_t &reg(uint32_t offset) noexcept { return m_regs[(offset & 0x7FFu) >> 1u]; }
         [[nodiscard]] uint16_t reg(uint32_t offset) const noexcept { return m_regs[(offset & 0x7FFu) >> 1u]; }
         [[nodiscard]] uint32_t reg32(uint32_t offset) const noexcept; // par alto/bajo (direccion de 20 bits)
@@ -148,6 +172,22 @@ namespace ps2x::iop::detail
         void decodeBlock(uint32_t core, uint32_t voice);
         int32_t stepVoice(uint32_t core, uint32_t voice);
         void stepEnvelope(uint32_t core, uint32_t voice);
+        // What renderFrames() reads from the registers for one voice, read once per call instead of once per sample
+        // (registers cannot change while samples are rendered), plus the envelope constants of the voice's current phase.
+        struct VoiceCache
+        {
+            uint32_t pitch;
+            int32_t volLeft, volRight;
+            uint16_t adsr1, adsr2;
+            VoiceState::Phase phase; // the phase the constants below belong to
+            uint32_t cycles;
+            int32_t step;
+            bool exponential, increase;
+        };
+        void fillVoiceCache(uint32_t core, uint32_t voice, VoiceCache &cache) const noexcept;
+        static void envelopeConstants(VoiceState::Phase phase, VoiceCache &cache) noexcept;
+        int32_t stepVoiceCached(uint32_t core, uint32_t voice, VoiceCache &cache);
+        static void stepEnvelopeCached(VoiceState &v, VoiceCache &cache) noexcept;
         void checkIrqAddress(uint32_t halfwordAddress) noexcept;
 
         void feedInput(uint32_t core);
@@ -203,6 +243,10 @@ namespace ps2x::iop::detail
         std::vector<int16_t> m_stage; // StageFrames * 2 samples
         size_t m_stageCount = 0;
 
+        // PS2X_SPU2_TAP=<file>: every frame the producer makes (silence included), in order, as s16le stereo, before
+        // any drop or consumer: a pure record of what the emulation produced, for comparing two builds bit for bit.
+        std::FILE *m_tap = nullptr;
+
         std::vector<uint16_t> m_ram;
         std::array<uint16_t, 0x400> m_regs{};
         std::array<std::array<VoiceState, VoicesPerCore>, 2> m_voices{};
@@ -225,6 +269,8 @@ namespace ps2x::iop::detail
         // ring is read (drainOutput, pendingFrames), so the common case needs neither the mutex nor a memset.
         std::atomic<uint64_t> m_silentPending{0};
         uint64_t m_lastCycle = 0;
+        uint64_t m_owed = 0; // lazy mode: samples that fell due (m_lastCycle already counts them) and are not rendered yet
+        bool m_lazy = false;
         bool m_interrupt = false;
     };
 }

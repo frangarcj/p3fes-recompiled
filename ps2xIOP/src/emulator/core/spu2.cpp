@@ -1,8 +1,62 @@
 #include "spu2.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+#endif
+
+// Cheap run-time counters for the host's one-line-per-5-s IOP report (ps2_iop_host.cpp, PS2X_IOP_STATS=1). Plain integers:
+// each is only ever written by the thread that holds the lock it counts, or by the producer thread.
+namespace
+{
+    struct Spu2Counters
+    {
+        uint64_t outputLocks = 0;    // m_outputMutex acquisitions (producer pushes + consumer drains)
+        uint64_t streamLocks = 0;    // m_streamMutex acquisitions
+        uint64_t runCalls = 0;       // runSamples() calls that had samples to make
+        uint64_t renderedSamples = 0; // samples made by renderFrames (voices / ADMA / streams playing)
+        uint64_t bulkSamples = 0;    // samples made by the silent bulk path
+        uint64_t renderChunks = 0;   // renderFrames() calls
+        uint64_t services = 0;       // service points that had at least one sample due
+        uint64_t servicesDeferred = 0; // ...of which left for later (lazy mode)
+        uint64_t forcedRenders = 0;  // lazy mode: service points that had to render at once (events possible, or the bound)
+        uint64_t catchUpRenders = 0; // lazy mode: renders caused by an access, a stream call or the end of a run
+        uint64_t renderUs = 0;       // time spent rendering owed samples (only when timing is on)
+        bool timing = false;
+    } g_spu2Counters;
+
+    inline uint64_t spu2NowUs()
+    {
+#if defined(__vita__)
+        return sceKernelGetProcessTimeWide();
+#else
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+#endif
+    }
+}
+extern "C" void ps2xSpu2SetTiming(int enabled)
+{
+    g_spu2Counters.timing = enabled != 0;
+}
+extern "C" void ps2xSpu2Counters(uint64_t *out)
+{
+    out[0] = g_spu2Counters.outputLocks;
+    out[1] = g_spu2Counters.streamLocks;
+    out[2] = g_spu2Counters.runCalls;
+    out[3] = g_spu2Counters.renderedSamples;
+    out[4] = g_spu2Counters.bulkSamples;
+    out[5] = g_spu2Counters.renderChunks;
+    out[6] = g_spu2Counters.services;
+    out[7] = g_spu2Counters.servicesDeferred;
+    out[8] = g_spu2Counters.forcedRenders;
+    out[9] = g_spu2Counters.catchUpRenders;
+    out[10] = g_spu2Counters.renderUs;
+}
 
 namespace ps2x::iop::detail
 {
@@ -50,9 +104,21 @@ namespace ps2x::iop::detail
     {
         const char *batch = std::getenv("PS2X_SPU2_BATCH");
         m_batch = batch != nullptr && batch[0] == '1';
+        // Lazy service is on unless PS2X_SPU2_LAZY=0 (bit-identical output: spu2_equivalence_tests, and a 128 s battle
+        // run on the Mac compared sample for sample with it off).
+        const char *lazy = std::getenv("PS2X_SPU2_LAZY");
+        m_lazy = !(lazy != nullptr && lazy[0] == '0') && !diagEnabled();
         if (m_batch)
             m_stage.resize(StageFrames * 2u);
+        if (const char *tap = std::getenv("PS2X_SPU2_TAP"); tap && tap[0] != '\0')
+            m_tap = std::fopen(tap, "wb");
         reset();
+    }
+
+    Spu2::~Spu2()
+    {
+        if (m_tap)
+            std::fclose(m_tap);
     }
 
     void Spu2::reset()
@@ -81,6 +147,7 @@ namespace ps2x::iop::detail
             m_streamLive.store(false, std::memory_order_relaxed);
         }
         m_lastCycle = 0;
+        m_owed = 0;
         m_interrupt = false;
         reg(RegStatx) = StatxDmaReady;
         reg(0x400u + RegStatx) = StatxDmaReady;
@@ -100,6 +167,7 @@ namespace ps2x::iop::detail
 
     void Spu2::writeRam(uint32_t halfwordAddress, uint16_t value) noexcept
     {
+        catchUp(); // a voice decoding RAM must see the data it would have seen at the service point
         halfwordAddress &= RamHalfwords - 1u;
         m_ram[halfwordAddress] = value;
         checkIrqAddress(halfwordAddress);
@@ -127,6 +195,7 @@ namespace ps2x::iop::detail
 
     uint16_t Spu2::read16(uint32_t physical) const
     {
+        const_cast<Spu2 *>(this)->catchUp(); // envelope, NAX and ENDX are what the voices have reached by now
         const uint32_t offset = (physical - RegBase) & 0x7FEu;
         if (offset < 0x760u)
         {
@@ -164,6 +233,7 @@ namespace ps2x::iop::detail
 
     void Spu2::write16(uint32_t physical, uint16_t value)
     {
+        catchUp(); // samples due before this write are made with the registers as they were
         const uint32_t offset = (physical - RegBase) & 0x7FEu;
         reg(offset) = value;
         if (offset < 0x760u && diagEnabled())
@@ -234,6 +304,7 @@ namespace ps2x::iop::detail
 
     bool Spu2::dmaWrite(uint32_t core, const uint8_t *source, size_t bytes)
     {
+        catchUp();
         const uint32_t base = core * 0x400u;
         if ((reg(base + RegAdmas) & (core + 1u)) != 0u)
         {
@@ -259,6 +330,7 @@ namespace ps2x::iop::detail
 
     bool Spu2::dmaRead(uint32_t core, uint8_t *destination, size_t bytes)
     {
+        catchUp();
         const uint32_t base = core * 0x400u;
         if ((reg(base + RegAdmas) & (core + 1u)) != 0u)
             return false;
@@ -485,6 +557,134 @@ namespace ps2x::iop::detail
         return v.lastOutput;
     }
 
+    void Spu2::fillVoiceCache(uint32_t core, uint32_t index, VoiceCache &cache) const noexcept
+    {
+        cache.pitch = std::min<uint32_t>(reg(voiceReg(core, index, 4u)), 0x3FFFu);
+        cache.volLeft = volumeFromRegister(reg(voiceReg(core, index, 0u)));
+        cache.volRight = volumeFromRegister(reg(voiceReg(core, index, 2u)));
+        cache.adsr1 = reg(voiceReg(core, index, 6u));
+        cache.adsr2 = reg(voiceReg(core, index, 8u));
+        envelopeConstants(m_voices[core][index].phase, cache);
+    }
+
+    // The parts of stepEnvelope() that depend only on the phase and the ADSR registers.
+    void Spu2::envelopeConstants(VoiceState::Phase phase, VoiceCache &cache) noexcept
+    {
+        const uint16_t adsr1 = cache.adsr1;
+        const uint16_t adsr2 = cache.adsr2;
+        uint32_t rate = 0;
+        bool exponential = false;
+        bool increase = false;
+        switch (phase)
+        {
+        case VoiceState::Phase::Attack:
+            rate = (adsr1 >> 8u) & 0x7Fu;
+            exponential = (adsr1 & 0x8000u) != 0u;
+            increase = true;
+            break;
+        case VoiceState::Phase::Decay:
+            rate = ((adsr1 >> 4u) & 0xFu) * 4u;
+            exponential = true;
+            break;
+        case VoiceState::Phase::Sustain:
+            rate = (adsr2 >> 6u) & 0x7Fu;
+            exponential = (adsr2 & 0x8000u) != 0u;
+            increase = (adsr2 & 0x4000u) == 0u;
+            break;
+        case VoiceState::Phase::Release:
+            rate = (adsr2 & 0x1Fu) * 4u;
+            exponential = (adsr2 & 0x20u) != 0u;
+            break;
+        case VoiceState::Phase::Off:
+            break;
+        }
+        const int32_t shiftValue = static_cast<int32_t>(rate >> 2u);
+        const int32_t stepValue = static_cast<int32_t>(rate & 3u);
+        int32_t step = increase ? 7 - stepValue : -8 + stepValue;
+        cache.cycles = 1u << static_cast<uint32_t>(std::max(0, shiftValue - 11));
+        cache.step = step << std::max(0, 11 - shiftValue);
+        cache.exponential = exponential;
+        cache.increase = increase;
+        cache.phase = phase;
+    }
+
+    // stepEnvelope() with the register reads and the per-phase arithmetic hoisted out (see VoiceCache). The state it
+    // updates, and the order, are the same; spu2_equivalence_tests compares every voice field against the original.
+    void Spu2::stepEnvelopeCached(VoiceState &v, VoiceCache &cache) noexcept
+    {
+        if (v.phase != cache.phase)
+            envelopeConstants(v.phase, cache);
+        if (v.phase == VoiceState::Phase::Off)
+            return;
+
+        uint32_t cycles = cache.cycles;
+        if (cache.exponential && cache.increase && v.envelope > 0x6000)
+            cycles *= 4u;
+        if (++v.envelopeCounter >= cycles)
+        {
+            int32_t step = cache.step;
+            if (cache.exponential && !cache.increase)
+                step = step * v.envelope / 0x8000;
+            v.envelopeCounter = 0;
+            v.envelope = std::clamp(v.envelope + step, 0, 0x7FFF);
+        }
+
+        switch (v.phase)
+        {
+        case VoiceState::Phase::Attack:
+            if (v.envelope >= 0x7FFF)
+            {
+                v.phase = VoiceState::Phase::Decay;
+                v.envelopeCounter = 0;
+            }
+            break;
+        case VoiceState::Phase::Decay:
+            if (v.envelope <= static_cast<int32_t>(((cache.adsr1 & 0xFu) + 1u) * 0x800u))
+            {
+                v.phase = VoiceState::Phase::Sustain;
+                v.envelopeCounter = 0;
+            }
+            break;
+        case VoiceState::Phase::Release:
+            if (v.envelope <= 0)
+            {
+                v.envelope = 0;
+                v.phase = VoiceState::Phase::Off;
+                v.active = false;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    int32_t Spu2::stepVoiceCached(uint32_t core, uint32_t index, VoiceCache &cache)
+    {
+        VoiceState &v = m_voices[core][index];
+        if (!v.active)
+            return 0;
+
+        v.pitchCounter += cache.pitch;
+        while (v.pitchCounter >= 0x1000u && v.active)
+        {
+            v.pitchCounter -= 0x1000u;
+            if (v.decodedIndex >= 28u)
+                decodeBlock(core, index);
+            if (!v.active)
+                break;
+            v.prev[1] = v.prev[0];
+            v.prev[0] = v.decoded[v.decodedIndex++];
+        }
+        if (!v.active)
+            return 0;
+
+        const int32_t fraction = static_cast<int32_t>(v.pitchCounter & 0xFFFu);
+        const int32_t sample = v.prev[1] + (((v.prev[0] - v.prev[1]) * fraction) >> 12);
+        stepEnvelopeCached(v, cache);
+        v.lastOutput = clamp16((sample * v.envelope) >> 15);
+        return v.lastOutput;
+    }
+
     // Moves whole 512-byte ADMA blocks (256 L samples, then 256 R samples) into the input ring.
     void Spu2::feedInput(uint32_t core)
     {
@@ -595,6 +795,59 @@ namespace ps2x::iop::detail
             c.inputLive = Diag || m_input[core].ringCount != 0u || !inputIdle(core);
         }
 
+        // Per-voice register reads, once per call. Voices that are not active now cannot become active inside the call.
+        VoiceCache cache[2][VoicesPerCore];
+        for (uint32_t core = 0; core < 2u; ++core)
+            for (uint32_t pending = m_activeVoices[core]; pending != 0u; pending &= pending - 1u)
+                fillVoiceCache(core, static_cast<uint32_t>(__builtin_ctz(pending)), cache[core][__builtin_ctz(pending)]);
+
+        // Voice by voice (not frame by frame): a voice's samples depend only on its own state and the mix is a plain
+        // integer sum, so each voice is run through the whole call at once, with its state hot, into per-frame
+        // accumulators. The things that cross voices (an IRQ or ADMA event flag, a voice ending) are order-free.
+        // The diagnostic build keeps the original frame-major loop, whose counters need the per-sample order.
+        static constexpr size_t kBlockFrames = 256u;
+        int32_t accLeft[2][kBlockFrames];
+        int32_t accRight[2][kBlockFrames];
+        if constexpr (!Diag)
+        {
+            if (count > kBlockFrames)
+            {
+                renderFrames<false>(kBlockFrames, out, streamsLive);
+                renderFrames<false>(count - kBlockFrames, out + kBlockFrames * 2u, streamsLive);
+                return;
+            }
+            for (uint32_t core = 0; core < 2u; ++core)
+            {
+                std::fill_n(accLeft[core], count, 0);
+                std::fill_n(accRight[core], count, 0);
+                const CoreSetup &c = setup[core];
+                for (uint32_t pending = m_activeVoices[core]; pending != 0u; pending &= pending - 1u)
+                {
+                    const uint32_t index = static_cast<uint32_t>(__builtin_ctz(pending));
+                    VoiceCache &vc = cache[core][index];
+                    VoiceState &v = m_voices[core][index];
+                    const bool mixLeft = (c.mixLeft & (1u << index)) != 0u;
+                    const bool mixRight = (c.mixRight & (1u << index)) != 0u;
+                    for (size_t frame = 0; frame < count; ++frame)
+                    {
+                        const int32_t sample = stepVoiceCached(core, index, vc);
+                        if (sample != 0)
+                        {
+                            if (mixLeft)
+                                accLeft[core][frame] += (sample * vc.volLeft) >> 14;
+                            if (mixRight)
+                                accRight[core][frame] += (sample * vc.volRight) >> 14;
+                        }
+                        if (!v.active)
+                        {
+                            m_activeVoices[core] &= ~(1u << index); // stepVoice() is the only thing that ends a voice
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         for (size_t frame = 0; frame < count; ++frame)
         {
             if constexpr (Diag)
@@ -605,12 +858,18 @@ namespace ps2x::iop::detail
                 const CoreSetup &c = setup[core];
                 int32_t left = 0;
                 int32_t right = 0;
-                uint32_t pending = m_activeVoices[core];
+                if constexpr (!Diag)
+                {
+                    left = accLeft[core][frame];
+                    right = accRight[core][frame];
+                }
+                uint32_t pending = Diag ? m_activeVoices[core] : 0u;
                 while (pending != 0u)
                 {
                     const uint32_t index = static_cast<uint32_t>(__builtin_ctz(pending));
                     pending &= pending - 1u;
-                    const int32_t sample = stepVoice(core, index);
+                    VoiceCache &vc = cache[core][index];
+                    const int32_t sample = stepVoiceCached(core, index, vc);
                     if (!m_voices[core][index].active)
                         m_activeVoices[core] &= ~(1u << index); // stepVoice() is the only thing that ends a voice
                     if (sample == 0)
@@ -621,12 +880,10 @@ namespace ps2x::iop::detail
                         if ((c.mixLeft & (1u << index)) == 0u && (c.mixRight & (1u << index)) == 0u)
                             ++g_diagUnmixedSamples[core];
                     }
-                    const int32_t volLeft = volumeFromRegister(reg(voiceReg(core, index, 0u)));
-                    const int32_t volRight = volumeFromRegister(reg(voiceReg(core, index, 2u)));
                     if ((c.mixLeft & (1u << index)) != 0u)
-                        left += (sample * volLeft) >> 14;
+                        left += (sample * vc.volLeft) >> 14;
                     if ((c.mixRight & (1u << index)) != 0u)
-                        right += (sample * volRight) >> 14;
+                        right += (sample * vc.volRight) >> 14;
                 }
                 // ADMA sound-data input, scaled by the core's BVOL (master block +0x0C/+0x0E).
                 if (c.inputLive)
@@ -699,6 +956,7 @@ namespace ps2x::iop::detail
             return;
         }
         std::lock_guard<std::mutex> lock(m_outputMutex);
+        ++g_spu2Counters.outputLocks;
         flushSilenceLocked();
         pushOutputLocked(stereo, frames);
     }
@@ -708,6 +966,7 @@ namespace ps2x::iop::detail
         if (m_stageCount == 0u)
             return;
         std::lock_guard<std::mutex> lock(m_outputMutex);
+        ++g_spu2Counters.outputLocks;
         flushSilenceLocked();
         pushOutputLocked(m_stage.data(), m_stageCount);
         m_stageCount = 0u;
@@ -722,6 +981,21 @@ namespace ps2x::iop::detail
 
     void Spu2::pushOutputLocked(const int16_t *stereo, size_t frames)
     {
+        if (m_tap)
+        {
+            if (stereo != nullptr)
+                std::fwrite(stereo, sizeof(int16_t) * 2u, frames, m_tap);
+            else
+            {
+                static const int16_t zeros[1024 * 2] = {};
+                for (size_t left = frames; left != 0u;)
+                {
+                    const size_t n = std::min<size_t>(left, 1024u);
+                    std::fwrite(zeros, sizeof(int16_t) * 2u, n, m_tap);
+                    left -= n;
+                }
+            }
+        }
         while (frames != 0u)
         {
             // The original pushed one frame at a time and, as soon as more than MaxBufferedFrames were buffered,
@@ -757,6 +1031,7 @@ namespace ps2x::iop::detail
     void Spu2::runSamples(uint64_t count)
     {
         const bool diag = diagEnabled(); // read once per batch
+        ++g_spu2Counters.runCalls;
         constexpr size_t kChunkFrames = 256u;
         int16_t chunk[kChunkFrames * 2u];
         while (count != 0u)
@@ -768,6 +1043,7 @@ namespace ps2x::iop::detail
             if (m_batch ? m_streamLive.load(std::memory_order_relaxed) : m_streamsActive.load(std::memory_order_relaxed))
             {
                 streamLock.lock();
+                ++g_spu2Counters.streamLocks;
                 streamsLive = anyStreamLive();
                 if (!streamsLive)
                     streamLock.unlock();
@@ -779,11 +1055,14 @@ namespace ps2x::iop::detail
                 inputIdle(1u))
             {
                 m_bulkSamples += count;
+                g_spu2Counters.bulkSamples += count;
                 pushOutput(nullptr, static_cast<size_t>(std::min<uint64_t>(count, SIZE_MAX)));
                 return;
             }
 
             const size_t frames = static_cast<size_t>(std::min<uint64_t>(count, kChunkFrames));
+            ++g_spu2Counters.renderChunks;
+            g_spu2Counters.renderedSamples += frames;
             if (diag)
                 renderFrames<true>(frames, chunk, streamsLive);
             else
@@ -797,6 +1076,7 @@ namespace ps2x::iop::detail
 
     void Spu2::step()
     {
+        catchUp();
         runSamples(1u);
     }
 
@@ -804,7 +1084,9 @@ namespace ps2x::iop::detail
     {
         if (stream >= StreamCount || frames == 0u || rate == 0u)
             return;
+        catchUp(); // the samples due so far consume the stream as it was
         std::lock_guard<std::mutex> lock(m_streamMutex);
+        ++g_spu2Counters.streamLocks;
         PcmStream &s = m_streams[stream];
         // Drop the frames already played so the vector does not grow without bound.
         if (s.read >= 16384u)
@@ -822,7 +1104,9 @@ namespace ps2x::iop::detail
     {
         if (stream >= StreamCount)
             return 0u;
+        const_cast<Spu2 *>(this)->catchUp();
         std::lock_guard<std::mutex> lock(m_streamMutex);
+        ++g_spu2Counters.streamLocks;
         return m_streams[stream].consumedFrames;
     }
 
@@ -830,7 +1114,9 @@ namespace ps2x::iop::detail
     {
         if (stream >= StreamCount)
             return;
+        catchUp();
         std::lock_guard<std::mutex> lock(m_streamMutex);
+        ++g_spu2Counters.streamLocks;
         m_streams[stream] = PcmStream{};
         updateStreamLive();
     }
@@ -867,6 +1153,15 @@ namespace ps2x::iop::detail
 
     void Spu2::advanceTo(uint64_t iopCycle)
     {
+        serviceTo(iopCycle);
+        catchUp();
+    }
+
+    // A service point. The clock moves exactly as advanceTo() always moved it; the samples are rendered at once, or in
+    // lazy mode only when they could be told apart from rendering them later (see mustRenderNow, and the comment in
+    // spu2.h).
+    void Spu2::serviceTo(uint64_t iopCycle)
+    {
         if (iopCycle <= m_lastCycle)
             return;
         const uint64_t elapsed = iopCycle - m_lastCycle;
@@ -875,23 +1170,69 @@ namespace ps2x::iop::detail
         if (elapsed < CyclesPerSample)
             return;
         const uint64_t samples = elapsed / CyclesPerSample;
+        ++g_spu2Counters.services;
+        m_owed += samples;
+        m_lastCycle += samples * CyclesPerSample;
+        if (m_lazy)
+        {
+            if (!mustRenderNow())
+            {
+                ++g_spu2Counters.servicesDeferred;
+                return;
+            }
+            ++g_spu2Counters.forcedRenders;
+        }
+        renderOwed();
+    }
+
+    // Lazy mode: true when the owed samples may have an effect before the next access: an interrupt or ADMA
+    // completion could be raised (a voice decoding while IRQA is armed on either core, ADMA data flowing, an event
+    // already waiting) or too many are owed. Everything else the samples touch (voice state, ENDX, the output) is only
+    // observable through an access, which renders first.
+    bool Spu2::mustRenderNow() const noexcept
+    {
+        if (m_owed >= kLazyMaxSamples || m_interrupt || m_input[0].doneCount != 0u || m_input[1].doneCount != 0u)
+            return true;
+        if (!inputIdle(0u) || !inputIdle(1u))
+            return true;
+        if ((m_activeVoices[0] | m_activeVoices[1]) != 0u && ((reg(RegAttr) | reg(0x400u + RegAttr)) & 0x40u) != 0u)
+            return true;
+        // a live PCM stream is consumed per sample and observable through streamConsumed (which renders first), but
+        // it also keeps the stream lock busy; leave it to the bound above.
+        return false;
+    }
+
+    void Spu2::catchUpSlow()
+    {
+        ++g_spu2Counters.catchUpRenders;
+        renderOwed();
+    }
+
+    void Spu2::renderOwed()
+    {
+        const uint64_t samples = m_owed;
+        m_owed = 0u;
+        const uint64_t t0 = g_spu2Counters.timing ? spu2NowUs() : 0u;
         // runSamples' whole-batch silence path, without entering it: nothing playing, no stream, no ADMA input
         if (!diagEnabled() && !(m_batch ? m_streamLive.load(std::memory_order_relaxed) : m_streamsActive.load(std::memory_order_relaxed)) && m_activeVoices[0] == 0u &&
             m_activeVoices[1] == 0u && inputIdle(0u) && inputIdle(1u))
         {
             m_bulkSamples += samples;
+            g_spu2Counters.bulkSamples += samples;
             pushOutput(nullptr, static_cast<size_t>(std::min<uint64_t>(samples, SIZE_MAX)));
         }
         else
         {
             runSamples(samples);
         }
-        m_lastCycle += samples * CyclesPerSample;
+        if (g_spu2Counters.timing)
+            g_spu2Counters.renderUs += spu2NowUs() - t0;
     }
 
     size_t Spu2::pendingFrames() const
     {
         std::lock_guard<std::mutex> lock(m_outputMutex);
+        ++g_spu2Counters.outputLocks;
         const_cast<Spu2 *>(this)->flushSilenceLocked();
         return m_outCount;
     }
@@ -899,6 +1240,7 @@ namespace ps2x::iop::detail
     size_t Spu2::drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
     {
         std::lock_guard<std::mutex> lock(m_outputMutex);
+        ++g_spu2Counters.outputLocks;
         flushSilenceLocked();
         if (maxLatencyFrames != SIZE_MAX && m_outCount > maxFrames + maxLatencyFrames)
         {

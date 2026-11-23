@@ -39,8 +39,15 @@ namespace
     thread_local bool t_iopExecutor = false;
     thread_local uint64_t t_holdStart = 0; // (diagnostic) when the current IopSync got the lock
     thread_local size_t t_holdKind = 0;
+    thread_local uint64_t t_holdWait = 0; // (diagnostic) how long the current IopSync waited for the lock
 }
 static std::atomic<PS2IopHostAdapter *> g_frameCounterOwner{nullptr}; // for ps2xIopFrameCounters (PS2X_FRAME_LIST)
+// Lock-acquisition counters for the PS2X_IOP_STATS line: plain integers, each written only while holding the mutex it
+// counts (so exact), read without it by the reporter (a torn read of a 5 s sample is harmless).
+static uint64_t g_hostFileLocks = 0; // m_hostFileMutex
+static uint64_t g_callLocks = 0;     // m_callMutex
+extern "C" void ps2xSpu2Counters(uint64_t *out); // spu2.cpp: [outLocks, streamLocks, runCalls, rendered, bulk, chunks, services, deferred, forced, catchUp, renderUs]
+extern "C" void ps2xSpu2SetTiming(int enabled);   // spu2.cpp: time the rendering (PS2X_IOP_STATS)
 
 PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
     : m_lock(owner.m_callMutex),
@@ -49,6 +56,7 @@ PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *
       m_previousRdram(owner.m_activeRdram),
       m_previousToken(owner.m_activeToken)
 {
+    ++g_callLocks;
     m_token = owner.m_nextToken++;
     if (m_token == 0)
     {
@@ -383,6 +391,7 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
     }
 
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+    ++g_hostFileLocks;
     uint64_t handle = m_nextHostFileHandle++;
     if (handle == 0u)
     {
@@ -421,6 +430,7 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
     }
 
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+    ++g_hostFileLocks;
     const auto it = m_hostFiles.find(handle);
     if (it == m_hostFiles.end() || !it->second.stream)
     {
@@ -657,6 +667,71 @@ struct PS2IopHostAdapter::IopThread
     std::atomic<uint64_t> slices{0}, sliceEeTotal{0}, sliceUs{0}, maxSliceUs{0}, wakes{0}, posts{0};
     std::atomic<uint64_t> defOps{0}, defBytes{0}, drains{0}, drainUs{0};
 
+    // PS2X_IOP_STATS=1: one [iopstats] line every 5 s from the worker. Everything below is written under runMutex (by
+    // the thread that holds it: the worker in its slice, or any thread inside an IopSync), except where noted, and read
+    // by the worker with runMutex held, so plain integers are exact. No clock is read per instruction: the worker reads
+    // one per slice (~1000/s) and a sync reads two.
+    bool stats = false;
+    bool wakeFix = true; // PS2X_IOP_WAKE_FIX=0 brings back the wrapping wake predicate (see workerMain)
+    // PS2X_IOP_NOCATCHUP=<mask> (default 0 = exact): syncs of these kinds do not run the IOP's backlog inline before they
+    // act, they work on the IOP as the worker has left it (at most a few ms of guest time behind the EE) and the worker
+    // catches up afterwards. bit 0 Rpc, 1 Sif, 2 Mem, 3 Module, 4 Reset, 5 Query (IopSyncKind order). Cheaper for the game
+    // thread, but an RPC then runs at an earlier IOP time than the EE's, so sound commands of a frame bunch up in the
+    // IOP's timeline and the run is no longer reproducible; hence off unless asked for.
+    uint32_t noCatchUpMask = 0;
+    static constexpr uint64_t kBucketUs = 250u;
+    static constexpr size_t kBuckets = 161u; // 0 .. 40 ms in 0.25 ms steps, the last one is "40 ms and more"
+    struct Hist
+    {
+        uint32_t b[kBuckets] = {};
+        uint64_t n = 0, maxUs = 0, sumUs = 0;
+        void add(uint64_t us)
+        {
+            size_t i = static_cast<size_t>(us / kBucketUs);
+            if (i >= kBuckets)
+                i = kBuckets - 1u;
+            ++b[i];
+            ++n;
+            sumUs += us;
+            if (us > maxUs)
+                maxUs = us;
+        }
+        double pctMs(double p) const // upper edge of the bucket holding the p-th fraction
+        {
+            if (n == 0u)
+                return 0.0;
+            const uint64_t need = static_cast<uint64_t>(static_cast<double>(n) * p + 0.999999);
+            uint64_t acc = 0;
+            for (size_t i = 0; i < kBuckets; ++i)
+            {
+                acc += b[i];
+                if (acc >= need)
+                    return static_cast<double>(i + 1u) * kBucketUs / 1000.0;
+            }
+            return static_cast<double>(kBuckets) * kBucketUs / 1000.0;
+        }
+        double meanMs() const { return n ? static_cast<double>(sumUs) / n / 1000.0 : 0.0; }
+        void clear() { *this = Hist{}; }
+    };
+    struct KindStat
+    {
+        uint64_t n = 0, waitUs = 0, maxWaitUs = 0, holdUs = 0, maxHoldUs = 0, tailRuns = 0, tailUs = 0, maxTailUs = 0;
+    };
+    Hist lagExec;    // guest us the IOP was behind the EE when a sync wanted it caught up
+    Hist lagWorker;  // the same at the start of each worker slice (what the worker still had to do)
+    Hist wakeLat;    // wall us from the executor publishing `posted` to the worker starting the slice (scheduling delay)
+    Hist rpcRound;   // wall us of an Rpc sync: lock wait + tail run + the handler (the game thread is blocked all along)
+    KindStat kinds[static_cast<size_t>(IopSyncKind::Count)];
+    // size of the cycle lumps the EE hands over (executor only; read racily by the report)
+    static constexpr size_t kPostBuckets = 7u; // <50 us, <250 us, <1 ms, <4 ms, <10 ms, <20 ms, 20 ms and more (of guest time)
+    uint32_t notifyCount = 0;  // wake-ups the executor sent, and what they cost it (executor only)
+    uint64_t notifyUs = 0;
+    uint32_t postCount[kPostBuckets] = {};
+    uint64_t postCycles[kPostBuckets] = {};
+    uint64_t wSlices = 0, wWallUs = 0, wMaxSliceUs = 0, wGuestEe = 0, wSleepUs = 0, wWakes = 0;
+    uint64_t locksRun = 0, locksWake = 0, locksDeferred = 0; // under their own mutex
+    std::atomic<uint64_t> postUs{0};                         // executor: wall clock of the last publish (stats only)
+
     static uint64_t nowUs()
     {
 #if defined(PLATFORM_VITA)
@@ -702,7 +777,15 @@ struct PS2IopHostAdapter::IopThread
         if (const char *v = std::getenv("PS2X_IOP_THREAD_DIAG"))
             diag = v[0] == '1';
         const char *list = std::getenv("PS2X_FRAME_LIST");
-        timing = diag || (list && std::atof(list) > 0.0);
+        if (const char *v = std::getenv("PS2X_IOP_STATS"))
+            stats = v[0] == '1';
+        if (const char *v = std::getenv("PS2X_IOP_WAKE_FIX"))
+            wakeFix = v[0] != '0';
+        if (const char *v = std::getenv("PS2X_IOP_NOCATCHUP"))
+            noCatchUpMask = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+        if (stats)
+            ps2xSpu2SetTiming(1);
+        timing = diag || stats || (list && std::atof(list) > 0.0);
     }
 
     ~IopThread() { shutdown(); }
@@ -747,6 +830,7 @@ struct PS2IopHostAdapter::IopThread
         std::vector<Deferred> work;
         {
             std::lock_guard<std::mutex> lock(deferredMutex);
+            ++locksDeferred;
             work.swap(deferred);
             deferredCount.store(0u, std::memory_order_relaxed);
         }
@@ -764,23 +848,43 @@ struct PS2IopHostAdapter::IopThread
 
     void post(uint64_t eeCycles)
     {
-        t_iopExecutor = true;
+        // Called ~13 000 times a second by the one executor thread: the thread-local flag (140 instructions per access
+        // on the Vita) is set once, when the worker is started, not on every call.
         if (!started)
+        {
+            t_iopExecutor = true;
             startWorker();
+        }
         const uint64_t p = (postedLocal += eeCycles);
+        if (stats)
+        {
+            const uint64_t us = eeCycles / 295u;
+            const size_t b = us < 50u ? 0u : us < 250u ? 1u : us < 1000u ? 2u : us < 4000u ? 3u : us < 10000u ? 4u : us < 20000u ? 5u : 6u;
+            ++postCount[b];
+            postCycles[b] += eeCycles;
+        }
         if (deferredCount.load(std::memory_order_relaxed) != 0u)
             drainDeferred();
         // Called tens of thousands of times a second: the atomics and the wake are only paid once per wake quantum.
         if (p - lastNotified >= wakeEe)
         {
             lastNotified = p;
+            if (stats)
+                postUs.store(nowUs(), std::memory_order_relaxed);
             posted.store(p); // seq_cst: pairs with the worker's sleeping flag (see workerMain)
             if (sleeping.load())
             {
+                const uint64_t n0 = stats ? nowUs() : 0u;
                 {
                     std::lock_guard<std::mutex> lock(wakeMutex); // the worker is in wait() or has not tested yet
+                    ++locksWake;
                 }
                 wakeCv.notify_one();
+                if (stats)
+                {
+                    ++notifyCount; // executor only; read racily by the report
+                    notifyUs += nowUs() - n0;
+                }
                 if (diag)
                     wakes.fetch_add(1, std::memory_order_relaxed);
             }
@@ -798,12 +902,15 @@ struct PS2IopHostAdapter::IopThread
         runMutex.lock();
         eeWaiting.fetch_sub(1);
         t_iopHolds = true;
+        ++locksRun;
         const uint64_t t1 = timing ? nowUs() : 0u;
         if (catchUp && t_iopExecutor)
         {
             drainDeferred();
             const uint64_t p = postedLocal;
-            if (p > delivered)
+            if (stats)
+                lagExec.add((p > delivered ? p - delivered : 0u) / 295u);
+            if (p > delivered && (noCatchUpMask & (1u << static_cast<uint32_t>(kind))) == 0u)
             {
                 const uint64_t delta = p - delivered;
                 run(delta);
@@ -812,6 +919,14 @@ struct PS2IopHostAdapter::IopThread
                 if (timing)
                 {
                     const uint64_t us = nowUs() - t1;
+                    if (stats)
+                    {
+                        KindStat &ks = kinds[static_cast<size_t>(kind)];
+                        ++ks.tailRuns;
+                        ks.tailUs += us;
+                        if (us > ks.maxTailUs)
+                            ks.maxTailUs = us;
+                    }
                     totTailUs.fetch_add(us, std::memory_order_relaxed);
                     totTailEe.fetch_add(delta, std::memory_order_relaxed);
                     if (diag)
@@ -828,6 +943,15 @@ struct PS2IopHostAdapter::IopThread
         {
             t_holdStart = t1;
             t_holdKind = static_cast<size_t>(kind);
+            t_holdWait = t1 - t0;
+            if (stats)
+            {
+                KindStat &ks = kinds[static_cast<size_t>(kind)];
+                ++ks.n;
+                ks.waitUs += t1 - t0;
+                if (t1 - t0 > ks.maxWaitUs)
+                    ks.maxWaitUs = t1 - t0;
+            }
             totCount.fetch_add(1, std::memory_order_relaxed);
             totWaitUs.fetch_add(t1 - t0, std::memory_order_relaxed);
             if (diag)
@@ -846,6 +970,15 @@ struct PS2IopHostAdapter::IopThread
         {
             // everything the executor did inside the sync: the tail run, then the RPC / transfer / memory access itself
             const uint64_t us = nowUs() - t_holdStart;
+            if (stats)
+            {
+                KindStat &ks = kinds[t_holdKind];
+                ks.holdUs += us;
+                if (us > ks.maxHoldUs)
+                    ks.maxHoldUs = us;
+                if (t_holdKind == static_cast<size_t>(IopSyncKind::Rpc))
+                    rpcRound.add(us + t_holdWait);
+            }
             totHoldUs.fetch_add(us, std::memory_order_relaxed);
             if (diag)
             {
@@ -920,6 +1053,91 @@ struct PS2IopHostAdapter::IopThread
         std::fflush(stderr);
     }
 
+    void reportStats(uint64_t &lastUs)
+    {
+        const uint64_t now = nowUs();
+        if (now - lastUs < 5000000u)
+            return;
+        const double wall = static_cast<double>(now - lastUs) / 1e6;
+        lastUs = now;
+        static uint64_t lastCpu = 0;
+        static uint64_t lastSpu[11] = {};
+        static uint64_t lastFile = 0, lastCall = 0;
+        const uint64_t cpu = threadCpuUs();
+        uint64_t spu[11] = {};
+        ps2xSpu2Counters(spu);
+        const uint64_t fileLocks = g_hostFileLocks, callLocks = g_callLocks;
+        char line[1536];
+        {
+            std::lock_guard<std::mutex> lock(runMutex); // the numbers below are written under it
+            ++locksRun;
+            const double idleUs = static_cast<double>(wSleepUs);
+            int n = std::snprintf(
+                line, sizeof(line),
+                "[iopstats] %.1fs worker cpu %.0f%% run %.0f%% asleep %.0f%% slices %llu (avg %.0f us max %llu us, %.2f guest ms avg) wakeups %llu"
+                " | worker lag ms p95 %.2f max %.2f | wake latency ms p95 %.2f max %.2f"
+                " | sync lag ms p95 %.2f max %.2f | rpc round-trip n %llu avg %.2f p95 %.2f max %.2f ms |",
+                wall, (cpu - lastCpu) * 100.0 / (wall * 1e6), wWallUs * 100.0 / (wall * 1e6), idleUs * 100.0 / (wall * 1e6),
+                (unsigned long long)wSlices, wSlices ? (double)wWallUs / wSlices : 0.0, (unsigned long long)wMaxSliceUs,
+                wSlices ? wGuestEe / 294912.0 / wSlices : 0.0, (unsigned long long)wWakes,
+                lagWorker.pctMs(0.95), lagWorker.maxUs / 1000.0, wakeLat.pctMs(0.95), wakeLat.maxUs / 1000.0,
+                lagExec.pctMs(0.95), lagExec.maxUs / 1000.0,
+                (unsigned long long)rpcRound.n, rpcRound.meanMs(), rpcRound.pctMs(0.95), rpcRound.maxUs / 1000.0);
+            static const char *const names[] = {"rpc", "sif", "mem", "mod", "reset", "query"};
+            uint64_t inlineRuns = 0, inlineUs = 0;
+            for (size_t k = 0; k < static_cast<size_t>(IopSyncKind::Count); ++k)
+            {
+                const KindStat &ks = kinds[k];
+                inlineRuns += ks.tailRuns;
+                inlineUs += ks.tailUs;
+                if (ks.n != 0u && n > 0 && n < static_cast<int>(sizeof(line)) - 200)
+                    n += std::snprintf(line + n, sizeof(line) - n, " %s %llu wait %.1f ms (max %.2f) hold %.1f ms (max %.2f) inline %llu runs %.1f ms (max %.2f) |",
+                                       names[k], (unsigned long long)ks.n, ks.waitUs / 1000.0, ks.maxWaitUs / 1000.0, ks.holdUs / 1000.0,
+                                       ks.maxHoldUs / 1000.0, (unsigned long long)ks.tailRuns, ks.tailUs / 1000.0, ks.maxTailUs / 1000.0);
+            }
+            if (n > 0 && n < static_cast<int>(sizeof(line)) - 400)
+                n += std::snprintf(
+                    line + n, sizeof(line) - n,
+                    " INLINE %llu runs %.1f ms total | locks/s run %.0f wake %.0f deferred %.0f spu-out %.0f spu-stream %.0f hostfile %.0f call %.0f |"
+                    " spu2 runs/s %.0f chunks/s %.0f rendered/s %.0f bulk/s %.0f services/s %.0f deferred/s %.0f forced/s %.0f catchup/s %.0f render %.1f ms",
+                    (unsigned long long)inlineRuns, inlineUs / 1000.0, locksRun / wall, locksWake / wall, locksDeferred / wall,
+                    (spu[0] - lastSpu[0]) / wall, (spu[1] - lastSpu[1]) / wall, (fileLocks - lastFile) / wall, (callLocks - lastCall) / wall,
+                    (spu[2] - lastSpu[2]) / wall, (spu[5] - lastSpu[5]) / wall, (spu[3] - lastSpu[3]) / wall, (spu[4] - lastSpu[4]) / wall,
+                    (spu[6] - lastSpu[6]) / wall, (spu[7] - lastSpu[7]) / wall, (spu[8] - lastSpu[8]) / wall, (spu[9] - lastSpu[9]) / wall,
+                    (spu[10] - lastSpu[10]) / 1000.0);
+            if (n > 0 && n < static_cast<int>(sizeof(line)) - 300)
+            {
+                static const char *const pb[] = {"<50us", "<250us", "<1ms", "<4ms", "<10ms", "<20ms", ">=20ms"};
+                n = static_cast<int>(std::strlen(line));
+                n += std::snprintf(line + n, sizeof(line) - n, " | notify %u for %.1f ms | posts", notifyCount, notifyUs / 1000.0);
+                notifyCount = 0;
+                notifyUs = 0;
+                for (size_t b = 0; b < kPostBuckets; ++b)
+                {
+                    if (postCount[b] != 0u)
+                        n += std::snprintf(line + n, sizeof(line) - n, " %s:%u(%.0f ms)", pb[b], postCount[b], postCycles[b] / 294912.0);
+                    postCount[b] = 0u;
+                    postCycles[b] = 0u;
+                }
+            }
+            lagExec.clear();
+            lagWorker.clear();
+            wakeLat.clear();
+            rpcRound.clear();
+            for (KindStat &ks : kinds)
+                ks = KindStat{};
+            wSlices = wWallUs = wMaxSliceUs = wGuestEe = wSleepUs = wWakes = 0;
+            locksRun = locksWake = locksDeferred = 0;
+            for (int i = 0; i < 11; ++i)
+                lastSpu[i] = spu[i];
+            lastFile = fileLocks;
+            lastCall = callLocks;
+        }
+        lastCpu = cpu;
+        std::fprintf(stderr, "%s\n", line);
+        std::fflush(stderr);
+    }
+
     void workerMain()
     {
         ThreadNaming::SetCurrentThreadName("IopThread");
@@ -927,15 +1145,31 @@ struct PS2IopHostAdapter::IopThread
         t_iopHolds = true; // every host callback the IOP makes runs with the lock held
         setupWorkerThread();
         uint64_t lastReportUs = nowUs();
+        uint64_t lastStatsUs = lastReportUs;
         for (;;)
         {
             {
+                const uint64_t w0 = stats ? nowUs() : 0u;
                 std::unique_lock<std::mutex> lock(wakeMutex);
+                ++locksWake;
                 sleeping.store(true);
+                // `posted - delivered` as unsigned wraps to a huge number whenever an IopSync caught the IOP up beyond
+                // the last published `posted` (postedLocal runs ahead of it between publishes), which made this predicate
+                // true at once and the worker spin (lock, find nothing to do, wait again) for up to a wake quantum after
+                // every inline catch-up: ~1.4 M mutex acquisitions a second in busy RPC phases. PS2X_IOP_WAKE_FIX=0
+                // restores that predicate for A/B runs.
                 wakeCv.wait(lock, [this]
-                            { return stop.load() || posted.load() - deliveredMirror.load() >= wakeEe; });
+                            {
+                                if (stop.load())
+                                    return true;
+                                const uint64_t pst = posted.load(), dlv = deliveredMirror.load();
+                                return wakeFix ? (pst > dlv && pst - dlv >= wakeEe) : (pst - dlv >= wakeEe);
+                            });
                 sleeping.store(false);
+                if (stats)
+                    wSleepUs += nowUs() - w0; // only this thread writes it (read under runMutex copy below: approximate)
             }
+            bool firstSlice = true;
             for (;;)
             {
                 if (stop.load())
@@ -944,25 +1178,51 @@ struct PS2IopHostAdapter::IopThread
                 while (eeWaiting.load() != 0 && !stop.load())
                     std::this_thread::yield();
                 std::unique_lock<std::mutex> lock(runMutex);
+                ++locksRun;
                 const uint64_t p = posted.load();
                 if (p <= delivered)
                     break;
                 const uint64_t delta = std::min<uint64_t>(p - delivered, sliceEe);
-                const uint64_t t0 = diag ? nowUs() : 0u;
+                const uint64_t t0 = (diag || stats) ? nowUs() : 0u;
+                if (stats)
+                {
+                    lagWorker.add((p - delivered) / 295u);
+                    if (firstSlice)
+                    {
+                        // wall time from the executor's publish to now: the worker's wake-up and lock latency
+                        const uint64_t pu = postUs.load(std::memory_order_relaxed);
+                        wakeLat.add(t0 > pu ? t0 - pu : 0u);
+                        ++wWakes;
+                    }
+                }
+                firstSlice = false;
                 run(delta);
                 delivered += delta;
                 deliveredMirror.store(delivered, std::memory_order_release);
-                if (diag)
+                if (diag || stats)
                 {
                     const uint64_t us = nowUs() - t0;
-                    slices.fetch_add(1, std::memory_order_relaxed);
-                    sliceEeTotal.fetch_add(delta, std::memory_order_relaxed);
-                    sliceUs.fetch_add(us, std::memory_order_relaxed);
-                    raiseMax(maxSliceUs, us);
+                    if (stats)
+                    {
+                        ++wSlices;
+                        wWallUs += us;
+                        wGuestEe += delta;
+                        if (us > wMaxSliceUs)
+                            wMaxSliceUs = us;
+                    }
+                    if (diag)
+                    {
+                        slices.fetch_add(1, std::memory_order_relaxed);
+                        sliceEeTotal.fetch_add(delta, std::memory_order_relaxed);
+                        sliceUs.fetch_add(us, std::memory_order_relaxed);
+                        raiseMax(maxSliceUs, us);
+                    }
                 }
             }
             if (diag)
                 report(lastReportUs);
+            if (stats)
+                reportStats(lastStatsUs);
         }
     }
 };
@@ -981,6 +1241,7 @@ void PS2IopHostAdapter::queueDeferred(uint32_t kind, uint32_t a, uint32_t b, con
         m_iopThread->defBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
     std::lock_guard<std::mutex> lock(m_iopThread->deferredMutex);
+    ++m_iopThread->locksDeferred;
     m_iopThread->deferred.push_back(std::move(op));
     m_iopThread->deferredCount.fetch_add(1u, std::memory_order_relaxed);
 }

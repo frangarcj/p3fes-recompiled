@@ -6,7 +6,13 @@
 // compared after every operation: output samples, pending frames, ENDX/STATX and the whole register file, every voice
 // state, the interrupt line, ADMA completion and streamConsumed.
 //
-// Usage: spu2_equivalence_tests [--seeds N] [--ops N] [--first-seed N] [--bench]
+// Every seed runs twice: once with the optimised Spu2 serviced like the original (advanceTo), and once in lazy mode
+// (setLazy(true), PS2X_SPU2_LAZY=1): there the harness calls serviceTo() where the original is advanced, only settles
+// (renders what is owed) at a random half of the comparison points, and never before takeInterrupt / takeAdmaDone /
+// canSkipServiceAt: those must already agree, which is the guarantee the lazy mode makes (events are never deferred).
+// Register, RAM, DMA and stream accesses render by themselves; any missing catch-up shows up as a mismatch.
+//
+// Usage: spu2_equivalence_tests [--seeds N] [--ops N] [--first-seed N] [--eager-only | --lazy-only] [--bench]
 //   --bench  after the equivalence run (or alone with --seeds 0) prints samples/second, reference vs optimised.
 
 #include "emulator/core/spu2.h"
@@ -24,6 +30,8 @@
 
 using ps2x::iop::detail::Spu2;
 using ps2x::iop::detail::Spu2Reference;
+
+extern "C" void ps2xSpu2Counters(uint64_t *out); // spu2.cpp: [..., services (6), deferred (7)]
 
 namespace
 {
@@ -100,8 +108,12 @@ namespace
         // Coverage statistics (new implementation's view; the comparison guarantees the reference agrees)
         uint64_t activeVoiceSum = 0, compares = 0, endxNonZero = 0, nonSilentFrames = 0, overflows = 0, streamFrames = 0;
         uint64_t sawIrqLine = 0;
+        bool lazy = false;
 
-        Harness(uint64_t s) : seed(s), rng(s) {}
+        Harness(uint64_t s, bool lazyMode = false) : seed(s), rng(s), lazy(lazyMode)
+        {
+            a->setLazy(lazy); // eager runs must not pick up the PS2X_SPU2_LAZY default
+        }
 
         template <typename F>
         void both(F &&fn)
@@ -162,6 +174,16 @@ namespace
         // Everything observable that does not consume state.
         void compareCheap()
         {
+            if (lazy)
+            {
+                // Events are never deferred: the interrupt line and the ADMA-done counters (what canSkipServiceAt shows)
+                // must agree before anything is settled.
+                for (uint64_t probe : {cycle, cycle + Spu2::CyclesPerSample})
+                    expectEq(a->canSkipServiceAt(probe), b->canSkipServiceAt(probe), "canSkipServiceAt before settle");
+                if (rng.pct(45))
+                    return; // let owed samples pile up across operations
+                a->settle();
+            }
             a->flushOutput(); // PS2X_SPU2_BATCH stages frames; the consumer-side view is compared after publishing them
             expectEq(a->pendingFrames(), b->pendingFrames(), "pendingFrames");
             for (uint32_t core = 0; core < 2; ++core)
@@ -202,6 +224,7 @@ namespace
         void drain(size_t maxFrames, size_t maxLatency)
         {
             std::vector<int16_t> bufA(maxFrames * 2u + 8u, 0x5A5A), bufB(maxFrames * 2u + 8u, 0x5A5A);
+            a->settle(); // no-op unless lazy: the consumer sees only what the producer has rendered
             a->flushOutput();
             const size_t na = a->drainOutput(bufA.data(), maxFrames, maxLatency);
             const size_t nb = b->drainOutput(bufB.data(), maxFrames, maxLatency);
@@ -222,6 +245,15 @@ namespace
         {
             if (target > cycle)
                 samplesAdvanced += (target - cycle) / Spu2::CyclesPerSample;
+            if (lazy)
+            {
+                // the new object only counts the samples (unless an event could be raised); the reference renders them
+                a->serviceTo(target);
+                b->advanceTo(target);
+                if (target > cycle)
+                    cycle = target;
+                return;
+            }
             a->flushOutput();
             const size_t before = a->pendingFrames();
             const uint64_t due = target > cycle ? (target - cycle) / Spu2::CyclesPerSample : 0u;
@@ -320,7 +352,9 @@ namespace
         {
             const uint32_t kind = rng.below(100);
             uint64_t target = cycle;
-            if (kind < 28)
+            if (lazy && rng.pct(50))
+                target += static_cast<uint64_t>(rng.range(1, 40)) * Spu2::CyclesPerSample + rng.below(768); // stay under the bound
+            else if (kind < 28)
                 target += rng.range(1, 767);
             else if (kind < 53)
                 target += static_cast<uint64_t>(rng.range(1, 20)) * Spu2::CyclesPerSample + rng.below(768);
@@ -467,6 +501,9 @@ namespace
 
         void runOp()
         {
+            // lazy mode: leave samples owed in front of most operations, so each access has something to render first
+            if (lazy && rng.pct(60))
+                advanceCycles(cycle + static_cast<uint64_t>(rng.range(1, 30)) * Spu2::CyclesPerSample + rng.below(768));
             const uint32_t roll = rng.below(100);
             if (roll < 15) { opName = "voice reg"; randomVoiceRegWrite(); }
             else if (roll < 21) { opName = "core reg"; randomCoreRegWrite(); }
@@ -691,9 +728,11 @@ int main(int argc, char **argv)
 {
     size_t seeds = 30, ops = 2500;
     uint64_t firstSeed = 1;
-    bool bench = false;
+    bool bench = false, eager = true, lazyRun = true;
     for (int i = 1; i < argc; ++i)
     {
+        if (!std::strcmp(argv[i], "--eager-only")) { lazyRun = false; continue; }
+        if (!std::strcmp(argv[i], "--lazy-only")) { eager = false; continue; }
         if (!std::strcmp(argv[i], "--seeds") && i + 1 < argc) seeds = static_cast<size_t>(std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = static_cast<size_t>(std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "--first-seed") && i + 1 < argc) firstSeed = static_cast<uint64_t>(std::atoll(argv[++i]));
@@ -701,43 +740,58 @@ int main(int argc, char **argv)
         else { std::fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
     }
 
-    uint64_t totalOps = 0, totalSamples = 0, totalBulk = 0, totalDrained = 0, totalIrq = 0, totalAdma = 0;
-    uint64_t totalActive = 0, totalCompares = 0, totalEndx = 0, totalNonSilent = 0, totalOverflows = 0;
-    for (size_t n = 0; n < seeds; ++n)
+    for (int mode = 0; mode < 2; ++mode)
     {
-        Harness h(firstSeed + n);
-        h.run(ops);
-        totalOps += ops;
-        totalSamples += h.samplesAdvanced;
-        totalBulk += h.a->bulkSamplesForTest();
-        totalDrained += h.drainedFrames;
-        totalIrq += h.interrupts;
-        totalAdma += h.admaDone;
-        totalActive += h.activeVoiceSum;
-        totalCompares += h.compares;
-        totalEndx += h.endxNonZero;
-        totalNonSilent += h.nonSilentFrames;
-        totalOverflows += h.overflows;
-    }
-    if (seeds != 0)
-    {
-        std::printf("spu2 equivalence: %zu seeds, %llu operations, %llu samples advanced, %llu via the idle bulk path, "
-                    "%llu frames drained, %llu interrupts taken, %llu ADMA completions: identical to the reference\n",
-                    seeds, static_cast<unsigned long long>(totalOps), static_cast<unsigned long long>(totalSamples),
-                    static_cast<unsigned long long>(totalBulk), static_cast<unsigned long long>(totalDrained),
-                    static_cast<unsigned long long>(totalIrq), static_cast<unsigned long long>(totalAdma));
-        std::printf("coverage: avg %.2f active voices per comparison, ENDX non-zero in %llu of %llu comparisons, "
-                    "%llu non-silent frames drained, %llu buffer overflows\n",
-                    totalCompares ? static_cast<double>(totalActive) / static_cast<double>(totalCompares) : 0.0,
-                    static_cast<unsigned long long>(totalEndx), static_cast<unsigned long long>(totalCompares),
-                    static_cast<unsigned long long>(totalNonSilent), static_cast<unsigned long long>(totalOverflows));
-        // The comparison is only meaningful if the interesting paths were really taken.
-        if (seeds >= 10 && (totalBulk == 0 || totalNonSilent == 0 || totalEndx == 0 || totalOverflows == 0 || totalIrq == 0 || totalAdma == 0 || totalDrained == 0))
+        const bool lazyMode = mode == 1;
+        if (lazyMode ? !lazyRun : !eager)
+            continue;
+        uint64_t totalOps = 0, totalSamples = 0, totalBulk = 0, totalDrained = 0, totalIrq = 0, totalAdma = 0;
+        uint64_t totalActive = 0, totalCompares = 0, totalEndx = 0, totalNonSilent = 0, totalOverflows = 0;
+        uint64_t spuBefore[16] = {}, spuAfter[16] = {};
+        ps2xSpu2Counters(spuBefore);
+        for (size_t n = 0; n < seeds; ++n)
         {
-            std::fprintf(stderr, "coverage check failed: bulk=%llu irq=%llu adma=%llu drained=%llu\n",
-                         static_cast<unsigned long long>(totalBulk), static_cast<unsigned long long>(totalIrq),
-                         static_cast<unsigned long long>(totalAdma), static_cast<unsigned long long>(totalDrained));
-            return 1;
+            Harness h(firstSeed + n, lazyMode);
+            h.run(ops);
+            totalOps += ops;
+            totalSamples += h.samplesAdvanced;
+            totalBulk += h.a->bulkSamplesForTest();
+            totalDrained += h.drainedFrames;
+            totalIrq += h.interrupts;
+            totalAdma += h.admaDone;
+            totalActive += h.activeVoiceSum;
+            totalCompares += h.compares;
+            totalEndx += h.endxNonZero;
+            totalNonSilent += h.nonSilentFrames;
+            totalOverflows += h.overflows;
+        }
+        ps2xSpu2Counters(spuAfter);
+        if (seeds != 0)
+        {
+            std::printf("spu2 equivalence (%s service): %zu seeds, %llu operations, %llu samples advanced, %llu via the idle bulk path, "
+                        "%llu frames drained, %llu interrupts taken, %llu ADMA completions: identical to the reference\n",
+                        lazyMode ? "lazy" : "eager", seeds, static_cast<unsigned long long>(totalOps),
+                        static_cast<unsigned long long>(totalSamples), static_cast<unsigned long long>(totalBulk),
+                        static_cast<unsigned long long>(totalDrained), static_cast<unsigned long long>(totalIrq),
+                        static_cast<unsigned long long>(totalAdma));
+            std::printf("coverage: avg %.2f active voices per comparison, ENDX non-zero in %llu of %llu comparisons, "
+                        "%llu non-silent frames drained, %llu buffer overflows; service points %llu, left for later %llu\n",
+                        totalCompares ? static_cast<double>(totalActive) / static_cast<double>(totalCompares) : 0.0,
+                        static_cast<unsigned long long>(totalEndx), static_cast<unsigned long long>(totalCompares),
+                        static_cast<unsigned long long>(totalNonSilent), static_cast<unsigned long long>(totalOverflows),
+                        static_cast<unsigned long long>(spuAfter[6] - spuBefore[6]), static_cast<unsigned long long>(spuAfter[7] - spuBefore[7]));
+            // The comparison is only meaningful if the interesting paths were really taken.
+            const uint64_t deferred = spuAfter[7] - spuBefore[7];
+            const bool overflowsExpected = !lazyMode; // the lazy harness does not count them
+            if (seeds >= 10 && (totalBulk == 0 || totalNonSilent == 0 || totalEndx == 0 || (overflowsExpected && totalOverflows == 0) ||
+                                totalIrq == 0 || totalAdma == 0 || totalDrained == 0 || (lazyMode && deferred == 0)))
+            {
+                std::fprintf(stderr, "coverage check failed (%s): bulk=%llu irq=%llu adma=%llu drained=%llu deferred=%llu\n",
+                             lazyMode ? "lazy" : "eager", static_cast<unsigned long long>(totalBulk),
+                             static_cast<unsigned long long>(totalIrq), static_cast<unsigned long long>(totalAdma),
+                             static_cast<unsigned long long>(totalDrained), static_cast<unsigned long long>(deferred));
+                return 1;
+            }
         }
     }
     if (bench)

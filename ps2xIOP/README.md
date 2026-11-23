@@ -105,3 +105,25 @@ Silicon, exact host instructions per guest instruction and per `runEeCycles` cal
 `PS2X_IOP_PROFILE=<file>` (with `PS2X_IOP_FAST=0`, optionally `PS2X_IOP_PROFILE_FROM=<instruction>`) writes a guest PC
 histogram, per-thread instruction counts, import call counts per thread, hardware accesses and the running timers,
 plus `<file>.ram` (IOP RAM image) every 2 M instructions.
+
+## SPU2 lazy service and the IOP worker hand-off (2026-11-23)
+
+- `PS2X_SPU2_LAZY` (default on, `=0` restores the old behaviour): the emulator calls `Spu2::serviceTo()` where it used to
+  call `advanceTo()`. The SPU2 clock moves exactly as before, but the samples that fell due are only counted and are
+  rendered in one go when something could tell the difference: any register read or write, sound-RAM or DMA access,
+  PCM-stream call, a possible IRQ or ADMA event (IRQA armed while a voice plays, ADMA data flowing, an event waiting), a
+  bound of 96 samples, or the end of a `runCycles` (`settle()`). The PCM is bit-identical to rendering at every service
+  point. Proof: `spu2_equivalence_tests` runs every seed twice (eager, then lazy with owed samples left across operations
+  and an interrupt / ADMA-completion check before anything is settled) against the frozen reference, and a 128 s Mac
+  battle run's `PS2X_SPU2_TAP` stream is identical with the switch on and off.
+- `renderFrames` runs voice by voice into per-frame accumulators and reads each voice's registers once per call
+  (`VoiceCache`); the diagnostic build (`PS2X_SPU2_DIAG`) keeps the original frame-major loop.
+- `PS2X_SPU2_TAP=<file>` writes every frame the SPU2 produces (silence included) as s16le stereo, in order, before any
+  consumer or drop: a pure record for comparing two builds bit for bit (the audio dump goes through the sound pipe and
+  depends on wall-clock timing).
+- Host side (`ps2xRuntime/src/lib/ps2_iop_host.cpp`): `PS2X_IOP_STATS=1` prints one `[iopstats]` line every 5 s (worker
+  CPU / run / asleep, worker and sync lag, wake latency, per-sync-kind wait / hold / inline totals, RPC round trip,
+  lock acquisitions per second per mutex, SPU2 counters and render time, size histogram of the EE's cycle posts).
+  `PS2X_IOP_WAKE_FIX=0` brings back the wrapping wake predicate that made the worker spin after every inline catch-up.
+  `PS2X_IOP_NOCATCHUP=<mask>` (default 0, exact) lets syncs of the given kinds skip the inline catch-up (bit 0 Rpc, 1 Sif,
+  2 Mem, 3 Module, 4 Reset, 5 Query); not reproducible, see the comment in the source.

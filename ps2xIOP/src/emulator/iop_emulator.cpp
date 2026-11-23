@@ -983,7 +983,7 @@ namespace ps2x::iop::detail
                 else
                     ++workDiagSpu2DueOver64;
             }
-            spu.advanceTo(totalCycles);
+            spu.serviceTo(totalCycles); // lazy mode (PS2X_SPU2_LAZY=1) only counts the samples due; see Spu2::serviceTo
             if (!workDiagEnabled && !spu.eventsPending())
                 return; // no ADMA completion and no IRQ: the rest of this function would do nothing
             // ADMA transfers complete as the SPU2 takes their blocks: raise the core's DMA interrupt (4 / 7).
@@ -1311,6 +1311,7 @@ namespace ps2x::iop::detail
             {
                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
             }
+            memory.spu2().settle();      // PS2X_SPU2_LAZY: render what the service points of this run left owed
             memory.spu2().flushOutput(); // PS2X_SPU2_BATCH: publish the frames staged by this run (no-op otherwise)
             if (workDiagEnabled)
             {
