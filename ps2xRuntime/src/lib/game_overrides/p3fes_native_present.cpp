@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <type_traits>
 #include <variant>
 #include <vector>
 #include <string>
@@ -107,6 +108,84 @@ struct ScreenDraw
     }
 };
 
+// ---- Compact 2-D records (P3FES_IM2D_CMD, see p3fes_renderware.cpp) -----------------------------------------------------
+// A screen draw recorded as a few words: its vertices live in one array for the whole frame, its texture name and its
+// draw state (with the source size) are interned per frame. The array, the state table and the name table are
+// recycled from frame to frame, so a steady-state quad allocates nothing.
+struct ScreenStateEntry
+{
+    ScreenDrawState state{};
+    float sourceWidth = 640.0f;
+    float sourceHeight = 448.0f;
+};
+
+// Vertices of a frame's compact screen draws. malloc'd storage that is not initialised on growth (the caller writes
+// every vertex it reserves); ScreenVertex is trivially copyable.
+struct ScreenVertexArena
+{
+    ScreenVertex *data = nullptr;
+    size_t size = 0, capacity = 0;
+    ScreenVertexArena() = default;
+    ScreenVertexArena(const ScreenVertexArena &) = delete;
+    ScreenVertexArena &operator=(const ScreenVertexArena &) = delete;
+    ScreenVertexArena(ScreenVertexArena &&other) noexcept : data(other.data), size(other.size), capacity(other.capacity)
+    {
+        other.data = nullptr;
+        other.size = other.capacity = 0;
+    }
+    ScreenVertexArena &operator=(ScreenVertexArena &&other) noexcept
+    {
+        if (this != &other)
+        {
+            std::free(data);
+            data = other.data;
+            size = other.size;
+            capacity = other.capacity;
+            other.data = nullptr;
+            other.size = other.capacity = 0;
+        }
+        return *this;
+    }
+    ~ScreenVertexArena() { std::free(data); }
+    // Room for `count` more vertices; returns where they go. The pointer is valid until the next reserve.
+    ScreenVertex *append(size_t count)
+    {
+        if (__builtin_expect(size + count > capacity, 0))
+        {
+            size_t grown = capacity ? capacity * 2u : 4096u;
+            while (grown < size + count) grown *= 2u;
+            ScreenVertex *bigger = static_cast<ScreenVertex *>(std::realloc(data, grown * sizeof(ScreenVertex)));
+            if (!bigger) std::abort();
+            data = bigger;
+            capacity = grown;
+        }
+        ScreenVertex *out = data + size;
+        size += count;
+        return out;
+    }
+};
+
+struct ScreenArena
+{
+    ScreenVertexArena vertices;
+    std::vector<ScreenStateEntry> states;
+    std::vector<std::string> names; // names[0] is "" (no texture)
+    void reset()
+    {
+        vertices.size = 0;
+        states.clear();
+        names.clear();
+        names.emplace_back();
+    }
+};
+
+struct ScreenRec
+{
+    uint32_t first = 0, count = 0;
+    uint32_t texture = 0, state = 0;
+    bool lines = false;
+};
+
 struct ClearDraw
 {
     ClearColor color{};
@@ -137,7 +216,7 @@ struct TextureDefinition
     mutable uint64_t readyEpoch = 0;
 };
 
-using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw, ClearDraw, CameraDraw, TargetDraw, SharedMeshDraw>;
+using Draw = std::variant<MeshDraw, TransientMeshDraw, WorldLineDraw, ScreenDraw, ClearDraw, CameraDraw, TargetDraw, SharedMeshDraw, ScreenRec>;
 
 struct Frame
 {
@@ -145,6 +224,7 @@ struct Frame
     Camera recordedCamera{};
     ClearColor clear{};
     std::vector<Draw> draws;
+    ScreenArena screen; // what the ScreenRec draws refer to
     bool hasTargets = false;
     // Definitions this frame references, kept alive until it is consumed. The producer appends each
     // texture at most once per frame (see retainTexture); the host builds a name index when it
@@ -156,6 +236,68 @@ struct Frame
     std::vector<p3fes_frame_trace::Origin> drawOrigins;
 #endif
 };
+
+// A screen draw as the host reads it, whichever way it was recorded (ScreenDraw owns its data, ScreenRec points into the
+// frame's arena). `screen->x` and `*screen` work on the returned view like on a pointer to the old ScreenDraw.
+struct VertexSpan
+{
+    const ScreenVertex *first = nullptr;
+    size_t count = 0;
+    const ScreenVertex *begin() const { return first; }
+    const ScreenVertex *end() const { return first + count; }
+    const ScreenVertex *data() const { return first; }
+    size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    const ScreenVertex &operator[](size_t i) const { return first[i]; }
+    const ScreenVertex &front() const { return first[0]; }
+};
+const std::string kNoName;
+const ScreenDrawState kDefaultScreenState{};
+struct ScreenView
+{
+    VertexSpan vertices;
+    float sourceWidth = 640.0f;
+    float sourceHeight = 448.0f;
+    const std::string &textureName;
+    const ScreenDrawState &state;
+    bool lines = false;
+    bool valid = false;
+    const std::vector<ScreenVertex> *vector = nullptr; // the owning vector of a ScreenDraw (handed to the backend as it is)
+    ScreenView() : textureName(kNoName), state(kDefaultScreenState) {}
+    ScreenView(VertexSpan span, float width, float height, const std::string &name, const ScreenDrawState &drawState, bool asLines,
+               const std::vector<ScreenVertex> *owner)
+        : vertices(span), sourceWidth(width), sourceHeight(height), textureName(name), state(drawState), lines(asLines), valid(true), vector(owner)
+    {
+    }
+    explicit operator bool() const { return valid; }
+    const ScreenView *operator->() const { return this; }
+    const ScreenView &operator*() const { return *this; }
+};
+inline ScreenView screenOf(const Frame &frame, const Draw &draw)
+{
+    if (const auto *old = std::get_if<ScreenDraw>(&draw))
+        return ScreenView({old->vertices.data(), old->vertices.size()}, old->sourceWidth, old->sourceHeight, old->textureName, old->state,
+                          old->lines, &old->vertices);
+    if (const auto *rec = std::get_if<ScreenRec>(&draw))
+    {
+        const ScreenStateEntry &entry = frame.screen.states[rec->state];
+        return ScreenView({frame.screen.vertices.data + rec->first, rec->count}, entry.sourceWidth, entry.sourceHeight,
+                          frame.screen.names[rec->texture], entry.state, rec->lines, nullptr);
+    }
+    return ScreenView();
+}
+inline bool isScreenDraw(const Draw &draw)
+{
+    return std::holds_alternative<ScreenDraw>(draw) || std::holds_alternative<ScreenRec>(draw);
+}
+// What the backend's draw calls take: the owning vector of a ScreenDraw as it is, a copy in reused storage otherwise.
+inline const std::vector<ScreenVertex> &backendVertices(const ScreenView &view)
+{
+    if (view.vector) return *view.vector;
+    static std::vector<ScreenVertex> scratch;
+    scratch.assign(view.vertices.begin(), view.vertices.end());
+    return scratch;
+}
 
 // Threading. The guest game thread is the only producer (beginFrame ... endFrame, defineMesh,
 // defineTexture, retireTexture); the presentation thread only swaps in the finished frame. So the
@@ -175,6 +317,7 @@ std::optional<Frame> g_pending;
 std::unordered_map<MeshId, std::shared_ptr<const MeshData>> g_meshDefinitions;
 std::unordered_map<std::string, std::weak_ptr<const TextureDefinition>> g_retiredTextures;
 std::vector<MeshDrawState> g_statePool;
+std::vector<ScreenArena> g_arenaPool; // arenas of consumed frames, for the producer's next frames (guarded by g_mutex)
 std::atomic<uint32_t> g_textureDefinitionCount{0};
 constexpr size_t kStatePoolLimit = 512;
 
@@ -187,12 +330,35 @@ struct TextureEntry
 };
 Frame g_building;
 bool g_buildingOpen = false;
+// Compact screen records. Producer-private: the mode, the spare arenas of superseded frames, the per-frame name table's
+// helpers. Arenas the host is done with come back through g_arenaPool (guarded by g_mutex).
+int g_screenRecMode = 0; // 0: ScreenDraw per draw (the previous path), 1: compact records, 2: compact records + whole-frame check
+std::vector<ScreenArena> g_arenaSpare;
+struct ScreenNameInfo
+{
+    TextureEntry *entry = nullptr; // the entry retainTexture would resolve the name to, valid while generation matches
+    uint64_t generation = 0;
+};
+std::vector<ScreenNameInfo> g_screenNameInfo;  // parallel to g_building.screen.names
+std::vector<uint16_t> g_screenNameIndex;       // open-addressed name -> id (0: empty)
+// The old-form records of the frame being recorded (verify mode only): what the previous path would have recorded.
+struct OldScreenRecord
+{
+    std::vector<ScreenVertex> vertices;
+    float sourceWidth = 0.0f, sourceHeight = 0.0f;
+    std::string textureName;
+    ScreenDrawState state{};
+    bool lines = false;
+};
+std::vector<OldScreenRecord> g_verifyOld;
+constexpr size_t kArenaPoolLimit = 4;
 // Render-to-texture bracket being recorded: the display camera to restore at its end, and a flag
 // that makes the next setCamera record even when it equals the display camera.
 bool g_targetOpen = false;
 bool g_forceCameraRecord = false;
 Camera g_cameraBeforeTarget{};
 uint64_t g_cameraEpoch = 1; // see cameraEpoch()
+uint64_t g_screenEpoch = 1; // see screenEpoch()
 float g_targetWidth = 0.0f, g_targetHeight = 0.0f;
 uint64_t g_sequence = 0;
 uint32_t g_producerEpoch = 0;
@@ -498,6 +664,7 @@ void syncProducer()
     g_buildingOpen = false;
     g_targetOpen = g_forceCameraRecord = false;
     ++g_cameraEpoch;
+    ++g_screenEpoch;
     clearNameCache();
     g_textureDefinitions.clear();
     g_retiredEntryNames.clear();
@@ -590,13 +757,13 @@ p3fes_frame_trace::DrawInfo drawInfo(const Frame &frame, const Draw &draw, uint3
         info.kind = "world-lines";
         if (!lines->textureName.empty()) textureName = &lines->textureName;
     }
-    else if (const auto *screen = std::get_if<ScreenDraw>(&draw))
+    else if (const ScreenView screen = screenOf(frame, draw))
     {
         info.kind = screen->lines ? "screen-lines" : "screen-triangles";
         if (!screen->textureName.empty()) textureName = &screen->textureName;
         info.sourceWidth = screen->sourceWidth;
         info.sourceHeight = screen->sourceHeight;
-        info.vertices = screen->vertices;
+        info.vertices.assign(screen->vertices.begin(), screen->vertices.end());
         info.state = screen->state;
     }
     else if (std::holds_alternative<ClearDraw>(draw)) info.kind = "clear";
@@ -721,7 +888,7 @@ std::string capturePath()
     return path;
 }
 
-void dumpFrame(const Frame &frame, const std::function<std::string(const ScreenDraw &, size_t)> &placementOf)
+void dumpFrame(const Frame &frame, const std::function<std::string(const ScreenView &, size_t)> &placementOf)
 {
     std::fprintf(stderr, "[p3fes-frame] t=%d sequence=%llu draws=%u targets=%d\n", g_diagLabel,
                  static_cast<unsigned long long>(frame.sequence), static_cast<unsigned>(frame.draws.size()), frame.hasTargets ? 1 : 0);
@@ -730,7 +897,7 @@ void dumpFrame(const Frame &frame, const std::function<std::string(const ScreenD
     for (const Draw &draw : frame.draws)
     {
         ++slot;
-        if (const auto *screen = std::get_if<ScreenDraw>(&draw))
+        if (const ScreenView screen = screenOf(frame, draw))
         {
             float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
             float z0 = 1e9f, z1 = -1e9f;
@@ -1124,12 +1291,36 @@ void beginFrame(const Camera &camera, ClearColor clear)
     }
     g_building = {};
     g_building.draws.reserve(g_lastFrameDrawCount + 16u);
+    if (g_screenRecMode != 0)
+    {
+        // the arena of an earlier frame (the host hands its arenas back through the pool): no allocation in steady state
+        if (!g_arenaSpare.empty())
+        {
+            g_building.screen = std::move(g_arenaSpare.back());
+            g_arenaSpare.pop_back();
+        }
+        else
+        {
+            ProducerLock lock;
+            if (!g_arenaPool.empty())
+            {
+                g_building.screen = std::move(g_arenaPool.back());
+                g_arenaPool.pop_back();
+            }
+        }
+        g_building.screen.reset();
+        g_verifyOld.clear();
+        g_screenNameInfo.clear();
+        g_screenNameInfo.emplace_back();
+        g_screenNameIndex.assign(256u, 0u);
+    }
     g_building.camera = camera;
     g_building.recordedCamera = camera;
     g_building.clear = clear;
     g_building.sequence = ++g_sequence;
     g_targetOpen = g_forceCameraRecord = false;
     ++g_cameraEpoch;
+    ++g_screenEpoch;
 #if defined(PS2X_P3FES_FRAME_TRACE)
     g_building.trace = p3fes_frame_trace::beginFrame(g_building.sequence);
 #endif
@@ -1184,6 +1375,11 @@ bool sameCamera(const Camera &a, const Camera &b)
 uint64_t cameraEpoch()
 {
     return g_cameraEpoch;
+}
+
+uint64_t screenEpoch()
+{
+    return g_screenEpoch;
 }
 
 void setCutsEnabled(bool enabled)
@@ -1245,6 +1441,7 @@ bool beginTextureTarget(const std::string &name, uint32_t width, uint32_t height
     g_cameraBeforeTarget = g_building.recordedCamera;
     g_forceCameraRecord = true;
     ++g_cameraEpoch;
+    ++g_screenEpoch;
     g_targetOpen = true;
     return true;
 }
@@ -1265,6 +1462,7 @@ void endTextureTarget()
     g_building.recordedCamera = g_cameraBeforeTarget;
     g_forceCameraRecord = false;
     ++g_cameraEpoch;
+    ++g_screenEpoch;
     g_targetOpen = false;
 }
 
@@ -1510,6 +1708,224 @@ void drawWorldLines(std::vector<Vertex> vertices, const Matrix4 &model,
     }
 }
 
+// ---- Compact screen records, producer side --------------------------------------------------------------------------------
+static_assert(std::is_trivially_copyable<ScreenVertex>::value, "the screen arena copies vertices with memcpy");
+
+static bool sameScreenStateEntry(const ScreenDrawState &a, const ScreenDrawState &b)
+{
+    return a.blend == b.blend && a.depthTest == b.depthTest && a.depthWrite == b.depthWrite && a.depthFunction == b.depthFunction &&
+           a.alphaFailAction == b.alphaFailAction && a.gouraudShading == b.gouraudShading && a.clampU == b.clampU &&
+           a.clampV == b.clampV && a.linearFilter == b.linearFilter && a.alphaTest.enabled == b.alphaTest.enabled &&
+           a.alphaTest.function == b.alphaTest.function && a.alphaTest.reference == b.alphaTest.reference &&
+           a.fog.enabled == b.fog.enabled && a.fog.start == b.fog.start && a.fog.end == b.fog.end && a.fog.color == b.fog.color &&
+           a.destinationAlphaTest == b.destinationAlphaTest && a.alphaOnlyWrite == b.alphaOnlyWrite;
+}
+
+struct VerifyTotals
+{
+    uint64_t frames = 0, records = 0, bad = 0, badFrames = 0;
+    unsigned logged = 0;
+} g_verifyTotals;
+
+// Compares the compact records of the frame under construction with the old-form ones noted next to them, in order.
+static void verifyScreenFrame()
+{
+    VerifyTotals &t = g_verifyTotals;
+    size_t next = 0;
+    bool frameBad = false;
+    const auto fail = [&](size_t slot, const char *what) {
+        frameBad = true;
+        ++t.bad;
+        if (t.logged++ < 12u)
+            std::fprintf(stderr, "[p3fes-im2d-frame] MISMATCH frame=%llu slot=%u record=%u: %s\n", static_cast<unsigned long long>(g_building.sequence),
+                         static_cast<unsigned>(slot), static_cast<unsigned>(next), what);
+    };
+    for (size_t slot = 0; slot < g_building.draws.size(); ++slot)
+    {
+        const ScreenView view = screenOf(g_building, g_building.draws[slot]);
+        if (!view)
+            continue;
+        if (next >= g_verifyOld.size())
+        {
+            fail(slot, "more compact records than old ones");
+            ++next;
+            continue;
+        }
+        const OldScreenRecord &old = g_verifyOld[next];
+        ++t.records;
+        if (old.vertices.size() != view.vertices.size() ||
+            (old.vertices.size() && std::memcmp(old.vertices.data(), view.vertices.data(), old.vertices.size() * sizeof(ScreenVertex)) != 0))
+            fail(slot, "vertices");
+        else if (old.textureName != view.textureName)
+            fail(slot, "texture name");
+        else if (!sameScreenStateEntry(old.state, view.state))
+            fail(slot, "state");
+        else if (old.sourceWidth != view.sourceWidth || old.sourceHeight != view.sourceHeight)
+            fail(slot, "source size");
+        else if (old.lines != view.lines)
+            fail(slot, "lines");
+        ++next;
+    }
+    if (next < g_verifyOld.size())
+    {
+        frameBad = true;
+        t.bad += g_verifyOld.size() - next;
+        if (t.logged++ < 12u)
+            std::fprintf(stderr, "[p3fes-im2d-frame] MISMATCH frame=%llu: %u old records, %u compact\n",
+                         static_cast<unsigned long long>(g_building.sequence), static_cast<unsigned>(g_verifyOld.size()), static_cast<unsigned>(next));
+    }
+    g_verifyOld.clear();
+    ++t.frames;
+    if (frameBad)
+        ++t.badFrames;
+    if (t.frames % 300u == 0u || (frameBad && t.badFrames <= 3u))
+        std::fprintf(stderr, "[p3fes-im2d-frame] frames=%llu records=%llu mismatches=%llu bad-frames=%llu\n", static_cast<unsigned long long>(t.frames),
+                     static_cast<unsigned long long>(t.records), static_cast<unsigned long long>(t.bad), static_cast<unsigned long long>(t.badFrames));
+}
+
+void setScreenRecordMode(int mode)
+{
+    g_screenRecMode = mode < 0 ? 0 : (mode > 2 ? 2 : mode);
+}
+
+int screenRecordMode()
+{
+    return g_screenRecMode;
+}
+
+void noteOldScreenRecord(const std::vector<ScreenVertex> &vertices, float sourceWidth, float sourceHeight, const std::string &textureName,
+                         const ScreenDrawState &state, bool lines)
+{
+    if (g_screenRecMode != 2 || !active())
+        return;
+    syncProducer();
+    if (!g_buildingOpen)
+        return;
+    // (a draw inside a render-target bracket addresses the target's own pixels, as in the old drawScreenTriangles)
+    if (g_targetOpen)
+    {
+        sourceWidth = g_targetWidth;
+        sourceHeight = g_targetHeight;
+    }
+    g_verifyOld.push_back({vertices, sourceWidth, sourceHeight, textureName, state, lines});
+}
+
+// Name -> id in the frame's name table; the first use also retains the texture for the frame (as a draw does).
+uint32_t internScreenTexture(const std::string &name)
+{
+    if (!active())
+        return kNoScreenRecord;
+    syncProducer();
+    if (!g_buildingOpen)
+        return kNoScreenRecord;
+    if (name.empty())
+        return 0u;
+    ScreenArena &arena = g_building.screen;
+    // FNV-1a
+    uint32_t hash = 2166136261u;
+    for (const char c : name)
+        hash = (hash ^ static_cast<uint8_t>(c)) * 16777619u;
+    size_t mask = g_screenNameIndex.size() - 1u;
+    size_t i = hash & mask;
+    for (; g_screenNameIndex[i]; i = (i + 1u) & mask)
+        if (arena.names[g_screenNameIndex[i]] == name)
+            return g_screenNameIndex[i];
+    if (arena.names.size() >= 0xFFF0u)
+        return kNoScreenRecord;
+    const uint32_t id = static_cast<uint32_t>(arena.names.size());
+    arena.names.push_back(name);
+    g_screenNameInfo.push_back({findTextureEntry(name), g_textureTableGen});
+    g_screenNameIndex[i] = static_cast<uint16_t>(id);
+    if (arena.names.size() * 2u > g_screenNameIndex.size())
+    {
+        // grow and re-insert
+        std::vector<uint16_t> bigger(g_screenNameIndex.size() * 2u, 0u);
+        mask = bigger.size() - 1u;
+        for (uint32_t n = 1u; n < arena.names.size(); ++n)
+        {
+            uint32_t h = 2166136261u;
+            for (const char c : arena.names[n])
+                h = (h ^ static_cast<uint8_t>(c)) * 16777619u;
+            size_t k = h & mask;
+            while (bigger[k]) k = (k + 1u) & mask;
+            bigger[k] = static_cast<uint16_t>(n);
+        }
+        g_screenNameIndex.swap(bigger);
+    }
+    return id;
+}
+
+uint32_t internScreenState(const ScreenDrawState &state, float sourceWidth, float sourceHeight)
+{
+    if (!active())
+        return kNoScreenRecord;
+    syncProducer();
+    if (!g_buildingOpen)
+        return kNoScreenRecord;
+    // Screen-space draws of a render-target pass address the target's own pixels.
+    if (g_targetOpen)
+    {
+        sourceWidth = g_targetWidth;
+        sourceHeight = g_targetHeight;
+    }
+    ScreenArena &arena = g_building.screen;
+    for (size_t i = 0; i < arena.states.size(); ++i)
+    {
+        const ScreenStateEntry &entry = arena.states[i];
+        if (entry.sourceWidth == sourceWidth && entry.sourceHeight == sourceHeight && sameScreenStateEntry(entry.state, state))
+            return static_cast<uint32_t>(i);
+    }
+    if (arena.states.size() >= 0xFFF0u)
+        return kNoScreenRecord;
+    arena.states.push_back({state, sourceWidth, sourceHeight});
+    return static_cast<uint32_t>(arena.states.size() - 1u);
+}
+
+ScreenVertex *recordScreenDraw(uint32_t texture, uint32_t state, uint32_t vertexCount, bool lines)
+{
+    if (!active() || vertexCount == 0u)
+        return nullptr;
+    syncProducer();
+    if (!g_buildingOpen)
+        return nullptr;
+    ScreenArena &arena = g_building.screen;
+    if (texture >= arena.names.size() || state >= arena.states.size())
+        return nullptr;
+    if (texture)
+    {
+        // what retainTexture(name) does for each draw: the frame keeps the latest definition of the name
+        const ScreenNameInfo &info = g_screenNameInfo[texture];
+        if (info.entry && info.generation == g_textureTableGen)
+            retainEntry(*info.entry);
+        else
+            retainTexture(arena.names[texture]);
+    }
+#if defined(PS2X_P3FES_FRAME_TRACE)
+    recordDrawOrigin();
+#endif
+    const uint32_t first = static_cast<uint32_t>(arena.vertices.size);
+    ScreenVertex *out = arena.vertices.append(vertexCount);
+    g_building.draws.emplace_back(std::in_place_type<ScreenRec>, ScreenRec{first, vertexCount, texture, state, lines});
+    return out;
+}
+
+// A draw handed over as the old call took it (vector, name, state): the compact record of it, and in verify mode its
+// old-form copy as well.
+static void recordScreenFromVector(const std::vector<ScreenVertex> &vertices, float sourceWidth, float sourceHeight, const std::string &textureName,
+                            const ScreenDrawState &state, bool lines)
+{
+    if (!g_buildingOpen)
+        return;
+    const uint32_t texture = internScreenTexture(textureName);
+    const uint32_t stateId = internScreenState(state, sourceWidth, sourceHeight);
+    if (texture == kNoScreenRecord || stateId == kNoScreenRecord)
+        return;
+    if (g_screenRecMode == 2)
+        noteOldScreenRecord(vertices, sourceWidth, sourceHeight, textureName, state, lines);
+    if (ScreenVertex *out = recordScreenDraw(texture, stateId, static_cast<uint32_t>(vertices.size()), lines))
+        std::memcpy(out, vertices.data(), vertices.size() * sizeof(ScreenVertex));
+}
+
 void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, float sourceHeight,
                          std::string textureName, ScreenDrawState state)
 {
@@ -1519,6 +1935,11 @@ void drawScreenTriangles(std::vector<ScreenVertex> vertices, float sourceWidth, 
     p3fes_frame_trace::NativeScope traceScope(p3fes_frame_trace::Stage::CommandQueue);
 #endif
     syncProducer();
+    if (g_screenRecMode != 0)
+    {
+        recordScreenFromVector(vertices, sourceWidth, sourceHeight, textureName, state, false);
+        return;
+    }
     if (g_buildingOpen)
     {
         retainTexture(textureName);
@@ -1545,6 +1966,11 @@ void drawScreenLines(std::vector<ScreenVertex> vertices, float sourceWidth, floa
     p3fes_frame_trace::NativeScope traceScope(p3fes_frame_trace::Stage::CommandQueue);
 #endif
     syncProducer();
+    if (g_screenRecMode != 0)
+    {
+        recordScreenFromVector(vertices, sourceWidth, sourceHeight, textureName, state, true);
+        return;
+    }
     if (g_buildingOpen)
     {
         retainTexture(textureName);
@@ -1582,6 +2008,8 @@ void endFrame()
     if (g_targetOpen)
         endTextureTarget();
     g_lastFrameDrawCount = g_building.draws.size();
+    if (g_screenRecMode == 2)
+        verifyScreenFrame();
     // Latest complete frame wins. The host may present at 60 Hz while the game
     // submits at 30 Hz, so keeping only one pending frame bounds memory/latency.
     // The superseded frame (if any) is destroyed outside the lock.
@@ -1604,10 +2032,13 @@ void endFrame()
     g_building = {};
     g_buildingOpen = false;
     ++g_cameraEpoch;
+    ++g_screenEpoch;
     // A frame the host never presented still holds drawn states with their vectors' storage; keep
     // that storage for the producer instead of freeing it and re-allocating on the next frames.
     if (superseded)
     {
+        if (g_screenRecMode != 0 && g_arenaSpare.size() < kArenaPoolLimit)
+            g_arenaSpare.push_back(std::move(superseded->screen));
         for (Draw &draw : superseded->draws)
             if (auto *mesh = std::get_if<MeshDraw>(&draw))
             {
@@ -1786,7 +2217,7 @@ bool renderHostFrame()
                     }
                 }
             }
-            const auto *screen = inTarget ? nullptr : std::get_if<ScreenDraw>(&draw);
+            const ScreenView screen = inTarget ? ScreenView() : screenOf(frame, draw);
             if (!screen || screen->vertices.empty())
                 continue;
             const float z = screen->vertices[0].z;
@@ -1946,7 +2377,7 @@ bool renderHostFrame()
         // its own end when that lies inside), one flat colour? Then the quad can be extended sideways to the
         // edge of the screen by repeating that column (a bar or a panel flush with the edge); character art and
         // lettering are not flat and are pinned to the edge instead.
-        const auto flatEdge = [&](const ScreenDraw &screen, bool left) {
+        const auto flatEdge = [&](const ScreenView &screen, bool left) {
             const auto &v = screen.vertices;
             if (v.size() != 6u || screen.lines) return false;
             const TextureDefinition *definition = screen.textureName.empty() ? nullptr : findHostTexture(screen.textureName);
@@ -2019,7 +2450,7 @@ bool renderHostFrame()
             pieces.clear();
             for (size_t slot = 0; slot < frame.draws.size() && pieces.size() <= kMaxPieces; ++slot)
             {
-                const auto *screen = std::get_if<ScreenDraw>(&frame.draws[slot]);
+                const ScreenView screen = screenOf(frame, frame.draws[slot]);
                 if (!screen || screen->lines || screen->vertices.size() != 6u || screen->textureName.empty() || drawLayer[slot] < 0 ||
                     !layers[static_cast<size_t>(drawLayer[slot])].mixed)
                     continue;
@@ -2053,7 +2484,7 @@ bool renderHostFrame()
                         const size_t sa = static_cast<size_t>(pieces[i]), sb = static_cast<size_t>(pieces[j]);
                         const auto &a = drawBox[sa], &b = drawBox[sb];
                         if (drawLayer[sa] == drawLayer[sb] &&
-                            std::get<ScreenDraw>(frame.draws[sa]).textureName == std::get<ScreenDraw>(frame.draws[sb]).textureName &&
+                            screenOf(frame, frame.draws[sa]).textureName == screenOf(frame, frame.draws[sb]).textureName &&
                             a[0] <= b[1] + kJoin && b[0] <= a[1] + kJoin && a[2] <= b[3] + kJoin && b[2] <= a[3] + kJoin)
                             pieceRoot[static_cast<size_t>(root(static_cast<int32_t>(i)))] = root(static_cast<int32_t>(j));
                     }
@@ -2071,7 +2502,7 @@ bool renderHostFrame()
                         }
                     if (members < 2u)
                         continue;
-                    const float sw = std::get<ScreenDraw>(frame.draws[static_cast<size_t>(pieces[i])]).sourceWidth;
+                    const float sw = screenOf(frame, frame.draws[static_cast<size_t>(pieces[i])]).sourceWidth;
                     const bool touchLeft = x0 <= 0.5f, touchRight = x1 >= sw - 0.5f;
                     drawMenu[static_cast<size_t>(pieces[i])] = static_cast<uint8_t>(
                         touchLeft && touchRight ? Placement::Stretch : touchLeft ? Placement::Left : touchRight ? Placement::Right : Placement::Centre);
@@ -2080,7 +2511,7 @@ bool renderHostFrame()
         }
         for (size_t slot = 0; slot < frame.draws.size(); ++slot)
         {
-            const auto *screen = std::get_if<ScreenDraw>(&frame.draws[slot]);
+            const ScreenView screen = screenOf(frame, frame.draws[slot]);
             if (!screen || screen->vertices.empty() || drawLayer[slot] < 0)
                 continue;
             const ScreenLayer &layer = layers[static_cast<size_t>(drawLayer[slot])];
@@ -2192,7 +2623,7 @@ bool renderHostFrame()
         Renderer::ScreenPlacement placement = Renderer::ScreenPlacement::Centre;
         bool bleedLeft = false, bleedRight = false;
     };
-    const auto choosePlacement = [&](const ScreenDraw &screen, size_t slot) {
+    const auto choosePlacement = [&](const ScreenView &screen, size_t slot) {
         using Placement = Renderer::ScreenPlacement;
         ScreenPlace result;
         if (slot < drawMenu.size() && drawMenu[slot] != kMenuNone)
@@ -2253,9 +2684,9 @@ bool renderHostFrame()
     // Extends the quad `screen` sideways to the edge of the framebuffer by repeating its column of texels at the
     // edge of the source area (the sliver is one column wide and reaches far out; Wide placement shows as much of
     // it as there is room for). The quad itself is drawn centred and clipped to the source area.
-    const auto drawBleed = [&](const ScreenDraw &screen, bool left) {
+    const auto drawBleed = [&](const ScreenView &screen, bool left) {
         static std::vector<ScreenVertex> sliver;
-        sliver = screen.vertices;
+        sliver.assign(screen.vertices.begin(), screen.vertices.end());
         float xl = sliver[0].x, xr = sliver[0].x;
         for (const ScreenVertex &v : sliver)
         {
@@ -2293,7 +2724,7 @@ bool renderHostFrame()
         g_renderer->drawScreenTriangles(sliver, screen.sourceWidth, screen.sourceHeight, screen.textureName, screen.state);
     };
     lap(g_timing.prepass);
-    const auto placeScreenDraw = [&](const ScreenDraw &screen, size_t slot) {
+    const auto placeScreenDraw = [&](const ScreenView &screen, size_t slot) {
         const ScreenPlace place = choosePlacement(screen, slot);
         if (place.bleedLeft && !screen.lines) drawBleed(screen, true);
         if (place.bleedRight && !screen.lines) drawBleed(screen, false);
@@ -2311,7 +2742,7 @@ bool renderHostFrame()
     if (diag.dump)
     {
         static const char *const kNames[] = {"centre", "left", "right", "stretch", "wide"};
-        dumpFrame(frame, [&](const ScreenDraw &screen, size_t slot) {
+        dumpFrame(frame, [&](const ScreenView &screen, size_t slot) {
             if (widescreen != 2) return std::string();
             const ScreenPlace place = choosePlacement(screen, slot);
             std::string text = kNames[static_cast<size_t>(place.placement)];
@@ -2483,7 +2914,7 @@ bool renderHostFrame()
                 g_renderer->drawWorldLines(lines->vertices, lines->model, lines->textureName, lines->state);
             if (timing) ++g_timing.meshDraws;
         }
-        else if (const auto *screen = std::get_if<ScreenDraw>(&draw))
+        else if (const ScreenView screen = screenOf(frame, draw))
         {
             const bool textureReady = ensureTexture(screen->textureName);
             if (textureReady && !targetPass && g_anyFramebufferTexture.load(std::memory_order_acquire) &&
@@ -2516,10 +2947,10 @@ bool renderHostFrame()
                 if (widescreen == 2 && !targetPass) placeScreenDraw(*screen, drawSlot);
                 if (timing) placedUs = nowUs();
                 if (screen->lines)
-                    g_renderer->drawScreenLines(screen->vertices, screen->sourceWidth, screen->sourceHeight,
+                    g_renderer->drawScreenLines(backendVertices(screen), screen->sourceWidth, screen->sourceHeight,
                                                 screen->textureName, screen->state);
                 else
-                    g_renderer->drawScreenTriangles(screen->vertices, screen->sourceWidth, screen->sourceHeight,
+                    g_renderer->drawScreenTriangles(backendVertices(screen), screen->sourceWidth, screen->sourceHeight,
                                                     screen->textureName, screen->state);
             }
             if (timing && !targetPass)
@@ -2554,7 +2985,7 @@ bool renderHostFrame()
             if (std::holds_alternative<MeshDraw>(draw) || std::holds_alternative<SharedMeshDraw>(draw) ||
                 std::holds_alternative<TransientMeshDraw>(draw) || std::holds_alternative<WorldLineDraw>(draw))
                 g_timing.meshes += nowUs() - drawStartUs;
-            else if (!std::holds_alternative<ScreenDraw>(draw))
+            else if (!isScreenDraw(draw))
                 g_timing.other += nowUs() - drawStartUs;
         }
 #if defined(PS2X_P3FES_FRAME_TRACE)
@@ -2630,7 +3061,14 @@ bool renderHostFrame()
             resetForReuse(transient->state);
             recycled.push_back(std::move(transient->state));
         }
+    ScreenArena spareArena = std::move(g_hostFrame->screen);
     g_hostFrame.reset();
+    if (spareArena.vertices.capacity)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_arenaPool.size() < kArenaPoolLimit)
+            g_arenaPool.push_back(std::move(spareArena));
+    }
     lap(g_timing.postFree);
     if (!recycled.empty())
     {

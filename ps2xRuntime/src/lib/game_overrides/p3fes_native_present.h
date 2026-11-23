@@ -87,6 +87,25 @@ void drawScreenTriangles(std::vector<nr::ScreenVertex> vertices, float sourceWid
                          std::string textureName = {}, nr::ScreenDrawState state = {});
 void drawScreenLines(std::vector<nr::ScreenVertex> vertices, float sourceWidth, float sourceHeight,
                      std::string textureName = {}, nr::ScreenDrawState state = {});
+// ---- Compact 2-D records ------------------------------------------------------------------------------------------------
+// The cheap way to record a screen-space draw (P3FES_IM2D_CMD in p3fes_renderware.cpp): the vertices go into one array
+// for the frame, the texture name and the draw state are interned in per-frame tables, so a draw is a few words. The ids
+// are valid until screenEpoch() changes. The record call
+// returns where the caller writes the `vertexCount` vertices, or null when no frame is being recorded.
+// Mode 0: drawScreenTriangles/Lines keep one owning record per draw (the previous path); 1: they too record compactly;
+// 2: compact, and every record also noted in its old form with noteOldScreenRecord is compared with it at endFrame
+// (log line "[p3fes-im2d-frame] frames= records= mismatches=").
+constexpr uint32_t kNoScreenRecord = 0xFFFFFFFFu;
+// Bumped when the ids above stop being valid: frame begin and end, a render-target bracket opening or closing, a producer
+// reset (not by a recorded camera, unlike cameraEpoch()).
+uint64_t screenEpoch();
+void setScreenRecordMode(int mode);
+int screenRecordMode();
+uint32_t internScreenTexture(const std::string &name); // 0: untextured
+uint32_t internScreenState(const nr::ScreenDrawState &state, float sourceWidth, float sourceHeight);
+nr::ScreenVertex *recordScreenDraw(uint32_t texture, uint32_t state, uint32_t vertexCount, bool lines = false);
+void noteOldScreenRecord(const std::vector<nr::ScreenVertex> &vertices, float sourceWidth, float sourceHeight, const std::string &textureName,
+                         const nr::ScreenDrawState &state, bool lines = false);
 void endFrame();
 
 // Consumer side (host presentation thread): owns every graphics API call.

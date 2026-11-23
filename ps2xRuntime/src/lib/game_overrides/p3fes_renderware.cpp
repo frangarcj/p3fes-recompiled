@@ -5820,11 +5820,269 @@ namespace
         return true;
     }
 
+    // ---- compact record path (P3FES_IM2D_CMD) --------------------------------------------------------------------------------
+    // The same quad record as im2dQuadCore, without the per-quad objects: the texture and the draw state are interned ids of
+    // the frame being recorded (kept in small caches that stay valid while p3fes_native_present::screenEpoch() and the raster
+    // lifecycle epoch are unchanged), and the six vertices are written straight into the frame's vertex array.
+    // P3FES_IM2D_CMD=0: the previous record path (a std::vector, a std::string and a ScreenDrawState per quad); =verify: both
+    // are built for every draw and compared record by record per frame ("[p3fes-im2d-frame]" lines).
+    enum class Im2DCmdMode : uint8_t { Off, On, Verify };
+    Im2DCmdMode g_im2dCmdMode = Im2DCmdMode::Off;
+    bool g_im2dAnyDiag = false; // a diagnostic switch that the fast paths do not implement is on
+    struct Im2DCmdCounters { uint64_t quads = 0u, texQuads = 0u, missRaster = 0u, missEpoch = 0u, missToken = 0u, texHits = 0u, stateHits = 0u, restarts = 0u, bothMismatch = 0u; } g_im2dCmd;
+
+    struct Im2DTexIdSlot
+    {
+        uint32_t raster = 0u;
+        uint32_t id = 0u;
+        uint64_t lifecycleEpoch = ~uint64_t{0};
+        uint64_t token = ~uint64_t{0};
+        std::string name; // the name `id` stands for (a function of the raster while lifecycleEpoch is current)
+    };
+    Im2DTexIdSlot g_im2dTexIds[1024];
+    struct Im2DStateIdSlot
+    {
+        uint64_t words[6] = {};
+        uint64_t token = ~uint64_t{0};
+        uint32_t id = 0u;
+        bool masked = false;
+    };
+    Im2DStateIdSlot g_im2dStateIds[8];
+
+    // colorByte for the values the game writes (0..255, usually whole numbers): the same result without the clamp and the
+    // finite test; anything else (negative, above 255, NaN) takes the general function.
+    inline uint8_t colorByteFast(float value)
+    {
+        if (__builtin_expect(value >= 0.0f && value <= 255.0f, 1))
+        {
+            const int whole = static_cast<int>(value);
+            return static_cast<uint8_t>(whole + ((value - static_cast<float>(whole)) >= 0.5f ? 1 : 0));
+        }
+        return colorByte(value);
+    }
+
+    inline bool floatFinite(float value)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return (bits & 0x7F800000u) != 0x7F800000u;
+    }
+
+    // False: not handled here, nothing was recorded (the generic path decides what happens).
+    bool im2dQuadCoreCmd(uint8_t *rdram, const p3fes_native_ui::Im2DVertexF (&in)[4])
+    {
+        if (__builtin_expect(g_im2dAnyDiag || g_targetRaster != 0u || g_diagEnabled.load(std::memory_order_relaxed), 0))
+            return false;
+        if (g_gsColorMasked && g_maskDropIm2d)
+        {
+            ++g_maskDropped[2];
+            return true;
+        }
+        uint32_t probeT = p3fes_native_ui::g_prof.mode ? p3fes_native_ui::stamp() : 0u;
+        uint64_t flags = 0u, zbuf = 0u;
+        std::memcpy(&flags, rdram + kRwRenderFlags, 8u);
+        std::memcpy(&zbuf, rdram + kRwZbuf1, 8u);
+        // the vertices (pure): a position that is not finite declines the quad before anything else happens
+        const float inverseDepth = p3fes_im2d::inverseDepthRange(zbuf);
+        ScreenVertex quad[4];
+        // the four vertices of a sprite mostly share their depth and their colour: the conversion is repeated only when the
+        // float's bits differ from the previous vertex's (an exact test, so the result is the same as converting each)
+        uint32_t lastZ = 0u, lastColor[4] = {0u, 0u, 0u, 0u};
+        float lastDepth = 0.0f;
+        std::array<uint8_t, 4> lastBytes{};
+        for (uint32_t i = 0u; i < 4u; ++i)
+        {
+            const auto &p = in[i];
+            if (__builtin_expect(!(floatFinite(p.x) && floatFinite(p.y) && floatFinite(p.z)), 0))
+                return false;
+            ScreenVertex &v = quad[i];
+            v.x = p.x;
+            v.y = p.y;
+            uint32_t zBits, color[4];
+            std::memcpy(&zBits, &p.z, 4u);
+            std::memcpy(&color[0], &p.r, 4u);
+            std::memcpy(&color[1], &p.g, 4u);
+            std::memcpy(&color[2], &p.b, 4u);
+            std::memcpy(&color[3], &p.a, 4u);
+            if (i == 0u || zBits != lastZ)
+            {
+                lastDepth = p3fes_im2d::normalizedDepth(p.z, inverseDepth);
+                lastZ = zBits;
+            }
+            v.z = lastDepth;
+            v.u = floatFinite(p.u) ? p.u : 0.0f;
+            v.v = floatFinite(p.v) ? p.v : 0.0f;
+            if (i == 0u || color[0] != lastColor[0] || color[1] != lastColor[1] || color[2] != lastColor[2] || color[3] != lastColor[3])
+            {
+                lastBytes = {colorByteFast(p.r), colorByteFast(p.g), colorByteFast(p.b), colorByteFast(p.a)};
+                lastColor[0] = color[0]; lastColor[1] = color[1]; lastColor[2] = color[2]; lastColor[3] = color[3];
+            }
+            v.color = lastBytes;
+        }
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dVertices, probeT); probeT = p3fes_native_ui::stamp(); }
+        const uint64_t token0 = p3fes_native_present::screenEpoch();
+        // texture: an id from the cache, or the name the generic lookup gives
+        const bool textured = (flags & kGsPrimTextureEnable) != 0u;
+        uint32_t raster = 0u, textureId = 0u;
+        uint64_t lifecycleEpoch = 0u;
+        bool textureKnown = false;
+        std::string textureName;
+        const std::string *nameOf = &textureName;
+        bool nameFromSlot = false; // the name is the slot's: the same raster at the same lifecycle epoch, only the frame is new
+        Im2DTexIdSlot *textureSlot = nullptr;
+        if (textured)
+        {
+            std::memcpy(&raster, rdram + kRwCurrentRaster, 4u);
+            if (!raster)
+                return false;
+            lifecycleEpoch = p3fes_native_rasters::epoch();
+            textureSlot = &g_im2dTexIds[(raster * 0x9E3779B1u) >> 22u];
+            ++g_im2dCmd.texQuads;
+            if (textureSlot->raster == raster && textureSlot->lifecycleEpoch == lifecycleEpoch && textureSlot->token == token0)
+            {
+                textureId = textureSlot->id;
+                textureKnown = true;
+                ++g_im2dCmd.texHits;
+            }
+            else
+            {
+                if (textureSlot->raster != raster) ++g_im2dCmd.missRaster;
+                else if (textureSlot->lifecycleEpoch != lifecycleEpoch) ++g_im2dCmd.missEpoch;
+                else
+                {
+                    ++g_im2dCmd.missToken;
+                    nameOf = &textureSlot->name;
+                    nameFromSlot = true;
+                }
+                if (!nameFromSlot && !prepareNativeRasterTexture(rdram, raster, textureName))
+                    return false;
+            }
+        }
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dTexture, probeT); probeT = p3fes_native_ui::stamp(); }
+        // draw state: an id from the cache, or the decoded state
+        uint64_t words[6];
+        words[0] = flags;
+        std::memcpy(&words[1], rdram + kRwAlpha1, 8u);
+        std::memcpy(&words[2], rdram + kRwClamp1, 8u);
+        std::memcpy(&words[3], rdram + kRwTex1, 8u);
+        std::memcpy(&words[4], rdram + kRwTest1, 8u);
+        std::memcpy(&words[5], rdram + kRwZbuf1, 8u);
+        Im2DStateIdSlot &stateSlot = g_im2dStateIds[static_cast<uint32_t>((words[0] ^ (words[0] >> 29u) ^ (words[1] * 5u) ^ (words[4] * 3u) ^ words[3]) & 7u)];
+        const bool masked = g_gsColorMasked;
+        uint32_t stateId = 0u;
+        bool stateKnown = false;
+        ScreenDrawState drawState;
+        if (stateSlot.token == token0 && stateSlot.masked == masked &&
+            ((stateSlot.words[0] ^ words[0]) | (stateSlot.words[1] ^ words[1]) | (stateSlot.words[2] ^ words[2]) | (stateSlot.words[3] ^ words[3]) |
+             (stateSlot.words[4] ^ words[4]) | (stateSlot.words[5] ^ words[5])) == 0u)
+        {
+            stateId = stateSlot.id;
+            stateKnown = true;
+            ++g_im2dCmd.stateHits;
+        }
+        else
+            im2dStateFor(rdram, flags, drawState);
+        if (p3fes_native_ui::g_prof.mode) { p3fes_native_ui::note(p3fes_native_ui::Im2dState, probeT); probeT = p3fes_native_ui::stamp(); }
+        if (!ensureNativeFrame(rdram))
+            return false;
+        const uint64_t token1 = p3fes_native_present::screenEpoch();
+        if (__builtin_expect(token1 != token0, 0))
+        {
+            // The frame was opened, or a render-target bracket changed, by the call above: ids found before it were made for
+            // another frame (or another target size).
+            ++g_im2dCmd.restarts;
+            if (textureKnown)
+            {
+                textureKnown = false;
+                nameOf = &textureSlot->name;
+                nameFromSlot = true;
+            }
+            if (stateKnown)
+            {
+                stateKnown = false;
+                im2dStateFor(rdram, flags, drawState);
+            }
+        }
+        if (textured && !textureKnown)
+        {
+            textureId = p3fes_native_present::internScreenTexture(*nameOf);
+            if (textureId == p3fes_native_present::kNoScreenRecord)
+                return true; // no frame is being recorded: the previous path drops the draw as well
+            if (nameFromSlot)
+            {
+                textureSlot->token = token1;
+                textureSlot->id = textureId;
+            }
+            else
+            {
+            // The name of a raster is a function of the raster while the lifecycle epoch stands (that is what the generic lookup's
+            // cache relies on as well). Camera rasters are left out: their lookup also (re)defines a placeholder texture.
+            const RasterNameCacheSlot &generic = g_rasterNameCache[(raster >> 4u) & 127u];
+            if ((generic.raster == raster && generic.epoch == lifecycleEpoch && generic.name && *generic.name == textureName) ||
+                (p3fes_native_rasters::epoch() == lifecycleEpoch && !isCameraTextureRaster(rdram, raster)))
+            {
+                textureSlot->name = textureName;
+                textureSlot->raster = raster;
+                textureSlot->lifecycleEpoch = lifecycleEpoch;
+                textureSlot->token = token1;
+                textureSlot->id = textureId;
+            }
+            }
+        }
+        if (!stateKnown)
+        {
+            stateId = p3fes_native_present::internScreenState(drawState, kRwScreenWidth, kRwScreenHeight);
+            if (stateId == p3fes_native_present::kNoScreenRecord)
+                return true;
+            // (the decoded state of a fogged draw also depends on words that are not part of the key)
+            if ((flags & kGsPrimFogEnable) == 0u)
+            {
+                std::memcpy(stateSlot.words, words, sizeof(words));
+                stateSlot.masked = masked;
+                stateSlot.token = token1;
+                stateSlot.id = stateId;
+            }
+        }
+        ScreenVertex *out = p3fes_native_present::recordScreenDraw(textureId, stateId, 6u, false);
+        if (__builtin_expect(out != nullptr, 1))
+        {
+            // TRISTRIP(4): the triangles (0,1,2) (2,1,3)
+            out[0] = quad[0];
+            out[1] = quad[1];
+            out[2] = quad[2];
+            out[3] = quad[2];
+            out[4] = quad[1];
+            out[5] = quad[3];
+        }
+        ++g_im2dCmd.quads;
+        if (p3fes_native_ui::g_prof.mode)
+            p3fes_native_ui::note(p3fes_native_ui::Im2dSubmit, probeT);
+        return true;
+    }
+
+    // P3FES_IM2D_CMD=verify, a quad whose vertices are in C++ (the sprite drawer's): the previous fast path builds the old-form
+    // record, the compact one is recorded, and the frame's records are compared when it ends.
+    bool im2dQuadBoth(uint8_t *rdram, const p3fes_native_ui::Im2DVertexF (&in)[4])
+    {
+        Im2DRecord old;
+        g_im2dCapture = &old;
+        const bool oldHandled = im2dQuadCore(rdram, in);
+        g_im2dCapture = nullptr;
+        const bool newHandled = im2dQuadCoreCmd(rdram, in);
+        if (oldHandled != newHandled && g_im2dCmd.bothMismatch++ < 12u)
+            std::fprintf(stderr, "[p3fes-im2d] compact path MISMATCH: previous fast path handled=%d compact=%d\n", oldHandled ? 1 : 0, newHandled ? 1 : 0);
+        if (newHandled && old.valid)
+            p3fes_native_present::noteOldScreenRecord(old.vertices, kRwScreenWidth, kRwScreenHeight, old.textureName, old.state, false);
+        return newHandled;
+    }
+
     // The maestro drawer's draw: same record, vertices from C++ (see p3fes_native_ui.cpp)
     bool im2dQuadSink(uint8_t *rdram, const p3fes_native_ui::Im2DVertexF (&in)[4])
     {
         const uint32_t probeBegin = p3fes_native_ui::g_prof.mode ? p3fes_native_ui::stamp() : 0u;
-        const bool done = g_im2dFastMode != Im2DFastMode::Off && p3fes_native_ui::g_cutsOn && im2dQuadCore(rdram, in);
+        const bool done = g_im2dFastMode != Im2DFastMode::Off && p3fes_native_ui::g_cutsOn &&
+                          (g_im2dCmdMode == Im2DCmdMode::On ? im2dQuadCoreCmd(rdram, in)
+                           : g_im2dCmdMode == Im2DCmdMode::Verify ? im2dQuadBoth(rdram, in) : im2dQuadCore(rdram, in));
         if (done && p3fes_native_ui::g_prof.mode)
             p3fes_native_ui::note(p3fes_native_ui::Im2dTotal, probeBegin);
         return done;
@@ -5838,11 +6096,20 @@ namespace
         p3fes_native_ui::Im2DVertexF q[4];
         for (uint32_t i = 0u; i < 4u; ++i)
         {
-            RwIm2DVertex raw;
-            std::memcpy(&raw, rdram + verts + i * sizeof(RwIm2DVertex), sizeof(raw));
-            q[i] = {raw.x, raw.y, raw.z, raw.u, raw.v, raw.r, raw.g, raw.b, raw.a};
+            // only the nine floats the record is made of (not the 64-byte vertex)
+            const uint8_t *src = rdram + verts + i * sizeof(RwIm2DVertex);
+            p3fes_native_ui::Im2DVertexF &out = q[i];
+            std::memcpy(&out.x, src + offsetof(RwIm2DVertex, x), 4u);
+            std::memcpy(&out.y, src + offsetof(RwIm2DVertex, y), 4u);
+            std::memcpy(&out.z, src + offsetof(RwIm2DVertex, z), 4u);
+            std::memcpy(&out.u, src + offsetof(RwIm2DVertex, u), 4u);
+            std::memcpy(&out.v, src + offsetof(RwIm2DVertex, v), 4u);
+            std::memcpy(&out.r, src + offsetof(RwIm2DVertex, r), 4u);
+            std::memcpy(&out.g, src + offsetof(RwIm2DVertex, g), 4u);
+            std::memcpy(&out.b, src + offsetof(RwIm2DVertex, b), 4u);
+            std::memcpy(&out.a, src + offsetof(RwIm2DVertex, a), 4u);
         }
-        if (g_im2dFastMode == Im2DFastMode::Verify)
+        if (g_im2dFastMode == Im2DFastMode::Verify || g_im2dCmdMode == Im2DCmdMode::Verify)
         {
             Im2DRecord a, b;
             g_im2dCapture = &a;
@@ -5860,8 +6127,28 @@ namespace
             else if (g_im2dFast.verifyBad++ < 12u)
                 std::fprintf(stderr, "[p3fes-im2d] fast path MISMATCH tex=%s/%s verts=%zu/%zu\n", a.textureName.c_str(), b.textureName.c_str(),
                              a.vertices.size(), b.vertices.size());
+            if (g_im2dCmdMode == Im2DCmdMode::Verify)
+            {
+                // the compact record is the one drawn; the generic record is what it is compared with when the frame ends
+                if (im2dQuadCoreCmd(rdram, q))
+                {
+                    if (a.valid)
+                        p3fes_native_present::noteOldScreenRecord(a.vertices, kRwScreenWidth, kRwScreenHeight, a.textureName, a.state, false);
+                    return true;
+                }
+            }
             if (a.valid)
                 submitIm2DTriangles(std::move(a.vertices), std::move(a.textureName), a.state);
+            return true;
+        }
+        if (g_im2dCmdMode == Im2DCmdMode::On)
+        {
+            if (!im2dQuadCoreCmd(rdram, q))
+            {
+                ++g_im2dFast.declined;
+                return false;
+            }
+            ++g_im2dFast.fast;
             return true;
         }
         if (!im2dQuadCore(rdram, q))
@@ -6449,6 +6736,12 @@ namespace
                                  static_cast<int>(g_im2dFastMode), static_cast<unsigned long long>(g_im2dFast.fast),
                                  static_cast<unsigned long long>(g_im2dFast.declined), static_cast<unsigned long long>(g_im2dFast.stateHits),
                                  static_cast<unsigned long long>(g_im2dFast.verifyOk), static_cast<unsigned long long>(g_im2dFast.verifyBad));
+                    std::fprintf(stderr, "[p3fes-im2d] compact records mode=%d quads=%llu textured=%llu texture-id-hits=%llu (misses: raster=%llu epoch=%llu token=%llu) state-id-hits=%llu restarts=%llu both-mismatch=%llu\n",
+                                 static_cast<int>(g_im2dCmdMode), static_cast<unsigned long long>(g_im2dCmd.quads),
+                                 static_cast<unsigned long long>(g_im2dCmd.texQuads), static_cast<unsigned long long>(g_im2dCmd.texHits),
+                                 static_cast<unsigned long long>(g_im2dCmd.missRaster), static_cast<unsigned long long>(g_im2dCmd.missEpoch),
+                                 static_cast<unsigned long long>(g_im2dCmd.missToken), static_cast<unsigned long long>(g_im2dCmd.stateHits),
+                                 static_cast<unsigned long long>(g_im2dCmd.restarts), static_cast<unsigned long long>(g_im2dCmd.bothMismatch));
                     if (g_hookTimes.calls)
                     {
                         static const char *names[HookStageTimes::kStages] = {"inspect", "ensure", "camera", "mesh", "matrix", "acquire", "materials", "gsstate", "lighting", "skin", "handoff"};
@@ -7637,6 +7930,23 @@ namespace
                                : (fast && std::strcmp(fast, "verify") == 0 ? Im2DFastMode::Verify : Im2DFastMode::On);
                 g_im2dFast = {};
                 g_im2dStateCache = {};
+                const char *cmd = std::getenv("P3FES_IM2D_CMD");
+                g_im2dCmdMode = cmd && cmd[0] == '0' && !cmd[1] ? Im2DCmdMode::Off
+                              : (cmd && std::strcmp(cmd, "verify") == 0 ? Im2DCmdMode::Verify : Im2DCmdMode::On);
+                if (g_im2dCmdMode == Im2DCmdMode::Verify && g_im2dFastMode == Im2DFastMode::Off)
+                    g_im2dFastMode = Im2DFastMode::On;
+                p3fes_native_present::setScreenRecordMode(g_im2dCmdMode == Im2DCmdMode::Off ? 0 : (g_im2dCmdMode == Im2DCmdMode::Verify ? 2 : 1));
+                {
+                    const char *mask = std::getenv("P3FES_MASK_DIAG");
+                    const char *screen = std::getenv("P3FES_SCREEN_STATE_DIAG");
+                    const char *glow = std::getenv("P3FES_DEBUG_GLOW_ALPHA");
+                    g_im2dAnyDiag = (mask && std::atoi(mask) >= 2) || (screen && *screen == '1') || (glow && std::atoi(glow) >= 0);
+                }
+                g_im2dCmd = {};
+                for (auto &slot : g_im2dTexIds)
+                    slot = {};
+                for (auto &slot : g_im2dStateIds)
+                    slot = {};
             }
             const bool im2dPrim = installNativeOnlyHook(runtime, kSkyIm2DRenderPrimitive, &p3fesSkyIm2DRenderPrimitive);
             if (im2dPrim)
