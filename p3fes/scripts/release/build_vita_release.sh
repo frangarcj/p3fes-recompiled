@@ -23,6 +23,8 @@
 #   --jobs N              parallel jobs, default: number of CPUs [P3FES_JOBS]
 #   --commit SHA          commit shown in the release notes, default: git HEAD [P3FES_COMMIT]
 #   --notes FILE          release notes template, default p3fes/release/vita-release-notes.md
+#   --repo OWNER/NAME     GitHub repository that publishes the release; the notes link to its Pages site (the data
+#                         tool). Default frangarcj/p3fes-recompiled [GITHUB_REPOSITORY]
 #   --overwrite-generated allow replacing a non-empty ps2xRuntime/src/runner (always allowed when CI=true)
 #   --clean-generated     delete the generated sources from the tree when finished
 #   --configure-only      stop after the Vita CMake configure step (no build, no packaging)
@@ -43,6 +45,7 @@ work=${P3FES_WORK:-}
 jobs=${P3FES_JOBS:-}
 commit=${P3FES_COMMIT:-}
 notes_template=$root/p3fes/release/vita-release-notes.md
+repo=${GITHUB_REPOSITORY:-frangarcj/p3fes-recompiled}
 overwrite_generated=0
 clean_generated=0
 configure_only=0
@@ -66,6 +69,7 @@ while [ $# -gt 0 ]; do
         --jobs) jobs=${2:?--jobs needs a value}; shift 2 ;;
         --commit) commit=${2:?--commit needs a value}; shift 2 ;;
         --notes) notes_template=${2:?--notes needs a value}; shift 2 ;;
+        --repo) repo=${2:?--repo needs a value}; shift 2 ;;
         --overwrite-generated) overwrite_generated=1; shift ;;
         --clean-generated) clean_generated=1; shift ;;
         --configure-only) configure_only=1; shift ;;
@@ -136,9 +140,12 @@ check_vpk() {
 }
 
 render_notes() { # template tag app_ver commit vpk_name vpk_sha256 -> stdout
-    local tpl=$1 tag=$2 appver=$3 cmt=$4 name=$5 sum=$6
+    local tpl=$1 tag=$2 appver=$3 cmt=$4 name=$5 sum=$6 owner tool_url
     [ -f "$tpl" ] || die "release notes template not found: $tpl"
-    sed -e "s|@VERSION@|$tag|g" -e "s|@APP_VER@|$appver|g" -e "s|@COMMIT@|$cmt|g" \
+    [[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || die "--repo must be OWNER/NAME, got: $repo"
+    owner=$(printf '%s' "${repo%%/*}" | tr '[:upper:]' '[:lower:]')
+    tool_url="https://$owner.github.io/${repo#*/}/"
+    sed -e "s|@VERSION@|$tag|g" -e "s|@APP_VER@|$appver|g" -e "s|@COMMIT@|$cmt|g" -e "s|@TOOL_URL@|$tool_url|g" \
         -e "s|@VPK_NAME@|$name|g" -e "s|@VPK_SHA256@|$sum|g" -e "s|@DATE@|$(date -u +%Y-%m-%d)|g" "$tpl"
 }
 

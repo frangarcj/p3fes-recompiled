@@ -16,6 +16,13 @@ let statusState = null;    // for re-rendering on language change
 
 const ZIP_NAME = 'p3fes-vita-data.zip';
 
+// On GitHub Pages (OWNER.github.io/REPO/) the releases are those of the repository that serves this page.
+{
+  const pagesOwner = /^([a-z0-9-]+)\.github\.io$/i.exec(location.hostname)?.[1];
+  const pagesRepo = location.pathname.split('/')[1];
+  if (pagesOwner && pagesRepo) $('releasesLink').href = `https://github.com/${pagesOwner}/${pagesRepo}/releases`;
+}
+
 // ---------------------------------------------------------------- i18n
 const t = (key, vars) => format(STRINGS[lang][key] ?? STRINGS.en[key] ?? key, vars);
 

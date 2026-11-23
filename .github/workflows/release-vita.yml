@@ -3,7 +3,8 @@ name: Release PS Vita beta
 # Builds the PS Vita VPK from the user's SLUS_216.21 (fetched from a private repository) and publishes it as a GitHub
 # prerelease. Runs on a pushed tag v* or by hand with a tag input.
 #
-# Secrets and variables (Settings -> Secrets and variables -> Actions):
+# Secrets and variables (Settings -> Secrets and variables -> Actions) of the repository that publishes the releases;
+# the jobs are skipped where P3FES_INPUTS_REPO is not set, so other forks do not run them:
 #   secret   P3FES_INPUTS_TOKEN  fine-grained PAT, only the private inputs repository, permission "Contents: Read"
 #   variable P3FES_INPUTS_REPO   owner/name of the private repository holding SLUS_216.21 at its root
 #
@@ -58,7 +59,7 @@ env:
 jobs:
   build:
     name: Build VPK
-    if: github.repository == 'ppkkkkk/p3fes-recompiled'
+    if: vars.P3FES_INPUTS_REPO != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
@@ -194,7 +195,7 @@ jobs:
       - name: Fetch SLUS_216.21 from the private inputs repository
         env:
           INPUTS_TOKEN: ${{ secrets.P3FES_INPUTS_TOKEN }}
-          INPUTS_REPO: ${{ vars.P3FES_INPUTS_REPO || 'ppkkkkk/p3fes-ci-inputs' }}
+          INPUTS_REPO: ${{ vars.P3FES_INPUTS_REPO }}
         run: |
           set +x
           [ -n "$INPUTS_TOKEN" ] || { echo "::error::secret P3FES_INPUTS_TOKEN is not set"; exit 1; }
@@ -268,7 +269,7 @@ jobs:
   publish:
     name: Publish prerelease
     needs: build
-    if: github.repository == 'ppkkkkk/p3fes-recompiled'
+    if: vars.P3FES_INPUTS_REPO != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

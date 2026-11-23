@@ -14,7 +14,7 @@ Build: `@COMMIT@`, Vita app version `@APP_VER@`, @DATE@.
 ### Install
 
 1. Install `@VPK_NAME@` with VitaShell (copy it to the Vita, press Cross on it and confirm the install).
-2. Open the data tool at <https://ppkkkkk.github.io/p3fes-recompiled/> in a browser, pick your ISO and download the zip.
+2. Open the data tool at <@TOOL_URL@> in a browser, pick your ISO and download the zip.
    Nothing is uploaded: the zip is built on your computer.
 3. Extract the zip into the root of `ux0:` (it creates `ux0:data/p3fes/`).
 4. Launch "Persona 3 FES" from the LiveArea.

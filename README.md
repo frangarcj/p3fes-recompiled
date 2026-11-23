@@ -18,7 +18,7 @@ The game's MIPS R5900 code is statically recompiled to C++ and run on a reimplem
 
 > [!IMPORTANT]
 > This repository contains no game files: no ELF, IRX modules, `.CVM` archives or code generated from them.
-> The PS Vita beta VPK on the [Releases](https://github.com/ppkkkkk/p3fes-recompiled/releases) page holds the
+> The PS Vita beta VPK on the [Releases](https://github.com/frangarcj/p3fes-recompiled/releases) page holds the
 > recompiled executable code (a Vita app is one static binary), but no game data.
 > You need **your own copy** of Persona 3 FES, NTSC-U, PS2 ID **`SLUS-21621`**, matching the
 > [Redump record](http://redump.org/disc/4125/). The port is built against that disc's executable:
@@ -132,8 +132,8 @@ third_party/pcsx2-vu/  Subset of PCSX2 at 646df006a used by kzvu
 ## PS Vita beta
 
 1. You need a PS Vita or PS TV with HENkaku/Ensō and taiHEN, and about 6 GB free on `ux0:`.
-2. Install the VPK from the latest [prerelease](https://github.com/ppkkkkk/p3fes-recompiled/releases) with VitaShell.
-3. Open the **[data tool](https://ppkkkkk.github.io/p3fes-recompiled/)**, pick your `SLUS-21621` ISO and save the zip.
+2. Install the VPK from the latest [prerelease](https://github.com/frangarcj/p3fes-recompiled/releases) with VitaShell.
+3. Open the **[data tool](https://frangarcj.github.io/p3fes-recompiled/)**, pick your `SLUS-21621` ISO and save the zip.
    The zip is built in your browser and nothing is uploaded. It holds the game files, the music converted to WAV and
    (optionally, ~10-15 min) the movies converted to H.264 for the Vita's decoder.
 4. Extract the zip at the root of `ux0:` (it creates `ux0:data/p3fes/`) and start the game.
