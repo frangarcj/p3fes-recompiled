@@ -4,6 +4,8 @@
 #include "ps2_runtime_macros.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 
 namespace p3fes_native_rasters
@@ -90,6 +92,19 @@ namespace p3fes_native_rasters
             const uint32_t address = ctx->pc;
             const uint32_t raster = GPR_U32(ctx, 4);
             const GuestFunction original = originalFor(address);
+            static const bool diag = [] { const char *v = std::getenv("P3FES_RASTER_DIAG"); return v && *v == '1'; }();
+            if (diag)
+            {
+                uint32_t w = 0u, h = 0u, d = 0u, f = 0u, px = 0u;
+                if (raster && raster < PS2_RAM_SIZE - 64u)
+                {
+                    std::memcpy(&px, rdram + raster + 4u, 4u); std::memcpy(&w, rdram + raster + 12u, 4u);
+                    std::memcpy(&h, rdram + raster + 16u, 4u); std::memcpy(&d, rdram + raster + 20u, 4u);
+                    std::memcpy(&f, rdram + raster + 32u, 4u);
+                }
+                std::fprintf(stderr, "[raster-inval] hook=%X a0=%X a1=%X ra=%X %ux%u d=%u f=%X px=%X\n", address, raster, GPR_U32(ctx, 5),
+                             GPR_U32(ctx, 31), w, h, d, f, px);
+            }
             invalidate(raster);
             if (original)
                 original(rdram, ctx, runtime);

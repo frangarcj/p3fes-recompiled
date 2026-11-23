@@ -55,6 +55,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -704,10 +705,12 @@ namespace
         bool followupLogged = false;
     };
     std::unordered_map<uint32_t, SkinFrameDiagnostic> g_skinFrameDiagnostics;
+    struct ContentEntry;
     struct NativeRasterResource
     {
         p3fes_native_rasters::Version version;
         std::string textureName;
+        ContentEntry *content = nullptr; // P3FES_TEX_CONTENT: the shared content-addressed texture this raster shows
     };
     std::unordered_map<uint32_t, NativeRasterResource> g_nativeRasterResources;
     // Lowest texel alpha of each decoded native texture, by texture name (the same name the draw states
@@ -5044,12 +5047,230 @@ namespace
         return true;
     }
 
+    // ---- Content-addressed raster textures (P3FES_TEX_CONTENT=1, =verify, =0 for the one-texture-per-raster-revision
+    // behaviour). The game rewrites rasters it already showed: the battle command ring unlocks ~6 32x32 icon rasters per step
+    // (pixels + palette) and the new contents are icons that were on screen before, in other raster slots. Every such
+    // rewrite used to decode the raster, define a new host texture, upload it and delete the previous one. Now the source
+    // bytes (pixels + palette + format) of a re-prepared raster are hashed (128 bit); when a texture with that content exists
+    // the raster just takes its name: no decode, no upload, no delete. Textures nobody shows any more stay defined in a
+    // small LRU pool (P3FES_TEX_POOL_KB, default 2048 KB of RGBA) so an icon that comes back is still on the GPU.
+    struct ContentKey
+    {
+        uint64_t a = 0u, b = 0u;
+        bool operator==(const ContentKey &o) const { return a == o.a && b == o.b; }
+    };
+    struct ContentKeyHash
+    {
+        size_t operator()(const ContentKey &k) const { return static_cast<size_t>(k.a ^ (k.b * 0x9E3779B97F4A7C15ull)); }
+    };
+    struct ContentEntry
+    {
+        ContentKey key;
+        std::string name;
+        uint32_t refs = 0u;
+        uint32_t bytes = 0u;
+        bool pooled = false;
+        std::list<ContentEntry *>::iterator poolIt;
+        std::vector<uint8_t> verifyCopy; // verify mode only
+    };
+    std::unordered_map<ContentKey, ContentEntry, ContentKeyHash> g_contentTextures;
+    std::list<ContentEntry *> g_contentPool; // zero-reference entries, least recently released first
+    uint64_t g_contentPoolBytes = 0u;
+    uint64_t g_contentNextId = 1u;
+    struct ContentCounters
+    {
+        uint64_t hits = 0u, misses = 0u, unkeyed = 0u, evicted = 0u, revived = 0u, verified = 0u, mismatches = 0u;
+    } g_contentCounters;
+
+    // 0 off, 1 on, 2 verify (on, and every hit is also decoded and compared with the texture it reuses).
+    int contentMode()
+    {
+        static const int mode = [] {
+            const char *v = std::getenv("P3FES_TEX_CONTENT");
+            if (!v || !*v) return 1;
+            if (std::strcmp(v, "verify") == 0) return 2;
+            return *v == '0' ? 0 : 1;
+        }();
+        return mode;
+    }
+
+    uint64_t contentPoolBudget()
+    {
+        static const uint64_t budget = [] {
+            const char *v = std::getenv("P3FES_TEX_POOL_KB");
+            const long kb = v && *v ? std::atol(v) : 2048;
+            return static_cast<uint64_t>(kb < 0 ? 0 : kb) * 1024u;
+        }();
+        return budget;
+    }
+
+    inline void contentMix(ContentKey &k, uint64_t w)
+    {
+        k.a = (k.a ^ w) * 0x9E3779B97F4A7C15ull;
+        k.a ^= k.a >> 32u;
+        k.b = (k.b + w + 0x632BE59BD9B4E019ull) * 0xC2B2AE3D27D4EB4Full;
+        k.b = ((k.b << 27u) | (k.b >> 37u)) ^ k.a;
+    }
+
+    void contentHashBytes(ContentKey &k, const uint8_t *data, size_t size)
+    {
+        size_t i = 0u;
+        for (; i + 8u <= size; i += 8u)
+        {
+            uint64_t w;
+            std::memcpy(&w, data + i, 8u);
+            contentMix(k, w);
+        }
+        uint64_t tail = 0u;
+        if (i < size)
+            std::memcpy(&tail, data + i, size - i);
+        contentMix(k, tail ^ (static_cast<uint64_t>(size) << 56u));
+    }
+
+    // The hash of everything decodeNativeRaster reads (same validity tests; false = let the full decode decide).
+    bool contentKeyOfRaster(const uint8_t *rdram, uint32_t raster, ContentKey &key)
+    {
+        RasterSummary info;
+        if (!inspectRaster(rdram, raster, info) || info.width <= 0 || info.height <= 0 || info.width > 4096 ||
+            info.height > 4096 || info.stride <= 0 || (info.type & 0x07u) != 4u)
+            return false;
+        uint32_t pluginOffset = 0u;
+        uint8_t cacheFlags = 0u;
+        if (readGuest(rdram, kRwRasterPluginOffset, pluginOffset) && pluginOffset && guestPointer(raster + pluginOffset, 55u))
+            readGuest(rdram, raster + pluginOffset + 54u, cacheFlags);
+        const bool swizzled8 = (cacheFlags & 0x02u) != 0u;
+        const bool swizzled4 = (cacheFlags & 0x04u) != 0u;
+        if ((swizzled8 && info.depth != 8) || (swizzled4 && info.depth != 4) || (swizzled8 && swizzled4))
+            return false;
+        size_t rowBytes = 0u;
+        switch (info.depth)
+        {
+        case 4: rowBytes = (static_cast<size_t>(info.width) + 1u) / 2u; break;
+        case 8: rowBytes = static_cast<size_t>(info.width); break;
+        case 16: rowBytes = static_cast<size_t>(info.width) * 2u; break;
+        case 24: rowBytes = static_cast<size_t>(info.width) * 3u; break;
+        case 32: rowBytes = static_cast<size_t>(info.width) * 4u; break;
+        default: return false;
+        }
+        if (!guestPointer(info.pixels, 1u))
+            return false;
+        const uint32_t paletteEntries = info.depth == 4 ? 16u : (info.depth == 8 ? 256u : 0u);
+        const uint32_t paletteEntryBytes = (info.format & 0x0Fu) == 1u ? 2u : 4u;
+        if (paletteEntries && !guestPointer(info.palette, paletteEntries * paletteEntryBytes))
+            return false;
+
+        key = {};
+        contentMix(key, (static_cast<uint64_t>(static_cast<uint32_t>(info.width)) << 32u) | static_cast<uint32_t>(info.height));
+        contentMix(key, (static_cast<uint64_t>(static_cast<uint32_t>(info.depth)) << 32u) | (static_cast<uint64_t>(info.format) << 8u) | cacheFlags);
+        if (!swizzled8 && !swizzled4)
+        {
+            if (static_cast<size_t>(info.stride) < rowBytes)
+                return false;
+            const uint64_t pixelEnd = static_cast<uint64_t>(info.pixels) +
+                                      static_cast<uint64_t>(info.stride) * static_cast<uint64_t>(info.height - 1) + rowBytes;
+            if (pixelEnd > PS2_RAM_SIZE)
+                return false;
+            for (int32_t y = 0; y < info.height; ++y)
+                contentHashBytes(key, rdram + info.pixels + static_cast<uint32_t>(y) * static_cast<uint32_t>(info.stride), rowBytes);
+        }
+        else
+        {
+            uint32_t swizzledWidth = static_cast<uint32_t>(info.width);
+            swizzledWidth = std::max(swizzledWidth, swizzled8 ? 16u : 32u);
+            uint32_t logWidth = 0u;
+            for (uint32_t w = 1u; w < swizzledWidth; w <<= 1u)
+                ++logWidth;
+            const uint64_t groupYMax = static_cast<uint64_t>(static_cast<uint32_t>(info.height - 1) & ~3u);
+            uint64_t region = groupYMax * swizzledWidth + (1ull << (logWidth + 2u));
+            if (swizzled4)
+                region = (region + 1u) / 2u;
+            if (static_cast<uint64_t>(info.pixels) + region > PS2_RAM_SIZE)
+                return false;
+            contentHashBytes(key, rdram + info.pixels, static_cast<size_t>(region));
+        }
+        if (paletteEntries)
+            contentHashBytes(key, rdram + info.palette, static_cast<size_t>(paletteEntries) * paletteEntryBytes);
+        return true;
+    }
+
+    void contentTrimPool()
+    {
+        const uint64_t budget = contentPoolBudget();
+        while (g_contentPoolBytes > budget && !g_contentPool.empty())
+        {
+            ContentEntry *victim = g_contentPool.front();
+            g_contentPool.pop_front();
+            g_contentPoolBytes -= victim->bytes;
+            p3fes_native_present::retireTexture(victim->name);
+            g_textureMinAlpha.erase(victim->name);
+            ++g_minAlphaVersion;
+            ++g_contentCounters.evicted;
+            const ContentKey victimKey = victim->key;
+            g_contentTextures.erase(victimKey);
+        }
+    }
+
+    void contentAcquire(ContentEntry &entry)
+    {
+        if (entry.pooled)
+        {
+            g_contentPool.erase(entry.poolIt);
+            g_contentPoolBytes -= entry.bytes;
+            entry.pooled = false;
+            ++g_contentCounters.revived;
+        }
+        ++entry.refs;
+    }
+
+    void contentRelease(ContentEntry *entry)
+    {
+        if (!entry || entry->refs == 0u)
+            return;
+        if (--entry->refs != 0u)
+            return;
+        entry->poolIt = g_contentPool.insert(g_contentPool.end(), entry);
+        entry->pooled = true;
+        g_contentPoolBytes += entry->bytes;
+        contentTrimPool();
+    }
+
+    // Reset (the lifecycle reset already released every raster): retire every content texture.
+    void contentReset()
+    {
+        for (auto &[key, entry] : g_contentTextures)
+        {
+            p3fes_native_present::retireTexture(entry.name);
+            g_textureMinAlpha.erase(entry.name);
+        }
+        g_contentTextures.clear();
+        g_contentPool.clear();
+        g_contentPoolBytes = 0u;
+    }
+
+    void logContentCounters()
+    {
+        if (!contentMode())
+            return;
+        std::fprintf(stderr, "[p3fes-texcontent] hits=%llu misses=%llu unkeyed=%llu revived=%llu evicted=%llu contents=%u pooled=%u pool-kb=%u verified=%llu mismatch=%llu\n",
+                     static_cast<unsigned long long>(g_contentCounters.hits), static_cast<unsigned long long>(g_contentCounters.misses),
+                     static_cast<unsigned long long>(g_contentCounters.unkeyed), static_cast<unsigned long long>(g_contentCounters.revived),
+                     static_cast<unsigned long long>(g_contentCounters.evicted), static_cast<unsigned>(g_contentTextures.size()),
+                     static_cast<unsigned>(g_contentPool.size()), static_cast<unsigned>(g_contentPoolBytes / 1024u),
+                     static_cast<unsigned long long>(g_contentCounters.verified), static_cast<unsigned long long>(g_contentCounters.mismatches));
+    }
+
     void retireNativeRaster(uint32_t raster, uint64_t generation)
     {
         p3fes_native_texture_access::forgetRaster(raster);
         const auto found = g_nativeRasterResources.find(raster);
         if (found == g_nativeRasterResources.end() || found->second.version.generation != generation)
             return;
+        if (found->second.content)
+        {
+            contentRelease(found->second.content);
+            g_nativeRasterResources.erase(found);
+            return;
+        }
         p3fes_native_present::retireTexture(found->second.textureName);
         g_textureMinAlpha.erase(found->second.textureName);
         ++g_minAlphaVersion;
@@ -5143,14 +5364,95 @@ namespace
 
         // Resource preparation happens once at the first bind after creation
         // or an explicit image/palette update. Draws only look up its version;
-        // they never inspect or hash the texture's source bytes.
+        // they never hash the texture's source bytes (a re-preparation does, see the content-addressed block above).
+        const int contentOn = contentMode();
+        ContentKey contentKey;
+        bool keyed = false;
+        if (contentOn)
+        {
+            keyed = contentKeyOfRaster(rdram, raster, contentKey);
+        }
+        if (keyed)
+        {
+            const auto content = g_contentTextures.find(contentKey);
+            if (content != g_contentTextures.end())
+            {
+                ContentEntry &entry = content->second;
+                if (contentOn == 2)
+                {
+                    TextureData check;
+                    ++g_contentCounters.verified;
+                    if (!decodeNativeRaster(rdram, raster, check) || check.rgba != entry.verifyCopy)
+                    {
+                        if (g_contentCounters.mismatches++ < 8u)
+                            std::fprintf(stderr, "[p3fes-texcontent] MISMATCH raster=%X %ux%u reuses %s\n", raster, check.width, check.height,
+                                         entry.name.c_str());
+                    }
+                }
+                contentAcquire(entry);
+                if (found != g_nativeRasterResources.end())
+                {
+                    if (found->second.content)
+                        contentRelease(found->second.content);
+                    else
+                    {
+                        p3fes_native_present::retireTexture(found->second.textureName);
+                        g_textureMinAlpha.erase(found->second.textureName);
+                        ++g_minAlphaVersion;
+                    }
+                }
+                NativeRasterResource &resource = g_nativeRasterResources[raster];
+                resource = {version, entry.name, &entry};
+                textureName = entry.name;
+                cached = {raster, lifecycleEpoch, &resource.textureName};
+                ++g_contentCounters.hits;
+                return true;
+            }
+        }
         TextureData texture;
         if (!decodeNativeRaster(rdram, raster, texture)) return false;
+        if (contentOn && !keyed)
+            ++g_contentCounters.unkeyed; // decodable but not hashable (a bug if this ever counts)
+        {
+            static const bool diag = [] { const char *v = std::getenv("P3FES_RASTER_DIAG"); return v && *v == '1'; }();
+            if (diag)
+            {
+                uint64_t h = 1469598103934665603ull;
+                for (uint8_t b : texture.rgba) { h ^= b; h *= 1099511628211ull; }
+                static std::unordered_map<uint32_t, uint64_t> last;
+                const auto it = last.find(raster);
+                std::fprintf(stderr, "[raster-prep] raster=%X %ux%u rev=%llu hash=%016llX %s\n", raster, texture.width, texture.height,
+                             static_cast<unsigned long long>(version.revision), static_cast<unsigned long long>(h),
+                             it == last.end() ? "new" : (it->second == h ? "SAME" : "changed"));
+                last[raster] = h;
+            }
+        }
+        ContentEntry *newContent = nullptr;
+        if (keyed)
+        {
+            // A new content: its name is a process-unique id, not a raster address.
+            char contentName[24];
+            std::snprintf(contentName, sizeof(contentName), "~%llX", static_cast<unsigned long long>(g_contentNextId++));
+            ContentEntry &entry = g_contentTextures[contentKey];
+            entry.key = contentKey;
+            entry.name = contentName;
+            entry.bytes = static_cast<uint32_t>(std::min<size_t>(texture.rgba.size(), 0xFFFFFFFFu));
+            entry.refs = 1u;
+            if (contentOn == 2)
+                entry.verifyCopy = texture.rgba;
+            newContent = &entry;
+            ++g_contentCounters.misses;
+        }
         if (found != g_nativeRasterResources.end())
         {
-            p3fes_native_present::retireTexture(found->second.textureName);
-            g_textureMinAlpha.erase(found->second.textureName);
-            ++g_minAlphaVersion;
+            if (found->second.content)
+                contentRelease(found->second.content);
+            else
+            {
+                p3fes_native_present::retireTexture(found->second.textureName);
+                g_textureMinAlpha.erase(found->second.textureName);
+                ++g_minAlphaVersion;
+            }
         }
         // Short, so the name fits the std::string small buffer (15 chars on libstdc++): every draw
         // copies these names and a heap allocation per copy is costly on the Vita's CPU. The raster
@@ -5159,7 +5461,7 @@ namespace
         std::snprintf(name, sizeof(name), "%X.%llX.%llX", raster,
                       static_cast<unsigned long long>(version.generation),
                       static_cast<unsigned long long>(version.revision));
-        texture.name = name;
+        texture.name = newContent ? newContent->name : std::string(name);
         textureName = texture.name;
         static const bool dumpTextures = [] {
             const char *value = std::getenv("P3FES_TEXTURE_DUMP");
@@ -5191,9 +5493,9 @@ namespace
             g_textureMinAlpha[textureName] = lowest;
             ++g_minAlphaVersion;
         }
-        p3fes_native_present::defineTexture(texture, version.revision);
+        p3fes_native_present::defineTexture(texture, newContent ? 1u : version.revision);
         NativeRasterResource &resource = g_nativeRasterResources[raster];
-        resource = {version, textureName};
+        resource = {version, textureName, newContent};
         cached = {raster, lifecycleEpoch, &resource.textureName};
         ++g_texturePrepares;
         return true;
@@ -6234,6 +6536,7 @@ namespace
                 std::fprintf(stderr, "[p3fes-textures] prepared=%llu live=%u fields=%llu\n",
                              static_cast<unsigned long long>(g_texturePrepares), static_cast<unsigned>(g_nativeRasterResources.size()),
                              static_cast<unsigned long long>(fields));
+                logContentCounters();
                 p3fes_native_rasters::logCounters();
                 p3fes_native_texture_access::logCounters();
                 p3fes_native_camera::logCounters();
@@ -7188,6 +7491,7 @@ namespace
         if (nativeEnabled)
         {
             p3fes_native_rasters::reset();
+            contentReset();
             g_nativeRasterResources.clear();
             g_textureMinAlpha.clear();
             ++g_minAlphaVersion;
