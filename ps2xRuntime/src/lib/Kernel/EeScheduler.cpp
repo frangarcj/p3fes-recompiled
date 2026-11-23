@@ -89,6 +89,13 @@ namespace
         return v;
     }
     uint64_t g_fhIopLast[5] = {0, 0, 0, 0, 0};
+    // Coarse per-frame event accumulators (PS2X_FRAME_LIST): kind 0 = EE-side sceCdRead (CD.cpp / Support.h), 1 = guest
+    // texture preparation, 2 = texture upload, 3 = vertex-buffer bake, 4..7 free for other owners. Atomic because the
+    // render thread may feed some of them; one clock read per coarse event, never per hot call.
+    constexpr int kFhEventKinds = 8;
+    const char *const kFhEventNames[kFhEventKinds] = {"cd", "texprep", "upload", "bake", "ev4", "ev5", "ev6", "ev7"};
+    std::atomic<uint64_t> g_fhEvUs[kFhEventKinds], g_fhEvCount[kFhEventKinds], g_fhEvBytes[kFhEventKinds], g_fhEvMaxUs[kFhEventKinds];
+    uint64_t g_fhEvLastUs[kFhEventKinds] = {}, g_fhEvLastCount[kFhEventKinds] = {}, g_fhEvLastBytes[kFhEventKinds] = {};
     uint64_t g_fhLastWall = 0u, g_fhLastRun = 0u, g_fhLastTick = 0u, g_fhWindowStart = 0u;
     uint64_t g_fhLastPace = 0u, g_fhLastEvt = 0u, g_fhLastLock = 0u, g_fhLastCap = 0u;
     double g_fhWorstWall = 0.0, g_fhWorstCpu = 0.0, g_fhPrintMs = 0.0;
@@ -114,7 +121,8 @@ namespace
         }
     };
 
-    void frameHistFrame(uint64_t tick, bool capped)
+    uint64_t g_fhLastEeCycle = 0u;
+    void frameHistFrame(uint64_t tick, bool capped, uint64_t eeCycle)
     {
         const uint64_t wall = fhNowUs(), run = fhRunUs();
         if (g_fhLastWall != 0u)
@@ -139,16 +147,37 @@ namespace
             ps2xIopFrameCounters(iop);
             if (listMs > 0.0 && (wallMs >= listMs || cpuMs >= listMs * 0.85))
             {
-                std::fprintf(stderr, "[fdip] seq=%llu t=%.3f wall=%.1f cpu=%.1f pace=%.1f event=%.1f lock=%.1f io=%.1f iop-sync n=%llu wait=%.2f tail=%.2f hold=%.2f tail-ee-ms=%.2f\n",
+                std::fprintf(stderr, "[fdip] seq=%llu t=%.3f wall=%.1f cpu=%.1f pace=%.1f event=%.1f lock=%.1f io=%.1f iop-sync n=%llu wait=%.2f tail=%.2f hold=%.2f tail-ee-ms=%.2f ee-model-ms=%.1f\n",
                              static_cast<unsigned long long>(g_ps2FrameSeq.load(std::memory_order_relaxed)), wall / 1e6, wallMs, cpuMs,
                              (g_fhPacingUs - g_fhLastPace) / 1000.0, (g_fhEventUs - g_fhLastEvt) / 1000.0, (g_fhLockUs - g_fhLastLock) / 1000.0,
                              (g_fhIoUs - g_fhLastIo) / 1000.0, static_cast<unsigned long long>(iop[0] - g_fhIopLast[0]),
                              (iop[1] - g_fhIopLast[1]) / 1000.0, (iop[2] - g_fhIopLast[2]) / 1000.0, (iop[3] - g_fhIopLast[3]) / 1000.0,
-                             (iop[4] - g_fhIopLast[4]) / 294912.0);
+                             (iop[4] - g_fhIopLast[4]) / 294912.0, (eeCycle - g_fhLastEeCycle) / 294912.0);
             }
             for (int i = 0; i < 5; ++i) g_fhIopLast[i] = iop[i];
+            // Coarse event totals of this frame (printed only for the frames the [fdip] line is for).
+            {
+                char evs[256];
+                evs[0] = '\0';
+                int en = 0;
+                for (int k = 0; k < kFhEventKinds; ++k)
+                {
+                    const uint64_t us = g_fhEvUs[k].load(std::memory_order_relaxed), cnt = g_fhEvCount[k].load(std::memory_order_relaxed),
+                                   by = g_fhEvBytes[k].load(std::memory_order_relaxed);
+                    if (cnt != g_fhEvLastCount[k] && en < static_cast<int>(sizeof(evs)) - 70)
+                        en += std::snprintf(evs + en, sizeof(evs) - en, " %s[n=%llu ms=%.1f kb=%llu max=%.1f]", kFhEventNames[k],
+                                            static_cast<unsigned long long>(cnt - g_fhEvLastCount[k]), (us - g_fhEvLastUs[k]) / 1000.0,
+                                            static_cast<unsigned long long>((by - g_fhEvLastBytes[k]) / 1024u),
+                                            g_fhEvMaxUs[k].load(std::memory_order_relaxed) / 1000.0);
+                    g_fhEvMaxUs[k].store(0u, std::memory_order_relaxed);
+                    g_fhEvLastUs[k] = us; g_fhEvLastCount[k] = cnt; g_fhEvLastBytes[k] = by;
+                }
+                if (listMs > 0.0 && (wallMs >= listMs || cpuMs >= listMs * 0.85) && en > 0)
+                    std::fprintf(stderr, "[fdip-ev] seq=%llu%s\n", static_cast<unsigned long long>(g_ps2FrameSeq.load(std::memory_order_relaxed)), evs);
+            }
         }
         g_ps2FrameSeq.fetch_add(1u, std::memory_order_relaxed);
+        g_fhLastEeCycle = eeCycle;
         (void)tick; (void)capped;
         g_fhLastWall = wall; g_fhLastRun = run; g_fhLastTick = tick;
         g_fhLastPace = g_fhPacingUs; g_fhLastEvt = g_fhEventUs; g_fhLastLock = g_fhLockUs; g_fhLastCap = g_fhCapFields; g_fhLastIo = g_fhIoUs;
@@ -225,7 +254,77 @@ extern "C" void ps2xFrameHistNoteRead(uint64_t startUs, size_t bytes)
     if (us >= 20000u)
         std::fprintf(stderr, "[io-slow] t=%.2f read of %u bytes took %.1f ms\n", fhNowUs() / 1e6, static_cast<unsigned>(bytes), us / 1000.0);
 }
+// Coarse event accounting for the [fdip-ev] line (see kFhEventNames). startUs comes from ps2xFrameHistNowUs() (0 = off).
+extern "C" void ps2xFrameHistNoteEvent(int kind, uint64_t startUs, uint64_t bytes)
+{
+    if (startUs == 0u || kind < 0 || kind >= kFhEventKinds) return;
+    const uint64_t us = fhNowUs() - startUs;
+    g_fhEvUs[kind].fetch_add(us, std::memory_order_relaxed);
+    g_fhEvCount[kind].fetch_add(1u, std::memory_order_relaxed);
+    g_fhEvBytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+    uint64_t old = g_fhEvMaxUs[kind].load(std::memory_order_relaxed);
+    while (us > old && !g_fhEvMaxUs[kind].compare_exchange_weak(old, us, std::memory_order_relaxed)) {}
+}
 extern "C" int ps2xFrameHistEnabled() { return frameHistOn() ? 1 : 0; }
+
+namespace
+{
+    // PS2X_PC_SAMPLE=<ms> (with PS2X_FRAME_HIST=1): a 1 ms sampler of the running guest context's pc (the generated code
+    // stores the callee's entry there at every call and the return label after it), printed as one [pc-frame] line per
+    // game frame whose samples reach <ms>. Unlike PS2X_EE_SAMPLE it sees through direct calls, so it names the guest
+    // function that really spends the time (pc -> function through p3fes_map.csv, see p3fes/scripts/perf/pcframe_report.py).
+    // "wait" samples are the scheduler's pacing / event waits. Costs nothing when off; the sampler thread only reads.
+    std::atomic<R5900Context *> g_pcSampleCtx{nullptr};
+    uint32_t pcSampleMs()
+    {
+        static const uint32_t v = [] { const char *e = std::getenv("PS2X_PC_SAMPLE"); return e ? static_cast<uint32_t>(std::atol(e)) : 0u; }();
+        return v;
+    }
+    void pcSamplerLoop(uint32_t thresholdMs)
+    {
+        std::unordered_map<uint32_t, uint32_t> counts;
+        uint64_t seq = g_ps2FrameSeq.load(std::memory_order_relaxed);
+        uint32_t samples = 0u, waits = 0u;
+        auto next = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            next += std::chrono::milliseconds(1);
+            std::this_thread::sleep_until(next);
+            const uint64_t now = g_ps2FrameSeq.load(std::memory_order_relaxed);
+            if (now != seq)
+            {
+                if (samples >= thresholdMs)
+                {
+                    std::vector<std::pair<uint32_t, uint32_t>> v(counts.begin(), counts.end());
+                    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                    char line[1024];
+                    int n = std::snprintf(line, sizeof(line), "[pc-frame] seq=%llu samples=%u wait=%u busy=%u top:", static_cast<unsigned long long>(seq), samples, waits, samples - waits);
+                    for (size_t i = 0; i < v.size() && i < 24 && n > 0 && n < static_cast<int>(sizeof(line)) - 24; ++i)
+                        n += std::snprintf(line + n, sizeof(line) - n, " %08X=%u", v[i].first, v[i].second);
+                    std::fprintf(stderr, "%s\n", line);
+                }
+                counts.clear();
+                samples = waits = 0u;
+                seq = now;
+            }
+            ++samples;
+            if (g_ps2EeSampleCurrent.load(std::memory_order_relaxed) >= 0xFFFFFF00u) { ++waits; continue; } // FhScopedWait's sentinels
+            if (R5900Context *c = g_pcSampleCtx.load(std::memory_order_relaxed))
+                ++counts[c->pc];
+        }
+    }
+    void pcSampleNote(R5900Context *ctx)
+    {
+        static const bool started = []
+        {
+            const uint32_t ms = pcSampleMs();
+            if (ms != 0u) std::thread(pcSamplerLoop, ms).detach();
+            return true;
+        }();
+        (void)started;
+        g_pcSampleCtx.store(ctx, std::memory_order_relaxed);
+    }
+}
 
 namespace
 {
@@ -881,6 +980,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 #endif
     g_busyCyclesThisField += cycles; // charged by guest code (generated back edges, dispatches)
     accountCycles(cycles);
+    if (pcSampleMs() != 0u) pcSampleNote(currentContext());
 
     FrameCap &cap = frameCap();
     if (cap.addr != 0u && m_rdram)
@@ -890,7 +990,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         if (count != cap.lastCount)
         {
             const uint64_t tick = m_vsyncTick;
-            if (frameHistOn()) frameHistFrame(tick, false);
+            if (frameHistOn()) frameHistFrame(tick, false, m_eeCycle);
             if (vsyncSlipOn())
             {
                 g_slipFrameStart = std::chrono::steady_clock::now();

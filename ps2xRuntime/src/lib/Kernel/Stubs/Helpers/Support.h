@@ -7,6 +7,9 @@
 #include <psp2/io/stat.h>
 #endif
 
+extern "C" uint64_t ps2xFrameHistNowUs();                                           // EeScheduler.cpp (0 unless PS2X_FRAME_HIST / PS2X_STALL_DIAG)
+extern "C" void ps2xFrameHistNoteEvent(int kind, uint64_t startUs, uint64_t bytes); // EeScheduler.cpp: [fdip-ev] accumulators
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -445,7 +448,9 @@ namespace
             return true;
         }
 
+#if !defined(PLATFORM_VITA)
         std::memset(dst, 0, byteCount);
+#endif
 #if defined(PLATFORM_VITA)
         const std::string nativePath = path.string();
         // CRI's CVM layer issues lots of small sector reads. Reopening a 3 GiB
@@ -456,25 +461,55 @@ namespace
         // turn arbitrary disc contents into an unbounded descriptor cache.
         const bool keepOpen = toLowerAscii(path.extension().string()) == ".cvm";
         static std::mutex cachedFileMutex;
-        static std::unordered_map<std::string, SceUID> cachedFiles;
+        // P3FES_CD_FDPOOL=<n> (default 1 = one descriptor per archive, the old behaviour): up to n descriptors per archive,
+        // each remembering where its last read ended; a read goes to the one that ends closest BEFORE the requested offset
+        // (a FAT driver that walks the cluster chain from the descriptor's position then walks the least), a new one is
+        // opened while the pool has room. See [io-bench] (p3fes_native_fnprof.cpp) for the measured seek costs.
+        struct PooledFd { SceUID fd; uint64_t end; };
+        static std::unordered_map<std::string, std::vector<PooledFd>> cachedFiles;
+        static const size_t poolSize = [] { const char *v = std::getenv("P3FES_CD_FDPOOL"); const long n = v ? std::atol(v) : 1; return static_cast<size_t>(n < 1 ? 1 : (n > 8 ? 8 : n)); }();
         std::unique_lock<std::mutex> cachedLock(cachedFileMutex, std::defer_lock);
 
         SceUID file = -1;
+        PooledFd *slot = nullptr;
         if (keepOpen)
         {
             cachedLock.lock();
-            const auto found = cachedFiles.find(nativePath);
-            if (found != cachedFiles.end())
-                file = found->second;
-            else
+            std::vector<PooledFd> &pool = cachedFiles[nativePath];
+            PooledFd *behind = nullptr, *ahead = nullptr;
+            for (PooledFd &f : pool)
             {
-                file = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
-                if (file >= 0)
-                    cachedFiles.emplace(nativePath, file);
+                if (f.end <= offsetBytes) { if (!behind || f.end > behind->end) behind = &f; }
+                else if (!ahead || f.end < ahead->end) ahead = &f;
             }
+            // a descriptor ending within 4 MB behind the offset is as good as it gets; else grow the pool if allowed
+            const bool near = behind && offsetBytes - behind->end <= (4u << 20);
+            if (near || (pool.size() >= poolSize && (behind || ahead)))
+                slot = behind ? behind : ahead;
+            else if (pool.size() < poolSize)
+            {
+                const SceUID opened = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
+                if (opened >= 0)
+                {
+                    pool.push_back({opened, 0u});
+                    slot = &pool.back();
+                }
+            }
+            if (slot)
+                file = slot->fd;
         }
         else
             file = sceIoOpen(nativePath.c_str(), SCE_O_RDONLY, 0);
+
+        auto dropSlot = [&]()
+        {
+            if (!slot)
+                return;
+            sceIoClose(slot->fd);
+            std::vector<PooledFd> &pool = cachedFiles[nativePath];
+            pool.erase(pool.begin() + (slot - pool.data()));
+            slot = nullptr;
+        };
 
         if (file < 0)
         {
@@ -486,10 +521,7 @@ namespace
         if (position < 0 || static_cast<uint64_t>(position) != offsetBytes)
         {
             if (keepOpen)
-            {
-                sceIoClose(file);
-                cachedFiles.erase(nativePath);
-            }
+                dropSlot();
             else
                 sceIoClose(file);
             g_lastCdError = -1;
@@ -506,15 +538,18 @@ namespace
             }
             totalRead += static_cast<size_t>(read);
         }
+        if (totalRead < byteCount)
+            std::memset(dst + totalRead, 0, byteCount - totalRead); // a short read leaves zeros, as the old up-front memset did
         if (!keepOpen)
             sceIoClose(file);
         else if (totalRead != byteCount)
         {
             // Drop a failed cached descriptor so the next request gets one
             // clean reopen instead of repeatedly reusing a bad handle.
-            sceIoClose(file);
-            cachedFiles.erase(nativePath);
+            dropSlot();
         }
+        else
+            slot->end = offsetBytes + totalRead;
         g_lastCdError = totalRead == byteCount ? 0 : -1;
         return totalRead == byteCount;
 #else
@@ -551,6 +586,29 @@ namespace
 
     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
     {
+        // PS2X_FRAME_LIST diagnostics: one clock read per EE-side CD read (kind 0 of the [fdip-ev] line); 0 when off.
+        struct CdReadTimer
+        {
+            uint64_t start;
+            size_t bytes;
+            CdReadTimer(size_t b, uint32_t l) : start(ps2xFrameHistNowUs()), bytes(b), lbn(l) {}
+            uint32_t lbn;
+            ~CdReadTimer()
+            {
+                ps2xFrameHistNoteEvent(0, start, bytes);
+                if (start != 0u)
+                {
+                    // [cd-slow]: a read that blocked the game thread 10 ms or more, with where it sat relative to the previous read
+                    // (end of the last read in sectors; a jump = a seek of the archive's FAT driver, not the transfer).
+                    static uint64_t s_prevEnd = 0u;
+                    const uint64_t us = ps2xFrameHistNowUs() - start;
+                    if (us >= 10000u)
+                        std::fprintf(stderr, "[cd-slow] lbn=0x%X kb=%u took %.1f ms, jump from previous end %+lld sectors\n", lbn, static_cast<unsigned>(bytes / 1024u),
+                                     us / 1000.0, static_cast<long long>(lbn) - static_cast<long long>(s_prevEnd));
+                    s_prevEnd = static_cast<uint64_t>(lbn) + (bytes + kCdSectorSize - 1u) / kCdSectorSize;
+                }
+            }
+        } cdReadTimer(byteCount, lbn);
         for (const auto &[key, entry] : g_cdFilesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;

@@ -2,6 +2,7 @@
 #include "p3fes_native_dialogue.h"
 #include "p3fes_native_ui.h"
 #include "p3fes_native_texture_access.h"
+#include "p3fes_native_raster_lifecycle.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -2727,6 +2728,187 @@ namespace p3fes_native_frame_cuts
             return runtime.replaceFunction(address, hook);
         }
 
+
+        // ---- SkyRasterUnlock_8to32 (0x4DDAA0) / SkyRasterUnlock_4to16 (0x4DDD30) in C++ -------------------------------
+        // The guest converts a linear 8-bit / 4-bit texture into the GS block order one pixel at a time (about 40 R5900
+        // instructions per pixel, an index permutation through a 4 KB stack buffer): 40-120 ms per texture on the Vita, and
+        // a battle start or the result screen creates dozens. Same result, a 64 / 128 entry permutation table per row
+        // parity and plain 16-byte copies. P3FES_CUT_UNLOCK=1 turns it on (default OFF: the native version charges no EE
+        // cycles, so the guest sees the load take fewer fields); "verify" runs the guest function on the live RAM, then
+        // the native one on a copy of the touched rows, and counts differences. Anything unusual (width not a multiple of
+        // 32, > 1024, a buffer outside RAM) goes to the guest function.
+        // R = a0: +4 pixels, +0xC width, +0x10 height, +0x18 stride (bytes).
+        constexpr uint32_t kUnlock8to32 = 0x004DDAA0u;
+        constexpr uint32_t kUnlock4to16 = 0x004DDD30u;
+        GuestFunction g_unlock8Original = nullptr, g_unlock4Original = nullptr;
+        Mode g_unlockMode = Mode::Off;
+        uint64_t g_unlockNative = 0u, g_unlockGuest = 0u, g_unlockVerifyOk8 = 0u, g_unlockVerifyOk = 0u, g_unlockVerifyBad = 0u, g_unlockUs = 0u, g_unlockGuestUs = 0u;
+        uint8_t g_unlockTab8[2][64];
+        uint8_t g_unlockTab4[2][128];
+        bool g_unlockTabsBuilt = false;
+
+        void buildUnlockTables()
+        {
+            if (g_unlockTabsBuilt)
+                return;
+            for (unsigned alt = 0; alt < 2u; ++alt)
+            {
+                for (uint32_t n = 0; n < 64u; ++n)
+                {
+                    const uint32_t base = ((n & 2u) << 2) | ((n & 4u) >> 2) | ((n & 8u) >> 2) | ((n & 0x10u) >> 2) | ((n & 0x20u) >> 1);
+                    const uint32_t x = ((n & 1u) << 5) | (alt ? ((~n & 1u) << 2) : ((n & 1u) << 2));
+                    g_unlockTab8[alt][n] = static_cast<uint8_t>(base ^ x);
+                }
+                for (uint32_t n = 0; n < 128u; ++n)
+                {
+                    const uint32_t base = ((n & 2u) << 2) | ((n & 0x20u) >> 1) | ((n & 4u) >> 2) | ((n & 8u) >> 2) | ((n & 0x10u) >> 2) | ((n & 0x40u) >> 1);
+                    const uint32_t x = ((n & 1u) << 6) | (alt ? ((~n & 1u) << 2) : ((n & 1u) << 2));
+                    g_unlockTab4[alt][n] = static_cast<uint8_t>(base ^ x);
+                }
+            }
+            g_unlockTabsBuilt = true;
+        }
+
+        inline void quadCopyIn(uint8_t *dst, const uint8_t *rdram, uint32_t address) // lq: the low 4 address bits are ignored
+        {
+            std::memcpy(dst, rdram + ((address & ~15u) & PS2_RAM_MASK), 16u);
+        }
+        inline void quadCopyOut(uint8_t *rdram, uint32_t address, const uint8_t *src) // sq
+        {
+            std::memcpy(rdram + ((address & ~15u) & PS2_RAM_MASK), src, 16u);
+        }
+
+        struct UnlockGeometry { int32_t w, h; uint32_t pixels, stride; };
+        bool unlockGeometry(const uint8_t *rdram, uint32_t raster, UnlockGeometry &g)
+        {
+            g.w = static_cast<int32_t>(r32(rdram, raster + 0xCu));
+            g.h = static_cast<int32_t>(r32(rdram, raster + 0x10u));
+            g.pixels = r32(rdram, raster + 4u);
+            g.stride = r32(rdram, raster + 0x18u);
+            if (g.h <= 0 || g.w < 32 || g.w > 1024 || (g.w & 31) != 0 || g.pixels >= 0x02000000u || g.stride > 0x10000u)
+                return false;
+            // touched rows: every group of four rows from 0 .. roundup4(h), 64 bytes past the last column at most
+            const uint64_t end = static_cast<uint64_t>(g.pixels) + static_cast<uint64_t>(g.stride) * (static_cast<uint32_t>(g.h) + 7u) + 4096u;
+            return end < 0x02000000u;
+        }
+
+        void unlock8to32Native(uint8_t *rdram, const UnlockGeometry &g)
+        {
+            uint8_t rows[4][0x400 + 16];
+            uint8_t out[64];
+            for (int32_t y0 = 0; y0 < g.h; y0 += 4)
+            {
+                for (int r = 0; r < 4; ++r)
+                    for (int32_t x = 0; x < g.w; x += 16)
+                        quadCopyIn(&rows[r][x], rdram, g.pixels + g.stride * static_cast<uint32_t>(y0 + r) + static_cast<uint32_t>(x));
+                const uint8_t *tab = g_unlockTab8[(y0 & 4) != 0 ? 1 : 0];
+                for (int32_t x = 0, outX = 0; x < g.w; x += 16, outX += 32)
+                {
+                    for (int n = 0; n < 64; ++n)
+                    {
+                        const uint32_t idx = tab[n];
+                        out[n] = rows[idx >> 4][static_cast<uint32_t>(x) + (idx & 15u)];
+                    }
+                    const uint32_t a0 = g.pixels + g.stride * static_cast<uint32_t>(y0) + static_cast<uint32_t>(outX);
+                    const uint32_t a2 = g.pixels + g.stride * static_cast<uint32_t>(y0 + 2) + static_cast<uint32_t>(outX);
+                    quadCopyOut(rdram, a0, out);
+                    quadCopyOut(rdram, a0 + 16u, out + 16);
+                    quadCopyOut(rdram, a2, out + 32);
+                    quadCopyOut(rdram, a2 + 16u, out + 48);
+                }
+            }
+        }
+
+        void unlock4to16Native(uint8_t *rdram, const UnlockGeometry &g)
+        {
+            uint8_t rows[4 * 0x200 + 16];
+            uint8_t out[64];
+            const int32_t half = g.w >> 1;
+            for (int32_t y0 = 0; y0 < g.h; y0 += 4)
+            {
+                for (int r = 0; r < 4; ++r)
+                    for (int32_t x = 0; x < half; x += 16)
+                        quadCopyIn(&rows[r * 0x200 + x], rdram, g.pixels + g.stride * static_cast<uint32_t>(y0 + r) + static_cast<uint32_t>(x));
+                const uint8_t *tab = g_unlockTab4[(y0 & 4) != 0 ? 1 : 0];
+                for (int32_t a3 = 0; a3 < g.w; a3 += 32)
+                {
+                    for (int n = 0; n < 128; ++n)
+                    {
+                        const uint32_t idx = tab[n];
+                        const uint32_t pixel = ((idx >> 5) << 10) + static_cast<uint32_t>(a3) + (idx & 0x1Fu);
+                        const uint8_t byte = rows[pixel >> 1];
+                        const uint8_t nibble = (idx & 1u) ? static_cast<uint8_t>(byte >> 4) : static_cast<uint8_t>(byte & 0xFu);
+                        if (n & 1)
+                            out[n >> 1] = static_cast<uint8_t>(out[n >> 1] | (nibble << 4));
+                        else
+                            out[n >> 1] = nibble;
+                    }
+                    const uint32_t d0 = g.pixels + g.stride * static_cast<uint32_t>(y0) + static_cast<uint32_t>(a3);
+                    const uint32_t d2 = g.pixels + g.stride * static_cast<uint32_t>(y0 + 2) + static_cast<uint32_t>(a3);
+                    quadCopyOut(rdram, d0, out);
+                    quadCopyOut(rdram, d0 + 16u, out + 16);
+                    quadCopyOut(rdram, d2, out + 32);
+                    quadCopyOut(rdram, d2 + 16u, out + 48);
+                }
+            }
+        }
+
+        void unlockHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool is8)
+        {
+            GuestFunction original = is8 ? g_unlock8Original : g_unlock4Original;
+            UnlockGeometry g{};
+            const uint32_t raster = getRegU32(ctx, 4);
+            if (g_unlockMode == Mode::Off || ctx->pc != (is8 ? kUnlock8to32 : kUnlock4to16) || !unlockGeometry(rdram, raster, g))
+            {
+                if (++g_unlockGuest <= 6u && g_unlockMode != Mode::Off)
+                    std::fprintf(stderr, "[p3fes-cuts] unlock%s left to the guest: raster=%08X w=%d h=%d pixels=%08X stride=%u\n", is8 ? "8to32" : "4to16", raster, static_cast<int>(r32(rdram, raster + 0xCu)),
+                                 static_cast<int>(r32(rdram, raster + 0x10u)), r32(rdram, raster + 4u), r32(rdram, raster + 0x18u));
+                original(rdram, ctx, runtime);
+                return;
+            }
+            const uint32_t ra = getRegU32(ctx, 31);
+            if (g_unlockMode == Mode::Verify)
+            {
+                const size_t bytes = static_cast<size_t>(g.stride) * (static_cast<uint32_t>(g.h) + 7u) + 4096u;
+                const uint32_t start = g.pixels & PS2_RAM_MASK;
+                std::vector<uint8_t> before(rdram + start, rdram + start + bytes);
+                R5900Context copy = *ctx;
+                const auto g0 = std::chrono::steady_clock::now();
+                original(rdram, ctx, runtime);
+                g_unlockGuestUs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g0).count());
+                if (ctx->pc != ra)
+                    return; // the guest did not come back (checkpoint yield): nothing to compare
+                std::vector<uint8_t> guest(rdram + start, rdram + start + bytes);
+                std::memcpy(rdram + start, before.data(), bytes);
+                (void)copy;
+                const auto n0 = std::chrono::steady_clock::now();
+                if (is8) unlock8to32Native(rdram, g); else unlock4to16Native(rdram, g);
+                g_unlockUs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - n0).count());
+                const bool same = std::memcmp(rdram + start, guest.data(), bytes) == 0;
+                if (same) { ++g_unlockVerifyOk; if (is8) ++g_unlockVerifyOk8; }
+                else if (++g_unlockVerifyBad <= 8u)
+                {
+                    size_t first = 0u;
+                    while (first < bytes && rdram[start + first] == guest[first]) ++first;
+                    std::fprintf(stderr, "[p3fes-cuts] unlock%s verify MISMATCH raster=%08X %dx%d stride=%u first diff at +%u native=%02X guest=%02X\n", is8 ? "8to32" : "4to16", raster,
+                                 g.w, g.h, g.stride, static_cast<unsigned>(first), rdram[start + first], guest[first]);
+                }
+                std::memcpy(rdram + start, guest.data(), bytes); // the guest's result stays
+                return;
+            }
+            // The lifecycle wrapper normally in front of the guest function bumps the raster's version: do it here too.
+            p3fes_native_rasters::invalidate(raster);
+            static const bool timed = std::getenv("P3FES_RESOURCE_DIAG") != nullptr;
+            const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (is8) unlock8to32Native(rdram, g); else unlock4to16Native(rdram, g);
+            if (timed)
+                g_unlockUs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+            ++g_unlockNative;
+            returnToCaller(ctx);
+        }
+        void unlock8Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) { unlockHook(rdram, ctx, runtime, true); }
+        void unlock4Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) { unlockHook(rdram, ctx, runtime, false); }
+
         // ---- probes: the generic sprite/panel drawer, timed with its nested hooks attributed to it -------------
         constexpr uint32_t kMaestroDraw = 0x001127D0u;
         GuestFunction g_maestroOriginal = nullptr;
@@ -2888,6 +3070,20 @@ namespace p3fes_native_frame_cuts
         const bool dbprt = dbprtMode != Mode::Off && installOne(runtime, kDbprtMain, &dbprtMainHook, g_dbprtOriginal);
         std::fprintf(stderr, "[p3fes-native] cut debug text overlay hook=%u\n", dbprt ? 1u : 0u);
         any |= dbprt;
+        {
+            // Native raster unlock conversions: default OFF (see the comment at kUnlock8to32); =1 on, =verify compares.
+            const char *v = std::getenv("P3FES_CUT_UNLOCK");
+            g_unlockMode = !v || !*v || (v[0] == '0' && !v[1]) ? Mode::Off : (std::strcmp(v, "verify") == 0 ? Mode::Verify : Mode::On);
+            if (g_unlockMode != Mode::Off)
+            {
+                buildUnlockTables();
+                const bool a = installOne(runtime, kUnlock8to32, &unlock8Hook, g_unlock8Original);
+                const bool b = installOne(runtime, kUnlock4to16, &unlock4Hook, g_unlock4Original);
+                std::fprintf(stderr, "[p3fes-native] cut raster unlock conversions hooks=%u/%u mode=%s\n", a ? 1u : 0u, b ? 1u : 0u, g_unlockMode == Mode::Verify ? "verify" : "on");
+                if (!a || !b) { g_unlockMode = Mode::Off; }
+                any |= a || b;
+            }
+        }
         any |= p3fes_native_dialogue::install(runtime);
         {
             const char *v = std::getenv("P3FES_CUT_PKT");
@@ -2949,6 +3145,10 @@ namespace p3fes_native_frame_cuts
                          static_cast<unsigned long long>(g_rsTexVerifyUnwound));
             for (unsigned i = 0; i < 64u; ++i) g_rsCalls[i] = g_rsSame[i] = g_rsSameChanged[i] = 0u;
         }
+        if (g_unlockMode != Mode::Off)
+            std::fprintf(stderr, "[p3fes-cuts] raster unlock native=%llu guest=%llu native-ms=%.1f guest-ms(verify)=%.1f verify ok=%llu (8to32 %llu) bad=%llu\n", static_cast<unsigned long long>(g_unlockNative),
+                         static_cast<unsigned long long>(g_unlockGuest), g_unlockUs / 1000.0, g_unlockGuestUs / 1000.0, static_cast<unsigned long long>(g_unlockVerifyOk), static_cast<unsigned long long>(g_unlockVerifyOk8),
+                         static_cast<unsigned long long>(g_unlockVerifyBad));
         std::fprintf(stderr, "[p3fes-cuts] sfd-spr skipped=%llu run=%llu | mc-free hits=%llu counts=%llu\n",
                      static_cast<unsigned long long>(g_sfdSwapSkipped), static_cast<unsigned long long>(g_sfdSwapRun),
                      static_cast<unsigned long long>(g_mcFreeHits), static_cast<unsigned long long>(g_mcFreeCounts));

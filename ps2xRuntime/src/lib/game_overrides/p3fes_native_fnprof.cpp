@@ -11,6 +11,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
+#include <thread>
+#include <vector>
+#if defined(PLATFORM_VITA)
+#include <psp2/io/fcntl.h>
+#include <psp2/kernel/processmgr.h>
+#endif
 
 // See p3fes_native_fnprof.h. A measurement tool: it is only installed when P3FES_FN_PROF is set.
 namespace p3fes_native_fnprof
@@ -153,8 +159,111 @@ namespace p3fes_native_fnprof
         }
     }
 
+
+    namespace
+    {
+        // P3FES_IO_BENCH=<path of a big archive> (diagnostic): 20 s after boot a detached thread times seek+read of 256 KB
+        // blocks at pseudo-random offsets of the file, to tell a slow seek (cluster-chain walk of the FAT driver) from slow
+        // reads: same descriptor / fresh descriptor per read / ascending / descending / repeat / sequential throughput.
+        // One [io-bench] line per test; the game keeps running, so run it on a title screen.
+        uint64_t benchNowUs()
+        {
+#if defined(PLATFORM_VITA)
+            return sceKernelGetProcessTimeWide();
+#else
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+        }
+        struct BenchFile
+        {
+#if defined(PLATFORM_VITA)
+            SceUID fd = -1;
+            bool open(const char *p) { fd = sceIoOpen(p, SCE_O_RDONLY, 0); return fd >= 0; }
+            bool seek(uint64_t o) { return sceIoLseek(fd, static_cast<SceOff>(o), SCE_SEEK_SET) == static_cast<SceOff>(o); }
+            int64_t read(void *b, size_t n) { return sceIoRead(fd, b, n); }
+            void close() { if (fd >= 0) sceIoClose(fd); fd = -1; }
+            static uint64_t sizeOf(const char *p) { SceUID f = sceIoOpen(p, SCE_O_RDONLY, 0); if (f < 0) return 0; const SceOff e = sceIoLseek(f, 0, SCE_SEEK_END); sceIoClose(f); return e < 0 ? 0u : static_cast<uint64_t>(e); }
+#else
+            std::FILE *f = nullptr;
+            bool open(const char *p) { f = std::fopen(p, "rb"); return f != nullptr; }
+            bool seek(uint64_t o) { return fseeko(f, static_cast<off_t>(o), SEEK_SET) == 0; }
+            int64_t read(void *b, size_t n) { return static_cast<int64_t>(std::fread(b, 1, n, f)); }
+            void close() { if (f) std::fclose(f); f = nullptr; }
+            static uint64_t sizeOf(const char *p) { std::FILE *f = std::fopen(p, "rb"); if (!f) return 0; fseeko(f, 0, SEEK_END); const off_t e = ftello(f); std::fclose(f); return e < 0 ? 0u : static_cast<uint64_t>(e); }
+#endif
+        };
+        void benchOne(const std::string &path);
+        void benchThread(std::string paths)
+        {
+#if defined(PLATFORM_VITA)
+            sceKernelDelayThread(20u * 1000u * 1000u);
+#else
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+#endif
+            size_t pos = 0u;
+            while (pos <= paths.size())
+            {
+                size_t comma = paths.find(',', pos);
+                if (comma == std::string::npos) comma = paths.size();
+                if (comma > pos) benchOne(paths.substr(pos, comma - pos));
+                pos = comma + 1u;
+            }
+            std::fprintf(stderr, "[io-bench] done\n");
+        }
+        void benchOne(const std::string &path)
+        {
+            const uint64_t size = BenchFile::sizeOf(path.c_str());
+            constexpr size_t kBlock = 256u * 1024u;
+            std::fprintf(stderr, "[io-bench] file %s size %llu MB\n", path.c_str(), static_cast<unsigned long long>(size >> 20));
+            if (size < 64u * kBlock) { std::fprintf(stderr, "[io-bench] %s: size %llu, nothing to do\n", path.c_str(), static_cast<unsigned long long>(size)); return; }
+            std::vector<uint8_t> buffer(kBlock);
+            std::vector<uint64_t> offsets;
+            uint64_t x = 0x9E3779B97F4A7C15ull;
+            for (int i = 0; i < 24; ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; offsets.push_back((x % ((size - kBlock) / 2048u)) * 2048u); }
+            auto run = [&](const char *name, const std::vector<uint64_t> &list, bool fresh)
+            {
+                BenchFile file;
+                if (!fresh && !file.open(path.c_str())) return;
+                double seekMs = 0.0, readMs = 0.0, worst = 0.0, total = 0.0;
+                std::string detail;
+                for (uint64_t offset : list)
+                {
+                    if (fresh && !file.open(path.c_str())) return;
+                    const uint64_t t0 = benchNowUs();
+                    file.seek(offset);
+                    const uint64_t t1 = benchNowUs();
+                    file.read(buffer.data(), kBlock);
+                    const uint64_t t2 = benchNowUs();
+                    if (fresh) file.close();
+                    seekMs += (t1 - t0) / 1000.0; readMs += (t2 - t1) / 1000.0;
+                    worst = std::max(worst, (t2 - t0) / 1000.0);
+                    if (detail.size() < 400) { char b[48]; std::snprintf(b, sizeof b, " %.0f/%.0f", (t1 - t0) / 1000.0, (t2 - t1) / 1000.0); detail += b; }
+                }
+                file.close();
+                total = seekMs + readMs;
+                std::fprintf(stderr, "[io-bench] %-22s n=%u total=%.0f ms (seek %.0f read %.0f) avg=%.1f worst=%.1f | seek/read ms:%s\n", name, static_cast<unsigned>(list.size()), total, seekMs, readMs,
+                             total / list.size(), worst, detail.c_str());
+            };
+            std::vector<uint64_t> asc = offsets, desc;
+            std::sort(asc.begin(), asc.end());
+            desc.assign(asc.rbegin(), asc.rend());
+            run("random same-fd", offsets, false);
+            run("random fresh-fd", offsets, true);
+            run("random same-fd repeat", offsets, false);
+            run("ascending same-fd", asc, false);
+            run("descending same-fd", desc, false);
+            {
+                std::vector<uint64_t> seq;
+                for (int i = 0; i < 32; ++i) seq.push_back(size / 3 + static_cast<uint64_t>(i) * kBlock);
+                run("sequential 8 MB", seq, false);
+            }
+        }
+    }
+
     bool install(PS2Runtime &runtime)
     {
+        if (const char *b = std::getenv("P3FES_IO_BENCH"); b && *b)
+            std::thread(benchThread, std::string(b)).detach();
         const char *list = std::getenv("P3FES_FN_PROF");
         if (!list || !*list)
             return false;
