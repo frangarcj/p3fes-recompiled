@@ -16,7 +16,9 @@
 #include <raylib.h>
 #include <vitaGL.h>
 #if defined(__vita__)
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #endif
 
 #include <algorithm>
@@ -167,6 +169,40 @@ std::size_t meshMergeMaxVerts()
     return limit;
 }
 
+// P3FES_SCREEN_GLCACHE (default on, =0 restores the old per-draw state setting): the screen-space path sets only the GL
+// state that differs from the previous draw and puts the baseline back once at the end of a run of screen draws instead
+// of after every draw. Pixel-identical to the old path in the A/B frame comparison (P3FES_AB_FRAME) on the console and
+// in Vita3K; the 2-D pass of the shop with its menu went from 8.9 to 5.6 ms of host thread.
+bool screenGlCacheEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_SCREEN_GLCACHE");
+        return !(value && *value == '0');
+    }();
+    return enabled;
+}
+
+// P3FES_MESH_MERGE_TWICE=0 keeps the parts drawn twice (alpha test with "frame buffer only" on failure) out of the merged
+// batches. By default they join, as long as their screen boxes do not overlap (see tryMergePart).
+bool meshMergeTwiceEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("P3FES_MESH_MERGE_TWICE");
+        return !(value && *value == '0');
+    }();
+    return enabled;
+}
+
+std::size_t meshMergeCacheBytes()
+{
+    static const std::size_t bytes = [] {
+        const char *value = std::getenv("P3FES_MESH_MERGE_CACHE_KB");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : 6144;
+        return static_cast<std::size_t>(std::max(parsed, 0l)) * 1024u;
+    }();
+    return bytes;
+}
+
 bool meshPhasesEnabled()
 {
     static const bool enabled = [] {
@@ -203,6 +239,107 @@ FitViewport fitViewport(float sourceWidth, float sourceHeight)
     return {(hostWidth - width) / 2, (hostHeight - height) / 2, width, height};
 }
 
+// Memory the GPU reads while it is drawn from: vertex and index data that a draw call points at by address.
+//
+// vitaGL's client-array draws do not always copy what they are given. The release build of vitaGL is made with
+// INDICES_DRAW_SPEEDHACK (indices are used where they stand) and DRAW_SPEEDHACK=2 (a vertex stream of more than
+// 32 KB is used where it stands), and in any case sceGxm draws are only recorded: the GPU reads the data when the
+// scene is rendered, after the frame is submitted and possibly while the next frame is being built. A draw's
+// arrays must therefore stay unchanged until the GPU is done with the scene. This is a ring of kSlots frames; a
+// slot is reused only kSlots frames later (vitaGL itself rests on the same assumption with its display buffer
+// count: its circular pool has one slice per display buffer). Chunks are kept for reuse, so a steady scene
+// allocates nothing.
+class FrameArena
+{
+public:
+    static constexpr std::size_t kSlots = 6;
+    static constexpr std::size_t kChunkBytes = 256u * 1024u;
+
+    FrameArena() = default;
+    FrameArena(const FrameArena &) = delete;
+    FrameArena &operator=(const FrameArena &) = delete;
+    ~FrameArena()
+    {
+        for (Slot &slot : m_slots)
+            for (Chunk &chunk : slot.chunks)
+                std::free(chunk.raw);
+    }
+
+    // Starts the next frame's slot (the oldest one) empty.
+    void nextFrame()
+    {
+        m_current = (m_current + 1u) % kSlots;
+        Slot &slot = m_slots[m_current];
+        slot.chunk = 0;
+        slot.used = 0;
+    }
+
+    // 16-byte aligned, valid until kSlots - 1 more nextFrame() calls. Null when memory is exhausted.
+    void *allocate(std::size_t bytes)
+    {
+        bytes = (bytes + 15u) & ~static_cast<std::size_t>(15u);
+        Slot &slot = m_slots[m_current];
+        while (slot.chunk < slot.chunks.size() && slot.chunks[slot.chunk].size - slot.used < bytes)
+        {
+            ++slot.chunk;
+            slot.used = 0;
+        }
+        if (slot.chunk == slot.chunks.size())
+        {
+            const std::size_t size = std::max(kChunkBytes, bytes);
+            void *raw = std::malloc(size + 15u);
+            if (!raw)
+                return nullptr;
+            const std::uintptr_t aligned = (reinterpret_cast<std::uintptr_t>(raw) + 15u) & ~static_cast<std::uintptr_t>(15u);
+            slot.chunks.push_back({static_cast<std::uint8_t *>(raw), reinterpret_cast<std::uint8_t *>(aligned), size});
+            slot.used = 0;
+        }
+        Chunk &chunk = slot.chunks[slot.chunk];
+        void *result = chunk.data + slot.used;
+        slot.used += bytes;
+        m_bytes += bytes;
+        return result;
+    }
+
+    // Copies `bytes` of `source` into the arena.
+    void *copy(const void *source, std::size_t bytes)
+    {
+        void *destination = allocate(bytes);
+        if (destination)
+            std::memcpy(destination, source, bytes);
+        return destination;
+    }
+
+    std::uint64_t bytesAllocated() const { return m_bytes; }
+    std::size_t bytesHeld() const
+    {
+        std::size_t total = 0;
+        for (const Slot &slot : m_slots)
+            for (const Chunk &chunk : slot.chunks)
+                total += chunk.size;
+        return total;
+    }
+
+private:
+    struct Chunk
+    {
+        std::uint8_t *raw;  // what malloc returned
+        std::uint8_t *data; // 16-byte aligned inside it
+        std::size_t size;
+    };
+    struct Slot
+    {
+        std::vector<Chunk> chunks;
+        std::size_t chunk = 0, used = 0;
+    };
+    Slot m_slots[kSlots];
+    std::size_t m_current = 0;
+    std::uint64_t m_bytes = 0;
+};
+
+// Bytes of DrawPart::mergeVerts held (P3FES_MESH_MERGE_CACHE_KB bounds them).
+std::size_t g_mergeCacheBytes = 0;
+
 struct DrawPart
 {
     GLuint vertexBuffer = 0;
@@ -229,6 +366,12 @@ struct DrawPart
     std::vector<Instance> instances;
     std::uint32_t slotUsedFrame = 0;
     std::vector<std::uint16_t> cpuIndices; // small unskinned parts only: triangle list, for the merged draw (P3FES_MESH_MERGE)
+    // The part's vertices baked in world space for the merged draw, with the inputs they were made from: a part that
+    // is drawn again with the same inputs (props that do not move) is copied instead of lit and transformed again.
+    detail::StaticVertexCacheKey mergeKey;
+    std::vector<GpuVertex> mergeVerts;
+    std::array<float, 6> bounds{}; // local axis-aligned box (min xyz, max xyz) of the vertices, for the screen-overlap test of two-pass merges
+    bool hasBounds = false;
     std::vector<std::uint8_t> usedBones; // skinned: bones with a usable weight in this part
     detail::SkinLayout skinLayout;       // skinned: rigid runs per bone, then blended vertices (mesh_regen.h)
     bool lighting = false;
@@ -752,6 +895,7 @@ void deleteParts(std::vector<DrawPart> &parts)
             if (skin.indexBuffer)
                 glDeleteBuffers(1, &skin.indexBuffer);
         }
+        g_mergeCacheBytes -= std::min(g_mergeCacheBytes, part.mergeVerts.capacity() * sizeof(GpuVertex));
         if (part.vertexBuffer)
             glDeleteBuffers(1, &part.vertexBuffer);
         for (DrawPart::Instance &instance : part.instances)
@@ -774,6 +918,7 @@ public:
             return true;
         m_merge.enabled = meshMergeEnabled();
         m_gl.on = meshGlCacheEnabled() || m_merge.enabled;
+        m_g2.on = screenGlCacheEnabled();
         // In the Vita runtime vitaGL is already initialized by the host shim.
         // Borrow that one global context; only the standalone viewer creates
         // and later destroys its own window/context.
@@ -917,6 +1062,7 @@ public:
     bool uploadMesh(MeshId id, const MeshData &source, std::string &error) override
     {
         leaveMesh();
+        end2D();
         if (!m_open)
         {
             error = "renderer is not open";
@@ -1067,8 +1213,18 @@ public:
             glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizei>(indices.size() * sizeof(std::uint16_t)),
                          indices.data(), GL_STATIC_DRAW);
             part.indexCount = static_cast<GLsizei>(indices.size());
-            if (meshMergeEnabled() && !part.skinned && part.sourceVertices.size() <= meshMergeMaxVerts())
+            if ((meshMergeEnabled() || std::getenv("P3FES_AB_FRAME")) && !part.skinned && part.sourceVertices.size() <= meshMergeMaxVerts())
+            {
                 part.cpuIndices = indices;
+                part.bounds = {1e30f, 1e30f, 1e30f, -1e30f, -1e30f, -1e30f};
+                for (const Vertex &v : part.sourceVertices)
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        part.bounds[static_cast<std::size_t>(c)] = std::min(part.bounds[static_cast<std::size_t>(c)], v.position[static_cast<std::size_t>(c)]);
+                        part.bounds[static_cast<std::size_t>(c) + 3u] = std::max(part.bounds[static_cast<std::size_t>(c) + 3u], v.position[static_cast<std::size_t>(c)]);
+                    }
+                part.hasBounds = !part.sourceVertices.empty();
+            }
             if (!part.vertexBuffer || !part.indexBuffer)
             {
                 error = "vitaGL failed to allocate mesh buffers";
@@ -1218,6 +1374,7 @@ public:
     {
         leaveMesh();
         ++m_instanceFrame;
+        m_arena.nextFrame();
         m_screenZLayers.clear();
         m_camera = camera;
         BeginDrawing(); // holds ps2xVitaGlMutex until EndDrawing
@@ -1329,7 +1486,7 @@ public:
                 glsAlpha(state.alphaTest);
             glsFog(state.fog);
             glsShade(state.gouraudShading);
-            glsCap(m_gl.depthTest, GL_DEPTH_TEST, state.depthTest);
+            glsCap(m_gl.depthTest, GL_DEPTH_TEST, state.depthTest, kCacheDepth);
             glsDepthMask(state.depthWrite);
             glsCull(state.cullMode);
         };
@@ -1596,13 +1753,13 @@ public:
             glsClient(m_gl.colArr, GL_COLOR_ARRAY, true);
             const auto &textureName = part.materialIndex < state.materialTextures.size()
                 ? state.materialTextures[part.materialIndex] : part.textureName;
-            auto texture = textureName.empty() ? m_textures.end() : m_textures.find(textureKey(textureName));
-            glsPointers(part.vertexBuffer, texture != m_textures.end());
-            if (texture != m_textures.end())
+            const GLuint textureId = textureName.empty() ? 0u : lookupTexture(textureName);
+            glsPointers(part.vertexBuffer, textureId != 0u);
+            if (textureId != 0u)
             {
                 const MeshDrawState::SamplerState *sampler = part.materialIndex < state.materialSamplers.size()
                     ? &state.materialSamplers[part.materialIndex] : nullptr;
-                glsTexture(texture->second, resolveMeshSampler(state, sampler));
+                glsTexture(textureId, resolveMeshSampler(state, sampler));
             }
             else
                 glsTexture(0u, ResolvedSampler{});
@@ -1846,7 +2003,7 @@ public:
         leaveMesh();
         if (!detail::screenBatchEnabled() || m_target || vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
         {
-            flushScreenBatch();
+            flushScreenBatch(true);
             drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_TRIANGLES);
             return;
         }
@@ -1858,7 +2015,7 @@ public:
                          std::string_view textureName,
                          const ScreenDrawState &state) override
     {
-        flushScreenBatch();
+        flushScreenBatch(true);
         drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, GL_LINES);
     }
 
@@ -1912,8 +2069,13 @@ public:
                              static_cast<unsigned long long>(a.phaseUs[6]), static_cast<unsigned long long>(a.phaseUs[7]),
                              a.partsStatic, a.partsGpuSkin, a.glDraws);
             if (a.mergedParts || a.mergeBatches)
-                std::fprintf(stderr, "[native-mesh-merge] display: merged parts=%u verts=%u in %u draws\n",
-                             a.mergedParts, a.mergedVerts, a.mergeBatches);
+                std::fprintf(stderr, "[native-mesh-merge] display: merged parts=%u verts=%u in %u draws | world-space vertices copied=%u baked=%u verify-bad=%u | cache %u KB\n",
+                             a.mergedParts, a.mergedVerts, a.mergeBatches, a.mergeReused, a.mergeBaked, a.mergeVerifyBad,
+                             static_cast<unsigned>(g_mergeCacheBytes / 1024u));
+            if (a.mergedParts || a.mergeBatches)
+                std::fprintf(stderr, "[native-mesh-merge] parts drawn alone: skinned=%u big/no-list=%u matrix=%u dual=%u env=%u twice=%u lights=%u\n",
+                             a.mergeRefused[0], a.mergeRefused[1], a.mergeRefused[2], a.mergeRefused[3], a.mergeRefused[4],
+                             a.mergeRefused[5], a.mergeRefused[6]);
             m_meshTiming = {};
             m_meshTimingTarget = {};
         }
@@ -1928,8 +2090,12 @@ public:
                       (t.us[0] + t.us[1] + t.us[2] + t.us[3] + t.us[4] + t.us[5] + t.us[6]) / n,
                       t.us[0] / n, t.us[1] / n, t.us[2] / n, t.us[3] / n, t.us[4] / n, t.us[5] / n, t.us[6] / n,
                       t.submitUs / sn);
+        char breakLine[200];
+        std::snprintf(breakLine, sizeof breakLine,
+                      "[native-screen-breaks] first=%u size/full=%u texture=%u (big-texture draws=%u) filter=%u state=%u overlap=%u\n",
+                      t.breaks[1], t.breaks[2], t.breaks[3], t.bigTextureBreaks, t.breaks[4], t.breaks[5], t.breaks[6]);
         m_screenTiming = {};
-        return std::string(meshLine) + line;
+        return std::string(meshLine) + line + breakLine;
     }
 
     void endFrame() override
@@ -1940,6 +2106,37 @@ public:
         m_in3D = false;
         if (m_gpuSkinEnabled && resourceDiagEnabled() && ++m_gpuSkinReportFrames % 120u == 0u)
             reportSkinStats();
+    }
+
+    // ---- A/B frame comparison support (see AbRenderer at the end of the file) ----------------------------------------
+    // The switchable fast paths. Changed between frames only.
+    struct Modes
+    {
+        bool glCache = false, merge = false, screenCache = false;
+        int skip = 0;
+    };
+    Modes modes() const { return {m_gl.on, m_merge.enabled, m_g2.on, m_glSkip}; }
+    void setModes(const Modes &modes)
+    {
+        flushScreenBatch(); // ends both kinds of run
+        m_merge.enabled = modes.merge;
+        m_gl.on = modes.glCache || modes.merge;
+        m_g2.on = modes.screenCache;
+        m_glSkip = modes.skip;
+    }
+    void drainPending() { flushScreenBatch(); }
+    // RGBA8 of the host framebuffer as drawn so far this frame (bottom row first, GL order). False when it cannot be read.
+    bool readFramebuffer(std::vector<std::uint8_t> &rgba, int &width, int &height)
+    {
+        flushScreenBatch();
+        width = std::max(GetScreenWidth(), 1);
+        height = std::max(GetScreenHeight(), 1);
+        rgba.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u, 0u);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFinish();
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        m_in3D = false;
+        return true;
     }
 
 private:
@@ -2242,6 +2439,7 @@ private:
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
+            m_g2.boundTex = 0u; // the screen path's shadow of the bound texture
             m_atlasPages.push_back(texture);
         }
         return m_atlasPages[static_cast<std::size_t>(page)];
@@ -2254,6 +2452,7 @@ private:
         glTexSubImage2D(GL_TEXTURE_2D, 0, small.slot.x - 1, small.slot.y - 1, small.slot.w + 2, small.slot.h + 2,
                         GL_RGBA, GL_UNSIGNED_BYTE, m_atlasScratch.data());
         glBindTexture(GL_TEXTURE_2D, 0);
+        m_g2.boundTex = 0u; // the screen path's shadow of the bound texture
     }
 
     // The atlas slot of a named texture, placed on first use; null when it has none (too big, atlas full, off).
@@ -2303,10 +2502,30 @@ private:
         const bool linear = (small != nullptr || texture != 0u) && wholeTextureLinear(vertices, state);
         const GLuint page = small ? atlasPage(small->slot.page) : texture;
         const std::uintptr_t id = static_cast<std::uintptr_t>(page);
-        if (!m_batch.accepts(sourceWidth, sourceHeight, id, linear, m_screenPlacement, state, vertices.data(),
-                             vertices.size()))
+        const int why = m_batch.whyNot(sourceWidth, sourceHeight, id, linear, m_screenPlacement, state, vertices.data(),
+                                       vertices.size());
+        static const long traceFrame = [] { const char *v = std::getenv("P3FES_SCREEN_TRACE"); return v ? std::strtol(v, nullptr, 10) : -1l; }();
+        if (traceFrame >= 0 && static_cast<long>(m_instanceFrame) >= traceFrame && static_cast<long>(m_instanceFrame) < traceFrame + 3)
         {
-            flushScreenBatch();
+            const auto sizeIt = textureName.empty() ? m_textureSizes.end() : m_textureSizes.find(textureKey(textureName));
+            std::fprintf(stderr, "[screen-trace] f=%u v=%u tex=%.*s %ux%u atlas=%d why=%d blend=%d dt=%d dw=%d df=%d at=%d/%u/%u af=%d z=%.4f bbox=%.0f,%.0f-%.0f,%.0f\n",
+                         m_instanceFrame, static_cast<unsigned>(vertices.size()), static_cast<int>(textureName.size()), textureName.data(),
+                         sizeIt != m_textureSizes.end() ? sizeIt->second[0] : 0u, sizeIt != m_textureSizes.end() ? sizeIt->second[1] : 0u,
+                         small ? 1 : 0, why, static_cast<int>(state.blend), state.depthTest, state.depthWrite,
+                         static_cast<int>(state.depthFunction), state.alphaTest.enabled, state.alphaTest.function,
+                         state.alphaTest.reference, static_cast<int>(state.alphaFailAction), vertices[0].z,
+                         vertices[0].x, vertices[0].y, vertices.back().x, vertices.back().y);
+        }
+        if (why)
+        {
+            if (timing)
+            {
+                ++m_screenTiming.breaks[why];
+                // what a texture break is made of: draws of a big texture vs a small one
+                if (why == 3 && !small && texture)
+                    ++m_screenTiming.bigTextureBreaks;
+            }
+            flushScreenBatch(true);
             m_batch.begin(sourceWidth, sourceHeight, id, linear, m_screenPlacement, state);
         }
         m_batch.added(vertices.data(), vertices.size());
@@ -2336,97 +2555,152 @@ private:
         }
     }
 
-    void flushScreenBatch()
+    // Draws the pending batch. keep2D: more screen draws follow at once, so the GL state of the run stays as it is;
+    // every other caller wants the normal baseline back (end2D).
+    void flushScreenBatch(bool keep2D = false)
     {
         leaveMesh();
-        if (!m_batch.active)
-            return;
-        m_batch.active = false;
-        if (m_batch.vertices.empty())
-            return;
-        const ScreenPlacement saved = m_screenPlacement;
-        m_screenPlacement = m_batch.placement;
-        drawScreenPrimitive(m_batch.vertices, m_batch.sourceWidth, m_batch.sourceHeight, std::string_view{}, m_batch.state,
-                            GL_TRIANGLES, static_cast<long>(m_batch.texture), m_batch.linear ? 1 : 0, true);
-        m_screenPlacement = saved;
-        m_batch.vertices.clear();
+        if (m_batch.active)
+        {
+            m_batch.active = false;
+            if (!m_batch.vertices.empty())
+            {
+                const ScreenPlacement saved = m_screenPlacement;
+                m_screenPlacement = m_batch.placement;
+                drawScreenPrimitive(m_batch.vertices, m_batch.sourceWidth, m_batch.sourceHeight, std::string_view{}, m_batch.state,
+                                    GL_TRIANGLES, static_cast<long>(m_batch.texture), m_batch.linear ? 1 : 0, true);
+                m_screenPlacement = saved;
+                m_batch.vertices.clear();
+            }
+        }
+        if (!keep2D)
+            end2D();
     }
 
-    // forcedTexture >= 0: the GL texture to sample (0: none) instead of the one named; forcedLinear >= 0 its
-    // filter; zBiased: the vertices already carry their GEQUAL Z bias (batched draws).
-    void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
-                             float sourceWidth, float sourceHeight,
-                             std::string_view textureName,
-                             const ScreenDrawState &state, GLenum primitive,
-                             long forcedTexture = -1, int forcedLinear = -1, bool zBiased = false)
+    // ---- GL state shadow of the screen-space path (P3FES_SCREEN_GLCACHE) -------------------------------------------
+    // A run of screen draws starts at the first drawScreenPrimitive after any other renderer work and ends in end2D(),
+    // which every other entry point reaches through flushScreenBatch(). Inside a run only drawScreenPrimitive (and the
+    // atlas uploads it triggers, which tell the shadow) touches GL, so the shadow is exact. Without the cache every draw
+    // sets all of its state and puts the baseline back, as before; with it a call is made only for what differs from the
+    // previous draw, and the baseline is put back once at the end of the run.
+    struct Gl2D
     {
-        if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
-            return;
-        const bool timing = resourceDiagEnabled() && !m_target;
-        std::uint64_t timingMark = timing ? diagNowUs() : 0u;
-        const auto lap = [&](int phase) {
-            if (!timing) return;
-            const std::uint64_t now = diagNowUs();
-            m_screenTiming.us[phase] += now - timingMark;
-            timingMark = now;
-        };
-        // Inside a render-target pass the source space is the target itself, drawn upside down like
-        // the world draws of the pass.
-        const FitViewport viewport = m_target ? worldViewport()
-            : screenViewport(sourceWidth, sourceHeight,
-                             FitViewport{0, 0, std::max(GetScreenWidth(), 1), std::max(GetScreenHeight(), 1)}, fitViewport);
-        glDisable(GL_SCISSOR_TEST);
-        glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        bool on = false, active = false;
+        int scissorOff = -1, shade = -1, alphaOn = -1, fogOn = -1, depthTest = -1, depthMask = -1, depthFunc = -1;
+        int cullOn = -1, tex2d = -1, vtxArr = -1, colArr = -1, texArr = -1, colorMask = -1, blendKey = -1;
+        int alphaFunc = -1, alphaRef = -1, arrayBuf = -1, elemBuf = -1;
+        FogState fog;
+        bool fogKnown = false, viewportKnown = false, orthoKnown = false;
+        int vx = 0, vy = 0, vw = 0, vh = 0;
+        GLuint boundTex = 0xFFFFFFFFu;
+        std::array<float, 5> ortho{};
+        float modelviewBias = -1.0f; // the translation loaded after glLoadIdentity; -1: unknown
+        std::unordered_map<GLuint, std::uint32_t> texParams; // texture -> clampU | clampV << 1 | linear << 2
+        void reset()
+        {
+            const bool keep = on;
+            *this = Gl2D{};
+            on = keep;
+        }
+    };
+    Gl2D m_g2;
 
-        applyAlphaTest(state.alphaTest);
-        applyFog(state.fog);
-        applyShadeMode(state.gouraudShading);
-        // FBMSK = 0x00FFFFFF: alpha-only write (see ScreenDrawState::alphaOnlyWrite). One state call per draw, as before.
-        if (state.alphaOnlyWrite)
-            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-        else
-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        if (state.depthTest)
-            glEnable(GL_DEPTH_TEST);
-        else
-            glDisable(GL_DEPTH_TEST);
-        glDepthMask(state.depthWrite ? GL_TRUE : GL_FALSE);
-        switch (state.depthFunction)
+    void g2Cap(int &shadow, GLenum cap, bool enable)
+    {
+        if (m_g2.on && shadow == (enable ? 1 : 0))
+            return;
+        if (enable) glEnable(cap); else glDisable(cap);
+        shadow = enable ? 1 : 0;
+    }
+    void g2Alpha(const AlphaTestState &alpha)
+    {
+        if (!alpha.enabled)
         {
-        case ScreenDepthFunction::Never: glDepthFunc(GL_NEVER); break;
-        case ScreenDepthFunction::GreaterEqual: glDepthFunc(GL_LEQUAL); break;
-        case ScreenDepthFunction::Greater: glDepthFunc(GL_LESS); break;
-        case ScreenDepthFunction::Always:
-        default: glDepthFunc(GL_ALWAYS); break;
+            g2Cap(m_g2.alphaOn, GL_ALPHA_TEST, false);
+            return;
         }
-        glDisable(GL_CULL_FACE);
-        lap(0);
-        GLuint texture = 0u;
-        if (forcedTexture >= 0)
-            texture = static_cast<GLuint>(forcedTexture);
-        else if (!textureName.empty())
+        g2Cap(m_g2.alphaOn, GL_ALPHA_TEST, true);
+        if (!m_g2.on || m_g2.alphaFunc != alpha.function || m_g2.alphaRef != alpha.reference)
         {
-            const auto found = m_textures.find(textureKey(textureName));
-            if (found != m_textures.end())
-                texture = found->second;
+            glAlphaFunc(gsAlphaFunc(alpha.function), alpha.reference / 255.0f);
+            m_g2.alphaFunc = alpha.function;
+            m_g2.alphaRef = alpha.reference;
         }
-        if (texture)
+    }
+    void g2Fog(const FogState &fog)
+    {
+        if (!fog.enabled)
         {
-            glEnable(GL_TEXTURE_2D);
-            glBindTexture(GL_TEXTURE_2D, texture);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            // The game draws its 512x512 dialogue portraits texel-for-pixel with point sampling.
-            // The host scales the 448-line picture to 544 lines (x1.214), where point sampling
-            // repeats every fifth texel or so and the portrait looks stepped. A draw that shows a
-            // whole texture (UV 0..1, so no neighbouring atlas cell can bleed in) is filtered.
-            bool linear = forcedLinear >= 0 ? forcedLinear != 0 : wholeTextureLinear(vertices, state);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            g2Cap(m_g2.fogOn, GL_FOG, false);
+            return;
         }
-        else
-            glDisable(GL_TEXTURE_2D);
-        lap(1);
+        g2Cap(m_g2.fogOn, GL_FOG, true);
+        if (!m_g2.on || !m_g2.fogKnown || m_g2.fog.start != fog.start || m_g2.fog.end != fog.end || m_g2.fog.color != fog.color)
+        {
+            const GLfloat color[4]{fog.color[0] / 255.0f, fog.color[1] / 255.0f, fog.color[2] / 255.0f, 1.0f};
+            glFogi(GL_FOG_MODE, GL_LINEAR);
+            glFogf(GL_FOG_START, fog.start);
+            glFogf(GL_FOG_END, fog.end);
+            glFogfv(GL_FOG_COLOR, color);
+            m_g2.fog = fog;
+            m_g2.fogKnown = true;
+        }
+    }
+    void g2Shade(bool gouraud)
+    {
+        if (m_g2.on && m_g2.shade == (gouraud ? 1 : 0))
+            return;
+        glShadeModel(gouraud ? GL_SMOOTH : GL_FLAT);
+        m_g2.shade = gouraud ? 1 : 0;
+    }
+    void g2ColorMask(bool r, bool g, bool b, bool a)
+    {
+        const int mask = (r ? 1 : 0) | (g ? 2 : 0) | (b ? 4 : 0) | (a ? 8 : 0);
+        if (m_g2.on && m_g2.colorMask == mask)
+            return;
+        glColorMask(r ? GL_TRUE : GL_FALSE, g ? GL_TRUE : GL_FALSE, b ? GL_TRUE : GL_FALSE, a ? GL_TRUE : GL_FALSE);
+        m_g2.colorMask = mask;
+    }
+    void g2DepthMask(bool on)
+    {
+        if (m_g2.on && m_g2.depthMask == (on ? 1 : 0))
+            return;
+        glDepthMask(on ? GL_TRUE : GL_FALSE);
+        m_g2.depthMask = on ? 1 : 0;
+    }
+    void g2DepthFunc(GLenum function)
+    {
+        if (m_g2.on && m_g2.depthFunc == static_cast<int>(function))
+            return;
+        glDepthFunc(function);
+        m_g2.depthFunc = static_cast<int>(function);
+    }
+    void g2Client(int &shadow, GLenum array, bool enable)
+    {
+        if (m_g2.on && shadow == (enable ? 1 : 0))
+            return;
+        if (enable) glEnableClientState(array); else glDisableClientState(array);
+        shadow = enable ? 1 : 0;
+    }
+    void g2Buffers()
+    {
+        if (!m_g2.on || m_g2.arrayBuf != 0)
+        {
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            m_g2.arrayBuf = 0;
+        }
+        if (!m_g2.on || m_g2.elemBuf != 0)
+        {
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            m_g2.elemBuf = 0;
+        }
+    }
+    void g2Blend(const ScreenDrawState &state)
+    {
+        const int key = static_cast<int>(state.blend) * 2 + (state.blend == ScreenBlend::Alpha && state.destinationAlphaTest ? 1 : 0);
+        if (m_g2.on && m_g2.blendKey == key)
+            return;
+        m_g2.blendKey = key;
         switch (state.blend)
         {
         case ScreenBlend::Opaque:
@@ -2464,9 +2738,133 @@ private:
                                 state.destinationAlphaTest ? GL_DST_ALPHA : GL_ONE, GL_ZERO);
             break;
         }
+    }
+    // The normal 3-D baseline after a run of screen draws (what each draw used to put back itself).
+    void end2D()
+    {
+        if (!m_g2.active)
+            return;
+        m_g2.active = false;
+        g2ColorMask(true, true, true, true);
+        g2Client(m_g2.texArr, GL_TEXTURE_COORD_ARRAY, false);
+        g2Client(m_g2.colArr, GL_COLOR_ARRAY, false);
+        g2Client(m_g2.vtxArr, GL_VERTEX_ARRAY, false);
+        if (m_g2.boundTex != 0u)
+            glBindTexture(GL_TEXTURE_2D, 0);
+        g2Cap(m_g2.tex2d, GL_TEXTURE_2D, false);
+        g2Cap(m_g2.alphaOn, GL_ALPHA_TEST, false);
+        g2Cap(m_g2.fogOn, GL_FOG, false);
+        g2Shade(true);
+        g2Cap(m_g2.depthTest, GL_DEPTH_TEST, true);
+        g2DepthMask(true);
+        g2DepthFunc(GL_LEQUAL);
+        if (m_g2.blendKey != 0)
+        {
+            ScreenDrawState baseline;
+            baseline.blend = ScreenBlend::Alpha;
+            g2Blend(baseline);
+        }
+        m_g2.reset();
+    }
+
+    // forcedTexture >= 0: the GL texture to sample (0: none) instead of the one named; forcedLinear >= 0 its
+    // filter; zBiased: the vertices already carry their GEQUAL Z bias (batched draws).
+    void drawScreenPrimitive(const std::vector<ScreenVertex> &vertices,
+                             float sourceWidth, float sourceHeight,
+                             std::string_view textureName,
+                             const ScreenDrawState &state, GLenum primitive,
+                             long forcedTexture = -1, int forcedLinear = -1, bool zBiased = false)
+    {
+        if (vertices.empty() || sourceWidth <= 0.0f || sourceHeight <= 0.0f)
+            return;
+        const bool timing = resourceDiagEnabled() && !m_target;
+        std::uint64_t timingMark = timing ? diagNowUs() : 0u;
+        const auto lap = [&](int phase) {
+            if (!timing) return;
+            const std::uint64_t now = diagNowUs();
+            m_screenTiming.us[phase] += now - timingMark;
+            timingMark = now;
+        };
+        if (!m_g2.active)
+            m_g2.reset(); // a new run: nothing is known about the GL state
+        // Inside a render-target pass the source space is the target itself, drawn upside down like
+        // the world draws of the pass.
+        const FitViewport viewport = m_target ? worldViewport()
+            : screenViewport(sourceWidth, sourceHeight,
+                             FitViewport{0, 0, std::max(GetScreenWidth(), 1), std::max(GetScreenHeight(), 1)}, fitViewport);
+        g2Cap(m_g2.scissorOff, GL_SCISSOR_TEST, false);
+        if (!m_g2.on || !m_g2.viewportKnown || m_g2.vx != viewport.x || m_g2.vy != viewport.y ||
+            m_g2.vw != viewport.width || m_g2.vh != viewport.height)
+        {
+            glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+            m_g2.vx = viewport.x; m_g2.vy = viewport.y; m_g2.vw = viewport.width; m_g2.vh = viewport.height;
+            m_g2.viewportKnown = true;
+        }
+
+        g2Alpha(state.alphaTest);
+        g2Fog(state.fog);
+        g2Shade(state.gouraudShading);
+        // FBMSK = 0x00FFFFFF: alpha-only write (see ScreenDrawState::alphaOnlyWrite). One state call per draw, as before.
+        if (state.alphaOnlyWrite)
+            g2ColorMask(false, false, false, true);
+        else
+            g2ColorMask(true, true, true, true);
+        g2Cap(m_g2.depthTest, GL_DEPTH_TEST, state.depthTest);
+        g2DepthMask(state.depthWrite);
+        switch (state.depthFunction)
+        {
+        case ScreenDepthFunction::Never: g2DepthFunc(GL_NEVER); break;
+        case ScreenDepthFunction::GreaterEqual: g2DepthFunc(GL_LEQUAL); break;
+        case ScreenDepthFunction::Greater: g2DepthFunc(GL_LESS); break;
+        case ScreenDepthFunction::Always:
+        default: g2DepthFunc(GL_ALWAYS); break;
+        }
+        g2Cap(m_g2.cullOn, GL_CULL_FACE, false);
+        lap(0);
+        GLuint texture = 0u;
+        if (forcedTexture >= 0)
+            texture = static_cast<GLuint>(forcedTexture);
+        else if (!textureName.empty())
+        {
+            const auto found = m_textures.find(textureKey(textureName));
+            if (found != m_textures.end())
+                texture = found->second;
+        }
+        if (texture)
+        {
+            g2Cap(m_g2.tex2d, GL_TEXTURE_2D, true);
+            if (!m_g2.on || m_g2.boundTex != texture)
+            {
+                glBindTexture(GL_TEXTURE_2D, texture);
+                m_g2.boundTex = texture;
+            }
+            // The game draws its 512x512 dialogue portraits texel-for-pixel with point sampling.
+            // The host scales the 448-line picture to 544 lines (x1.214), where point sampling
+            // repeats every fifth texel or so and the portrait looks stepped. A draw that shows a
+            // whole texture (UV 0..1, so no neighbouring atlas cell can bleed in) is filtered.
+            const bool linear = forcedLinear >= 0 ? forcedLinear != 0 : wholeTextureLinear(vertices, state);
+            const std::uint32_t params = (state.clampU ? 1u : 0u) | (state.clampV ? 2u : 0u) | (linear ? 4u : 0u);
+            bool same = false;
+            if (m_g2.on)
+            {
+                const auto known = m_g2.texParams.find(texture);
+                same = known != m_g2.texParams.end() && known->second == params;
+            }
+            if (!same)
+            {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, state.clampU ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, state.clampV ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+                if (m_g2.on)
+                    m_g2.texParams[texture] = params;
+            }
+        }
+        else
+            g2Cap(m_g2.tex2d, GL_TEXTURE_2D, false);
+        lap(1);
+        g2Blend(state);
         lap(2);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
         // Wide placement: the source area keeps its centred 4:3 position and scale, the rest of the framebuffer
         // shows the source plane beyond x = 0 / x = sourceWidth.
         float orthoLeft = 0.0f, orthoRight = sourceWidth;
@@ -2477,38 +2875,59 @@ private:
             orthoLeft = (sourceWidth - span) * 0.5f;
             orthoRight = orthoLeft + span;
         }
-        if (m_target && targetFlipEnabled())
-            glOrthof(0.0f, sourceWidth, 0.0f, sourceHeight, -1.0f, 0.0f);
-        else
-            glOrthof(orthoLeft, orthoRight, sourceHeight, 0.0f, -1.0f, 0.0f);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
+        const bool flipTarget = m_target && targetFlipEnabled();
+        const std::array<float, 5> orthoKey{orthoLeft, orthoRight, sourceHeight, sourceWidth, flipTarget ? 1.0f : 0.0f};
         // The GS passes a GEQUAL depth test on exactly equal Z, and the game relies on it: HUD text
         // is drawn at the same Z as the panel under it. The Vita's GPU does not give two different
         // triangles bit-identical depth for the same Z (desktop GPUs and Vita3K do), which cut
         // glyphs out. So the n-th GEQUAL draw of a frame at a given Z is moved n steps nearer: a
         // step is a few float ulps of Z, and the game's Z layers are thousands of steps apart.
         // P3FES_SCREEN_Z_BIAS=0 disables it.
+        float bias = 0.0f;
         if (!zBiased)
+            bias = screenZBias(vertices.data(), vertices.size(), state);
+        if (!m_g2.on || !m_g2.orthoKnown || m_g2.ortho != orthoKey)
         {
-            const float bias = screenZBias(vertices.data(), vertices.size(), state);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            if (flipTarget)
+                glOrthof(0.0f, sourceWidth, 0.0f, sourceHeight, -1.0f, 0.0f);
+            else
+                glOrthof(orthoLeft, orthoRight, sourceHeight, 0.0f, -1.0f, 0.0f);
+            glMatrixMode(GL_MODELVIEW);
+            m_g2.ortho = orthoKey;
+            m_g2.orthoKnown = true;
+            m_g2.modelviewBias = -1.0f; // the next block reloads the modelview too
+        }
+        if (!m_g2.on || m_g2.modelviewBias != bias)
+        {
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
             if (bias > 0.0f)
                 glTranslatef(0.0f, 0.0f, bias);
+            m_g2.modelviewBias = bias;
         }
         lap(3);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        glEnableClientState(GL_VERTEX_ARRAY);
-        glEnableClientState(GL_COLOR_ARRAY);
+        g2Buffers();
+        g2Client(m_g2.vtxArr, GL_VERTEX_ARRAY, true);
+        g2Client(m_g2.colArr, GL_COLOR_ARRAY, true);
+        // vitaGL uses a client array of more than 32 KB where it stands (DRAW_SPEEDHACK=2) and the GPU reads it when
+        // the scene renders: a batch whose vector is refilled for the next one must not be what the draw points at.
+        const ScreenVertex *source = vertices.data();
+#if defined(__vita__)
+        if (vertices.size() * sizeof(ScreenVertex) > 24u * 1024u)
+            if (const void *copy = m_arena.copy(source, vertices.size() * sizeof(ScreenVertex)))
+                source = static_cast<const ScreenVertex *>(copy);
+#endif
         if (texture)
         {
-            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-            glTexCoordPointer(2, GL_FLOAT, sizeof(ScreenVertex), &vertices[0].u);
+            g2Client(m_g2.texArr, GL_TEXTURE_COORD_ARRAY, true);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(ScreenVertex), &source[0].u);
         }
         else
-            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        glVertexPointer(3, GL_FLOAT, sizeof(ScreenVertex), &vertices[0].x);
-        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenVertex), vertices[0].color.data());
+            g2Client(m_g2.texArr, GL_TEXTURE_COORD_ARRAY, false);
+        glVertexPointer(3, GL_FLOAT, sizeof(ScreenVertex), &source[0].x);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(ScreenVertex), source[0].color.data());
         lap(4);
         const auto drawVertices = [&] {
             glDrawArrays(primitive, 0, static_cast<GLsizei>(vertices.size()));
@@ -2526,7 +2945,7 @@ private:
         {
             // With no observable depth side effect, both alpha outcomes write
             // the same framebuffer result; one draw without alpha test is exact.
-            glDisable(GL_ALPHA_TEST);
+            g2Cap(m_g2.alphaOn, GL_ALPHA_TEST, false);
             drawVertices();
         }
         else
@@ -2537,19 +2956,19 @@ private:
             {
                 AlphaTestState failedAlpha = state.alphaTest;
                 failedAlpha.function = complementGsAlphaFunction(state.alphaTest.function);
-                applyAlphaTest(failedAlpha);
+                g2Alpha(failedAlpha);
                 switch (state.alphaFailAction)
                 {
                 case ScreenAlphaFailAction::FramebufferOnly:
-                    glDepthMask(GL_FALSE);
+                    g2DepthMask(false);
                     break;
                 case ScreenAlphaFailAction::DepthOnly:
-                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-                    glDepthMask(GL_TRUE);
+                    g2ColorMask(false, false, false, false);
+                    g2DepthMask(true);
                     break;
                 case ScreenAlphaFailAction::RgbOnly:
-                    glColorMask(!state.alphaOnlyWrite, !state.alphaOnlyWrite, !state.alphaOnlyWrite, GL_FALSE);
-                    glDepthMask(GL_FALSE);
+                    g2ColorMask(!state.alphaOnlyWrite, !state.alphaOnlyWrite, !state.alphaOnlyWrite, false);
+                    g2DepthMask(false);
                     break;
                 case ScreenAlphaFailAction::Keep:
                 default:
@@ -2559,24 +2978,29 @@ private:
             }
         }
         lap(5);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        glDisableClientState(GL_COLOR_ARRAY);
-        glDisableClientState(GL_VERTEX_ARRAY);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glDisable(GL_TEXTURE_2D);
-        glDisable(GL_ALPHA_TEST);
-        glDisable(GL_FOG);
-        glShadeModel(GL_SMOOTH);
-        // Leave the shared context in the renderer's normal 3D state. Each
-        // subsequent screen primitive applies its own depth state above.
-        glEnable(GL_DEPTH_TEST);
-        glDepthMask(GL_TRUE);
-        glDepthFunc(GL_LEQUAL);
-        glEnable(GL_BLEND);
-        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
         m_in3D = false;
+        if (m_g2.on)
+            m_g2.active = true; // the baseline is put back by end2D() when the run ends
+        else
+        {
+            g2ColorMask(true, true, true, true);
+            g2Client(m_g2.texArr, GL_TEXTURE_COORD_ARRAY, false);
+            g2Client(m_g2.colArr, GL_COLOR_ARRAY, false);
+            g2Client(m_g2.vtxArr, GL_VERTEX_ARRAY, false);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            g2Cap(m_g2.tex2d, GL_TEXTURE_2D, false);
+            g2Cap(m_g2.alphaOn, GL_ALPHA_TEST, false);
+            g2Cap(m_g2.fogOn, GL_FOG, false);
+            g2Shade(true);
+            // Leave the shared context in the renderer's normal 3D state. Each
+            // subsequent screen primitive applies its own depth state above.
+            g2Cap(m_g2.depthTest, GL_DEPTH_TEST, true);
+            g2DepthMask(true);
+            g2DepthFunc(GL_LEQUAL);
+            glEnable(GL_BLEND);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
+        }
         lap(6);
         if (timing)
         {
@@ -2624,6 +3048,7 @@ private:
     void removeMeshLocked(MeshId id)
     {
         leaveMesh();
+        end2D();
         auto found = m_meshes.find(id);
         if (found == m_meshes.end())
             return;
@@ -2645,6 +3070,7 @@ private:
         std::uint32_t draws = 0, glDraws = 0, vertices = 0;
         std::uint64_t submitUs = 0;
         std::uint32_t submits = 0;
+        std::uint32_t breaks[7] = {}, bigTextureBreaks = 0; // batch breaks by ScreenBatch::whyNot
     };
     ScreenTiming m_screenTiming;
     struct MeshTiming
@@ -2661,7 +3087,7 @@ private:
         std::uint32_t reasons[2][512] = {};   // [skinned][mismatch bits]: how often each reason set came up
         // P3FES_MESH_PHASES=1: time by phase of drawMeshImpl (see PhaseClock), parts drawn by path, GL draw calls.
         std::uint64_t phaseUs[8] = {};
-        std::uint32_t partsStatic = 0, partsGpuSkin = 0, glDraws = 0, mergedParts = 0, mergedVerts = 0, mergeBatches = 0;
+        std::uint32_t partsStatic = 0, partsGpuSkin = 0, glDraws = 0, mergedParts = 0, mergedVerts = 0, mergeBatches = 0, mergeReused = 0, mergeBaked = 0, mergeVerifyBad = 0, mergeRefused[7] = {};
     };
     MeshTiming m_meshTiming, m_meshTimingTarget; // display frame / render-target passes
     static std::uint64_t diagNowUs()
@@ -2696,10 +3122,19 @@ private:
         {
             depthTest = depthMask = blendOn = smooth = 1;
             cullOn = alphaOn = fogOn = tex2d = vtxArr = colArr = texArr = 0;
-            eqSub = 0; funcSeparate = false;
-            funcSrc = GL_SRC_ALPHA; funcDst = GL_ONE_MINUS_SRC_ALPHA;
+            // The screen path leaves the blend factors as (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE, ZERO): the alpha channel
+            // is NOT blended like the colour, and a mesh draw must set its own factors (it writes the frame buffer's alpha
+            // the way glBlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA) does; later draws blend with that alpha). So the first
+            // blend call of a run is never skipped. The same for the face to cull: the last run may have left GL_FRONT.
+            eqSub = 0; funcSeparate = true;
+            funcSrc = funcDst = 0;
             arrayBuf = elemBuf = 0;
-            cullFace = GL_BACK;
+            cullFace = 0;
+            // The alpha test function / reference and the fog parameters outlive a run in vitaGL and the screen path sets
+            // its own: what the shadow remembers from the last run is not what GL holds now (a mesh drawn after the HUD
+            // used to keep the HUD's alpha test: the menu backdrop turned translucent).
+            alphaFunc = alphaRef = -1;
+            fogKnown = false;
             skinTouched = false;
             // ids can be reused and vitaGL keeps a buffer pointer in each array pointer: re-issue them in every run
             boundTex = ptrBuf = texPtrBuf = kUnknownBuffer;
@@ -2714,25 +3149,31 @@ private:
         }
     };
     GlShadow m_gl;
+    // Diagnostic (P3FES_AB_MODES names like cache-alpha): which kinds of state the shadow does NOT cache, so that a
+    // difference between the cached and the plain path can be traced to one kind.
+    static constexpr int kCacheAlpha = 1, kCacheFog = 2, kCacheShade = 4, kCacheDepth = 8, kCacheCull = 16, kCacheBlend = 32,
+                         kCacheBind = 64, kCachePointers = 128, kCacheTexture = 256;
+    int m_glSkip = 0;
+    bool cached(int bit) const { return m_gl.on && !(m_glSkip & bit); }
     std::unordered_map<GLuint, std::array<GLenum, 3>> m_samplerCache; // texture -> wrapS, wrapT, linear; valid inside a run only
 
-    void glsCap(std::int8_t &shadow, GLenum cap, bool on)
+    void glsCap(std::int8_t &shadow, GLenum cap, bool on, int bit)
     {
-        if (m_gl.on && shadow == static_cast<std::int8_t>(on))
+        if (cached(bit) && shadow == static_cast<std::int8_t>(on))
             return;
         if (on) glEnable(cap); else glDisable(cap);
         shadow = static_cast<std::int8_t>(on);
     }
     void glsDepthMask(bool on)
     {
-        if (m_gl.on && m_gl.depthMask == static_cast<std::int8_t>(on))
+        if (cached(kCacheDepth) && m_gl.depthMask == static_cast<std::int8_t>(on))
             return;
         glDepthMask(on ? GL_TRUE : GL_FALSE);
         m_gl.depthMask = static_cast<std::int8_t>(on);
     }
     void glsClient(std::int8_t &shadow, GLenum array, bool on)
     {
-        if (m_gl.on && shadow == static_cast<std::int8_t>(on))
+        if (cached(kCachePointers) && shadow == static_cast<std::int8_t>(on))
             return;
         if (on) glEnableClientState(array); else glDisableClientState(array);
         shadow = static_cast<std::int8_t>(on);
@@ -2741,12 +3182,12 @@ private:
     {
         if (!alpha.enabled)
         {
-            glsCap(m_gl.alphaOn, GL_ALPHA_TEST, false);
+            glsCap(m_gl.alphaOn, GL_ALPHA_TEST, false, kCacheAlpha);
             return;
         }
-        glsCap(m_gl.alphaOn, GL_ALPHA_TEST, true);
+        glsCap(m_gl.alphaOn, GL_ALPHA_TEST, true, kCacheAlpha);
         const int function = alpha.function & 7u; // bit 3 is the FB_ONLY marker, not part of the test
-        if (!m_gl.on || m_gl.alphaFunc != function || m_gl.alphaRef != alpha.reference)
+        if (!cached(kCacheAlpha) || m_gl.alphaFunc != function || m_gl.alphaRef != alpha.reference)
         {
             glAlphaFunc(gsAlphaFunc(alpha.function), alpha.reference / 255.0f);
             m_gl.alphaFunc = function;
@@ -2757,11 +3198,11 @@ private:
     {
         if (!fog.enabled)
         {
-            glsCap(m_gl.fogOn, GL_FOG, false);
+            glsCap(m_gl.fogOn, GL_FOG, false, kCacheFog);
             return;
         }
-        glsCap(m_gl.fogOn, GL_FOG, true);
-        if (!m_gl.on || !m_gl.fogKnown || m_gl.fog.start != fog.start || m_gl.fog.end != fog.end ||
+        glsCap(m_gl.fogOn, GL_FOG, true, kCacheFog);
+        if (!cached(kCacheFog) || !m_gl.fogKnown || m_gl.fog.start != fog.start || m_gl.fog.end != fog.end ||
             m_gl.fog.color != fog.color)
         {
             const GLfloat color[4]{fog.color[0] / 255.0f, fog.color[1] / 255.0f, fog.color[2] / 255.0f, 1.0f};
@@ -2775,7 +3216,7 @@ private:
     }
     void glsShade(bool gouraud)
     {
-        if (m_gl.on && m_gl.smooth == static_cast<std::int8_t>(gouraud))
+        if (cached(kCacheShade) && m_gl.smooth == static_cast<std::int8_t>(gouraud))
             return;
         glShadeModel(gouraud ? GL_SMOOTH : GL_FLAT);
         m_gl.smooth = static_cast<std::int8_t>(gouraud);
@@ -2784,12 +3225,12 @@ private:
     {
         if (mode == MeshDrawState::CullMode::None)
         {
-            glsCap(m_gl.cullOn, GL_CULL_FACE, false);
+            glsCap(m_gl.cullOn, GL_CULL_FACE, false, kCacheCull);
             return;
         }
         const GLenum face = mode == MeshDrawState::CullMode::Back ? GL_BACK : GL_FRONT;
-        glsCap(m_gl.cullOn, GL_CULL_FACE, true);
-        if (!m_gl.on || m_gl.cullFace != face)
+        glsCap(m_gl.cullOn, GL_CULL_FACE, true, kCacheCull);
+        if (!cached(kCacheCull) || m_gl.cullFace != face)
         {
             glCullFace(face);
             m_gl.cullFace = face;
@@ -2800,18 +3241,18 @@ private:
     {
         if (!subtract)
         {
-            if (!m_gl.on || m_gl.eqSub != 0)
+            if (!cached(kCacheBlend) || m_gl.eqSub != 0)
             {
                 glBlendEquation(GL_FUNC_ADD);
                 m_gl.eqSub = 0;
             }
             if (!enabled)
             {
-                glsCap(m_gl.blendOn, GL_BLEND, false);
+                glsCap(m_gl.blendOn, GL_BLEND, false, kCacheBlend);
                 return;
             }
-            glsCap(m_gl.blendOn, GL_BLEND, true);
-            if (!m_gl.on || m_gl.funcSeparate || m_gl.funcSrc != src || m_gl.funcDst != dst)
+            glsCap(m_gl.blendOn, GL_BLEND, true, kCacheBlend);
+            if (!cached(kCacheBlend) || m_gl.funcSeparate || m_gl.funcSrc != src || m_gl.funcDst != dst)
             {
                 glBlendFunc(src, dst);
                 m_gl.funcSrc = src;
@@ -2820,8 +3261,8 @@ private:
             }
             return;
         }
-        glsCap(m_gl.blendOn, GL_BLEND, true);
-        if (!m_gl.on || m_gl.eqSub != 1 || !m_gl.funcSeparate || m_gl.funcSrc != src || m_gl.funcDst != dst)
+        glsCap(m_gl.blendOn, GL_BLEND, true, kCacheBlend);
+        if (!cached(kCacheBlend) || m_gl.eqSub != 1 || !m_gl.funcSeparate || m_gl.funcSrc != src || m_gl.funcDst != dst)
         {
             glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
             glBlendFuncSeparate(src, dst, GL_ONE, GL_ZERO);
@@ -2833,14 +3274,14 @@ private:
     }
     void glsBindArray(GLuint buffer)
     {
-        if (m_gl.on && m_gl.arrayBuf == buffer)
+        if (cached(kCacheBind) && m_gl.arrayBuf == buffer)
             return;
         glBindBuffer(GL_ARRAY_BUFFER, buffer);
         m_gl.arrayBuf = buffer;
     }
     void glsBindElements(GLuint buffer)
     {
-        if (m_gl.on && m_gl.elemBuf == buffer)
+        if (cached(kCacheBind) && m_gl.elemBuf == buffer)
             return;
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffer);
         m_gl.elemBuf = buffer;
@@ -2852,18 +3293,18 @@ private:
         if (!texture)
         {
             glsClient(m_gl.texArr, GL_TEXTURE_COORD_ARRAY, false);
-            glsCap(m_gl.tex2d, GL_TEXTURE_2D, false);
+            glsCap(m_gl.tex2d, GL_TEXTURE_2D, false, kCacheTexture);
             return;
         }
-        glsCap(m_gl.tex2d, GL_TEXTURE_2D, true);
-        if (!m_gl.on || m_gl.boundTex != texture)
+        glsCap(m_gl.tex2d, GL_TEXTURE_2D, true, kCacheTexture);
+        if (!cached(kCacheTexture) || m_gl.boundTex != texture)
         {
             glBindTexture(GL_TEXTURE_2D, texture);
             m_gl.boundTex = texture;
         }
         const std::array<GLenum, 3> wanted{sampler.wrapS, sampler.wrapT, sampler.linear ? 1u : 0u};
         bool same = false;
-        if (m_gl.on)
+        if (cached(kCacheTexture))
         {
             const auto found = m_samplerCache.find(texture);
             same = found != m_samplerCache.end() && found->second == wanted;
@@ -2874,7 +3315,7 @@ private:
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, sampler.wrapT);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sampler.linear ? GL_LINEAR : GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sampler.linear ? GL_LINEAR : GL_NEAREST);
-            if (m_gl.on)
+            if (cached(kCacheTexture))
                 m_samplerCache[texture] = wanted;
         }
         glsClient(m_gl.texArr, GL_TEXTURE_COORD_ARRAY, true);
@@ -2882,13 +3323,13 @@ private:
     // Vertex / colour (and, when textured, coordinate) pointers into the bound array buffer, laid out as GpuVertex.
     void glsPointers(GLuint buffer, bool textured)
     {
-        if (!m_gl.on || m_gl.ptrBuf != buffer)
+        if (!cached(kCachePointers) || m_gl.ptrBuf != buffer)
         {
             glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, position)));
             glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, color)));
             m_gl.ptrBuf = buffer;
         }
-        if (textured && (!m_gl.on || m_gl.texPtrBuf != buffer))
+        if (textured && (!cached(kCachePointers) || m_gl.texPtrBuf != buffer))
         {
             glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), reinterpret_cast<const void *>(offsetof(GpuVertex, uv)));
             m_gl.texPtrBuf = buffer;
@@ -2907,20 +3348,20 @@ private:
         glColor4ub(255u, 255u, 255u, 255u);
         glsBindElements(0);
         glsBindArray(0);
-        glsCap(m_gl.tex2d, GL_TEXTURE_2D, false);
+        glsCap(m_gl.tex2d, GL_TEXTURE_2D, false, kCacheTexture);
         if (m_gl.skinTouched)
         {
             glUseProgram(0);
             for (GLuint attribute = 0; attribute < 6u; ++attribute)
                 glDisableVertexAttribArray(attribute);
         }
-        glsCap(m_gl.alphaOn, GL_ALPHA_TEST, false);
-        glsCap(m_gl.fogOn, GL_FOG, false);
+        glsCap(m_gl.alphaOn, GL_ALPHA_TEST, false, kCacheAlpha);
+        glsCap(m_gl.fogOn, GL_FOG, false, kCacheFog);
         glsShade(true);
-        glsCap(m_gl.depthTest, GL_DEPTH_TEST, true);
+        glsCap(m_gl.depthTest, GL_DEPTH_TEST, true, kCacheDepth);
         glsDepthMask(true);
         glsBlend(true, false, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glsCap(m_gl.cullOn, GL_CULL_FACE, false);
+        glsCap(m_gl.cullOn, GL_CULL_FACE, false, kCacheCull);
         m_gl.inRun = false;
         m_samplerCache.clear();
     }
@@ -2936,8 +3377,12 @@ private:
         GLenum src = GL_SRC_ALPHA, dst = GL_ONE_MINUS_SRC_ALPHA;
         GLuint texture = 0;
         ResolvedSampler sampler;
+        bool twice = false; // drawn as two passes: `alpha` passing pixels with the depth state, then `alpha2` with depth writes masked
+        AlphaTestState alpha2;
         bool same(const MergeSig &o) const
         {
+            if (twice != o.twice || (twice && (alpha2.function != o.alpha2.function || alpha2.reference != o.alpha2.reference)))
+                return false;
             if (alpha.enabled != o.alpha.enabled || (alpha.enabled && (alpha.function != o.alpha.function || alpha.reference != o.alpha.reference)))
                 return false;
             if (fog.enabled != o.fog.enabled || (fog.enabled && (fog.start != o.fog.start || fog.end != o.fog.end || fog.color != o.fog.color)))
@@ -2957,43 +3402,116 @@ private:
         std::vector<GpuVertex> verts;
         std::vector<std::uint16_t> indices;
         std::uint32_t parts = 0;
+        std::vector<std::array<float, 4>> rects; // two-pass batches: screen boxes (NDC x0 y0 x1 y1) of the parts so far
     };
     MergeBatch m_merge;
+    FrameArena m_arena; // arrays of client-memory draws (merged batches, big 2-D batches): see FrameArena
+
+    // Screen box (NDC, grown by a few pixels) of the part's local bounding box under `model`; false when a corner is
+    // not in front of the camera (the box is then unbounded) or the camera has no matrices.
+    bool screenRect(const DrawPart &part, const Matrix4 &model, std::array<float, 4> &rect) const
+    {
+        if (!m_camera.useMatrices)
+            return false;
+        const Matrix4 &view = m_camera.view, &projection = m_camera.projection;
+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const float p[3] = {part.bounds[(corner & 1) ? 3 : 0], part.bounds[(corner & 2) ? 4 : 1], part.bounds[(corner & 4) ? 5 : 2]};
+            float w[3], v[3], c[4];
+            for (int r = 0; r < 3; ++r)
+                w[r] = model[r] * p[0] + model[4 + r] * p[1] + model[8 + r] * p[2] + model[12 + r];
+            for (int r = 0; r < 3; ++r)
+                v[r] = view[r] * w[0] + view[4 + r] * w[1] + view[8 + r] * w[2] + view[12 + r];
+            for (int r = 0; r < 4; ++r)
+                c[r] = projection[r] * v[0] + projection[4 + r] * v[1] + projection[8 + r] * v[2] + projection[12 + r];
+            if (!(c[3] > 1.0e-4f))
+                return false;
+            const float x = c[0] / c[3], y = c[1] / c[3];
+            x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+        }
+        constexpr float kMargin = 0.01f; // 2.4 pixels of a 960-wide picture
+        rect = {x0 - kMargin, y0 - kMargin, x1 + kMargin, y1 + kMargin};
+        return true;
+    }
 
     // Adds the part to the pending batch (drawing the batch first when the state differs). False: the part is not
     // eligible and nothing was changed. `model` is the matrix currently pushed by drawMeshImpl.
     bool tryMergePart(DrawPart &part, const Matrix4 &model, const MeshDrawState &state)
     {
-        if (part.cpuIndices.empty() || part.skinned || part.gpuVertices.size() != part.sourceVertices.size())
+        MeshTiming &refused = m_target ? m_meshTimingTarget : m_meshTiming;
+        // refusal reasons, counted for the diagnostic line: 0 skinned, 1 too many vertices / no triangle list, 2 matrix
+        // not affine, 3 dual pass, 4 environment pass, 5 drawn twice (alpha test), 6 lights the kernel cannot do
+        if (part.skinned)
+        {
+            ++refused.mergeRefused[0];
             return false;
+        }
+        if (part.cpuIndices.empty() || part.gpuVertices.size() != part.sourceVertices.size())
+        {
+            ++refused.mergeRefused[1];
+            return false;
+        }
         const std::size_t count = part.sourceVertices.size();
         if (count > meshMergeMaxVerts() || !meshFastRegenEnabled())
+        {
+            ++refused.mergeRefused[1];
             return false;
+        }
         if (model[3] != 0.0f || model[7] != 0.0f || model[11] != 0.0f || model[15] != 1.0f)
+        {
+            ++refused.mergeRefused[2];
             return false;
+        }
         const std::uint32_t material = part.materialIndex;
         if (material < state.materialDualPasses.size() && state.materialDualPasses[material].enabled &&
             !state.materialDualPasses[material].textureName.empty())
+        {
+            ++refused.mergeRefused[3];
             return false;
+        }
         if (material < state.materialEnvPasses.size() && state.materialEnvPasses[material].enabled && part.hasNormals &&
             !state.materialEnvPasses[material].textureName.empty())
+        {
+            ++refused.mergeRefused[4];
             return false;
+        }
         MergeSig sig;
         sig.alpha = state.alphaTest;
+        std::array<float, 4> rect{};
         if (alphaTestFbOnly(state.alphaTest))
         {
             if (alphaTestFailPass(state.alphaTest).function != 0u)
-                return false; // drawn twice
-            sig.alpha = alphaTestSinglePass(state.alphaTest);
+            {
+                // Drawn twice. P1(A) P2(A) P1(B) P2(B) and P1(A) P1(B) P2(A) P2(B) differ only where A's second pass and
+                // B's first pass touch the same pixel, so a part joins a batch of two-pass parts only when its screen box
+                // is clear of theirs (the box is that of the part's local bounding box).
+                if (!meshMergeTwiceEnabled() || !part.hasBounds || !state.depthTest || !screenRect(part, model, rect))
+                {
+                    ++refused.mergeRefused[5];
+                    return false;
+                }
+                sig.twice = true;
+                sig.alpha = alphaTestPassOne(state.alphaTest);
+                sig.alpha2 = alphaTestFailPass(state.alphaTest);
+            }
+            else
+                sig.alpha = alphaTestSinglePass(state.alphaTest);
         }
         const auto &color = material < state.materialColors.size() ? state.materialColors[material] : part.color;
         const MeshDrawState::UvTransform defaultUv{};
         const MeshDrawState::UvTransform &uv =
             material < state.materialUvTransforms.size() ? state.materialUvTransforms[material] : defaultUv;
+        // The same inputs as the last bake of this part: its world-space vertices can be copied.
+        const bool reusable = part.mergeKey.valid && part.mergeVerts.size() == count &&
+            part.mergeKey.mismatch(model, part.material, color, part.lighting, part.hasPrelight, state, uv) == 0u;
         detail::RegenContext context;
-        if (!detail::prepareRegenContext(context, model, state.skinPalette, part.material, color, part.lighting,
-                                         part.hasPrelight, state, uv))
+        if (!reusable && !detail::prepareRegenContext(context, model, state.skinPalette, part.material, color, part.lighting,
+                                                      part.hasPrelight, state, uv))
+        {
+            ++refused.mergeRefused[6];
             return false;
+        }
         sig.fog = state.fog;
         sig.gouraud = state.gouraudShading;
         sig.depthTest = state.depthTest;
@@ -3013,28 +3531,80 @@ private:
         const auto &textureName = material < state.materialTextures.size() ? state.materialTextures[material] : part.textureName;
         if (!textureName.empty())
         {
-            const auto found = m_textures.find(textureKey(textureName));
-            if (found != m_textures.end())
+            if (const GLuint id = lookupTexture(textureName))
             {
-                sig.texture = found->second;
+                sig.texture = id;
                 sig.sampler = resolveMeshSampler(state, material < state.materialSamplers.size() ? &state.materialSamplers[material] : nullptr);
             }
         }
-        if (m_merge.parts &&
-            (!sig.same(m_merge.sig) || m_merge.verts.size() + count > 65535u))
+        bool flushFirst = m_merge.parts && (!sig.same(m_merge.sig) || m_merge.verts.size() + count > 65535u);
+        if (m_merge.parts && !flushFirst && sig.twice)
+            for (const auto &known : m_merge.rects)
+                if (rect[0] < known[2] && known[0] < rect[2] && rect[1] < known[3] && known[1] < rect[3])
+                {
+                    flushFirst = true;
+                    break;
+                }
+        static int rectTrace = [] { const char *v = std::getenv("P3FES_MERGE_RECT_TRACE"); return v ? std::atoi(v) : 0; }();
+        if (rectTrace > 0 && sig.twice && m_instanceFrame > 800)
+        {
+            --rectTrace;
+            std::fprintf(stderr, "[merge-rect] f=%u part verts=%zu rect=(%.3f,%.3f)-(%.3f,%.3f) batch parts=%u rects=%zu flushFirst=%d depthTest=%d depthWrite=%d blend=%d model.t=(%.1f,%.1f,%.1f) bounds=(%.1f %.1f %.1f)-(%.1f %.1f %.1f)\n",
+                         m_instanceFrame, count, rect[0], rect[1], rect[2], rect[3], m_merge.parts, m_merge.rects.size(), flushFirst ? 1 : 0,
+                         sig.depthTest, sig.depthWrite, sig.blendEnabled, model[12], model[13], model[14],
+                         part.bounds[0], part.bounds[1], part.bounds[2], part.bounds[3], part.bounds[4], part.bounds[5]);
+        }
+        if (flushFirst)
             flushMerge(&model);
         if (!m_merge.parts)
             m_merge.sig = sig;
+        if (sig.twice)
+            m_merge.rects.push_back(rect);
         const std::size_t base = m_merge.verts.size();
         m_merge.verts.resize(base + count);
         GpuVertex *out = m_merge.verts.data() + base;
-        detail::regenerateVertices(context, false, nullptr, part.sourceVertices.data(), out, count);
-        for (std::size_t i = 0; i < count; ++i)
+        static const bool verify = [] { const char *v = std::getenv("P3FES_MERGE_VERIFY"); return v && *v == '1'; }();
+        const auto bake = [&](GpuVertex *destination) {
+            detail::RegenContext fresh;
+            const detail::RegenContext &ctx = reusable ? (detail::prepareRegenContext(fresh, model, state.skinPalette, part.material, color,
+                                                                                      part.lighting, part.hasPrelight, state, uv), fresh)
+                                                       : context;
+            detail::regenerateVertices(ctx, false, nullptr, part.sourceVertices.data(), destination, count);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const auto &p = part.sourceVertices[i].position;
+                destination[i].position[0] = model[0] * p[0] + model[4] * p[1] + model[8] * p[2] + model[12];
+                destination[i].position[1] = model[1] * p[0] + model[5] * p[1] + model[9] * p[2] + model[13];
+                destination[i].position[2] = model[2] * p[0] + model[6] * p[1] + model[10] * p[2] + model[14];
+            }
+        };
+        MeshTiming &mt = m_target ? m_meshTimingTarget : m_meshTiming;
+        if (reusable)
         {
-            const auto &p = part.sourceVertices[i].position;
-            out[i].position[0] = model[0] * p[0] + model[4] * p[1] + model[8] * p[2] + model[12];
-            out[i].position[1] = model[1] * p[0] + model[5] * p[1] + model[9] * p[2] + model[13];
-            out[i].position[2] = model[2] * p[0] + model[6] * p[1] + model[10] * p[2] + model[14];
+            std::memcpy(out, part.mergeVerts.data(), count * sizeof(GpuVertex));
+            ++mt.mergeReused;
+            if (verify)
+            {
+                std::vector<GpuVertex> check(count);
+                bake(check.data());
+                if (std::memcmp(check.data(), out, count * sizeof(GpuVertex)) != 0)
+                    ++mt.mergeVerifyBad;
+            }
+        }
+        else
+        {
+            bake(out);
+            ++mt.mergeBaked;
+            const std::size_t held = part.mergeVerts.capacity() * sizeof(GpuVertex);
+            if (g_mergeCacheBytes - std::min(g_mergeCacheBytes, held) + count * sizeof(GpuVertex) <= meshMergeCacheBytes())
+            {
+                g_mergeCacheBytes = g_mergeCacheBytes - std::min(g_mergeCacheBytes, held);
+                part.mergeVerts.assign(out, out + count);
+                g_mergeCacheBytes += part.mergeVerts.capacity() * sizeof(GpuVertex);
+                part.mergeKey.capture(model, part.material, color, part.lighting, part.hasPrelight, state, uv);
+            }
+            else
+                part.mergeKey.invalidate();
         }
         const std::size_t firstIndex = m_merge.indices.size();
         m_merge.indices.resize(firstIndex + part.cpuIndices.size());
@@ -3055,10 +3625,35 @@ private:
         if (activeModel)
             glPopMatrix();
         const MergeSig &sig = m_merge.sig;
+        // The GPU reads these arrays when the scene renders, long after this call: they go to memory that is not
+        // reused for several frames (a std::vector refilled by the next batch gave wrong triangles).
+        const std::size_t vertexBytes = m_merge.verts.size() * sizeof(GpuVertex);
+        const std::size_t indexBytes = m_merge.indices.size() * sizeof(std::uint16_t);
+        // P3FES_MERGE_INPLACE=1 (diagnostic): the old behaviour, draw from the batch's own vectors, and scribble over
+        // them right after the draw call, as the next batch would. If vitaGL copies the arrays at the draw call this
+        // changes nothing; if it keeps pointing at them the merged geometry breaks.
+        static const bool inPlace = [] { const char *v = std::getenv("P3FES_MERGE_INPLACE"); return v && *v == '1'; }();
+        GpuVertex *vertices = inPlace ? m_merge.verts.data()
+                                      : static_cast<GpuVertex *>(m_arena.copy(m_merge.verts.data(), vertexBytes));
+        std::uint16_t *indices = inPlace ? m_merge.indices.data()
+                                         : static_cast<std::uint16_t *>(m_arena.copy(m_merge.indices.data(), indexBytes));
+        if (!vertices || !indices)
+        {
+            m_merge.verts.clear();
+            m_merge.indices.clear();
+            m_merge.rects.clear();
+            m_merge.parts = 0;
+            if (activeModel)
+            {
+                glPushMatrix();
+                glMultMatrixf(activeModel->data());
+            }
+            return; // out of memory: the batch is lost rather than drawn from memory that will change
+        }
         glsAlpha(sig.alpha);
         glsFog(sig.fog);
         glsShade(sig.gouraud);
-        glsCap(m_gl.depthTest, GL_DEPTH_TEST, sig.depthTest);
+        glsCap(m_gl.depthTest, GL_DEPTH_TEST, sig.depthTest, kCacheDepth);
         glsDepthMask(sig.depthWrite);
         glsCull(sig.cull);
         glsBlend(sig.blendEnabled, sig.blendEnabled && sig.subtract, sig.src, sig.dst);
@@ -3066,7 +3661,6 @@ private:
         glsBindArray(0);
         glsClient(m_gl.vtxArr, GL_VERTEX_ARRAY, true);
         glsClient(m_gl.colArr, GL_COLOR_ARRAY, true);
-        const GpuVertex *vertices = m_merge.verts.data();
         glVertexPointer(3, GL_FLOAT, sizeof(GpuVertex), &vertices[0].position[0]);
         glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(GpuVertex), &vertices[0].color[0]);
         m_gl.ptrBuf = kClientMemory;
@@ -3076,11 +3670,26 @@ private:
             glTexCoordPointer(2, GL_FLOAT, sizeof(GpuVertex), &vertices[0].uv[0]);
             m_gl.texPtrBuf = kClientMemory;
         }
-        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(m_merge.indices.size()), GL_UNSIGNED_SHORT, m_merge.indices.data());
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(m_merge.indices.size()), GL_UNSIGNED_SHORT, indices);
+        if (sig.twice)
+        {
+            // the pixels that failed the test: still drawn, Z not written (as the unmerged two-pass draw does)
+            glsAlpha(sig.alpha2);
+            glsDepthMask(false);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(m_merge.indices.size()), GL_UNSIGNED_SHORT, indices);
+            glsDepthMask(sig.depthWrite);
+            glsAlpha(sig.alpha);
+        }
+        if (inPlace)
+        {
+            std::memset(m_merge.indices.data(), 0, indexBytes);
+            std::memset(m_merge.verts.data(), 0, vertexBytes);
+        }
         MeshTiming &t = m_target ? m_meshTimingTarget : m_meshTiming;
         ++t.mergeBatches;
         m_merge.verts.clear();
         m_merge.indices.clear();
+        m_merge.rects.clear();
         m_merge.parts = 0;
         if (activeModel)
         {
@@ -3176,6 +3785,16 @@ template <typename Viewport, typename Fit>
     std::unordered_map<MeshId, std::vector<DrawPart>> m_meshes;
     std::unordered_map<std::string, GLuint> m_textures;
     std::unordered_map<std::string, std::array<std::uint32_t, 2>> m_textureSizes;
+    std::string m_keyScratch;
+    // GL texture of a name (case-insensitive), 0 when there is none; no allocation in the steady state.
+    GLuint lookupTexture(std::string_view name)
+    {
+        m_keyScratch.assign(name.data(), name.size());
+        for (char &ch : m_keyScratch)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        const auto found = m_textures.find(m_keyScratch);
+        return found == m_textures.end() ? 0u : found->second;
+    }
 
     // Edge placements draw into a magnified viewport and keep only the margin next to the 4:3 picture.
     void applyWorldScissor()
@@ -3227,10 +3846,508 @@ template <typename Viewport, typename Fit>
         m_in3D = true;
     }
 };
+
+// ---- P3FES_AB_FRAME: pixel-exact A/B comparison of the fast paths, inside one process ----------------------------------
+// Comparing screenshots of two runs does not work for this game: the scene is never in the same state twice. This
+// wrapper records every renderer call of a chosen frame, lets the frame go through as usual (the TEST pass, drawn with
+// the switches the environment asked for), reads the picture back, then replays the recorded calls on the same
+// textures and meshes with every fast path off (the REFERENCE pass), with the test switches again (TEST2) and with the
+// fast paths off again (REF2: the noise of the platform, to tell from a difference of the paths), and reports how the
+// pictures differ. The pictures to compare are REF and TEST2: both are replays; the live frame can differ in what the
+// game changed in the frame without going through this interface (particle textures) and in what is shown when.
+//   P3FES_AB_FRAME=<first beginFrame number>  P3FES_AB_EVERY=<frames between comparisons, default 240>
+//   P3FES_AB_COUNT=<comparisons, default 4>   P3FES_AB_DUMP=1 writes ux0:data/p3fes/ab-<n>-{test,ref}.p3fb
+// The replayed frames are presented too (the screen flickers once): a diagnostic, not for play.
+class AbRenderer final : public Renderer
+{
+public:
+    explicit AbRenderer(std::unique_ptr<VitaGlRenderer> inner) : m_in(std::move(inner))
+    {
+        const auto number = [](const char *name, long fallback) {
+            const char *value = std::getenv(name);
+            return value ? std::strtol(value, nullptr, 10) : fallback;
+        };
+        m_first = number("P3FES_AB_FRAME", 1000);
+        m_every = std::max(number("P3FES_AB_EVERY", 240), 1l);
+        m_count = number("P3FES_AB_COUNT", 4);
+        const char *dump = std::getenv("P3FES_AB_DUMP");
+        m_dump = dump && *dump == '1';
+        m_runs = static_cast<int>(std::clamp(number("P3FES_AB_RUNS", 5), 1l, 50l));
+        // P3FES_AB_MODES=cache,cache+merge,cache+merge+s2d : the switch sets to compare with the reference
+        // (default: what the environment switched on).
+        if (const char *list = std::getenv("P3FES_AB_MODES"))
+        {
+            std::string text(list);
+            std::size_t from = 0;
+            while (from <= text.size())
+            {
+                const std::size_t comma = std::min(text.find(',', from), text.size());
+                const std::string name = text.substr(from, comma - from);
+                VitaGlRenderer::Modes modes;
+                modes.glCache = name.find("cache") != std::string::npos;
+                modes.merge = name.find("merge") != std::string::npos;
+                modes.screenCache = name.find("s2d") != std::string::npos;
+                // "-alpha" etc.: that kind of state is not cached (see VitaGlRenderer::kCache*)
+                for (const auto &[word, bit] : {std::pair<const char *, int>{"-alpha", 1}, {"-fog", 2}, {"-shade", 4}, {"-depth", 8},
+                                                {"-cull", 16}, {"-blend", 32}, {"-bind", 64}, {"-ptr", 128}, {"-tex", 256}})
+                    if (name.find(word) != std::string::npos)
+                        modes.skip |= bit;
+                if (!name.empty())
+                    m_tests.emplace_back(name, modes);
+                from = comma + 1;
+            }
+        }
+    }
+
+    bool open(int w, int h, const char *title, std::string &error) override { return m_in->open(w, h, title, error); }
+    void close() override { m_in->close(); }
+    bool shouldClose() const override { return m_in->shouldClose(); }
+    void setTargetFps(int fps) override { m_in->setTargetFps(fps); }
+    bool uploadTexture(const TextureData &t, std::string &error) override { return m_in->uploadTexture(t, error); }
+    void removeTexture(std::string_view name) override { m_in->removeTexture(name); }
+    bool uploadMesh(MeshId id, const MeshData &mesh, std::string &error) override { return m_in->uploadMesh(id, mesh, error); }
+    void removeMesh(MeshId id) override { m_in->removeMesh(id); }
+    void beginTextureTarget(std::string_view name, int w, int h) override
+    {
+        if (m_recording)
+            m_poisoned = true; // not replayable
+        m_in->beginTextureTarget(name, w, h);
+    }
+    void endTextureTarget() override { m_in->endTextureTarget(); }
+    void setWidescreen(int mode) override
+    {
+        m_widescreen = mode;
+        if (m_recording) record(Op::Widescreen).a = mode;
+        m_in->setWidescreen(mode);
+    }
+    void setScreenPlacement(ScreenPlacement placement) override
+    {
+        m_screenPlacement = placement;
+        if (m_recording) record(Op::ScreenPlacement).a = static_cast<int>(placement);
+        m_in->setScreenPlacement(placement);
+    }
+    bool setWorldPlacement(WorldPlacement placement) override
+    {
+        const bool supported = m_in->setWorldPlacement(placement);
+        m_worldPlacement = placement;
+        if (m_recording) record(Op::WorldPlacement).a = static_cast<int>(placement);
+        return supported;
+    }
+    bool captureNextFrame(const std::string &path) override { return m_in->captureNextFrame(path); }
+    bool snapshotFramebuffer(std::string_view name, int tw, int th, int sw, int sh) override
+    {
+        if (m_recording)
+            m_poisoned = true;
+        return m_in->snapshotFramebuffer(name, tw, th, sw, sh);
+    }
+
+    void beginFrame(const Camera &camera, ClearColor clear) override
+    {
+        ++m_frame;
+        m_recording = m_done < m_count && m_frame >= m_first && (m_frame - m_first) % m_every == 0;
+        m_poisoned = false;
+        m_ops.clear();
+        m_meshes = 0;
+        if (m_recording)
+        {
+            m_startCamera = camera;
+            m_startClear = clear;
+            m_startWidescreen = m_widescreen;
+            m_startScreenPlacement = m_screenPlacement;
+            m_startWorldPlacement = m_worldPlacement;
+        }
+        m_in->beginFrame(camera, clear);
+    }
+    void setCamera(const Camera &camera) override
+    {
+        if (m_recording)
+            record(Op::Camera).camera = camera;
+        m_in->setCamera(camera);
+    }
+    void clear(ClearColor color, bool colorBuffer, bool depthBuffer) override
+    {
+        if (m_recording)
+        {
+            Op &op = record(Op::Clear);
+            op.clear = color;
+            op.a = colorBuffer;
+            op.b = depthBuffer;
+        }
+        m_in->clear(color, colorBuffer, depthBuffer);
+    }
+    void drawMesh(MeshId id, const Matrix4 &model, const MeshDrawState &state = {}) override
+    {
+        if (m_recording)
+        {
+            Op &op = record(Op::Mesh);
+            op.id = id;
+            op.model = model;
+            op.state = state;
+            ++m_meshes;
+        }
+        m_in->drawMesh(id, model, state);
+    }
+    void drawWorldLines(const std::vector<Vertex> &vertices, const Matrix4 &model, std::string_view textureName = {},
+                        const MeshDrawState &state = {}) override
+    {
+        if (m_recording)
+        {
+            Op &op = record(Op::WorldLines);
+            op.vertices = vertices;
+            op.model = model;
+            op.name = std::string(textureName);
+            op.state = state;
+        }
+        m_in->drawWorldLines(vertices, model, textureName, state);
+    }
+    void drawScreenTriangles(const std::vector<ScreenVertex> &vertices, float w, float h, std::string_view textureName = {},
+                             const ScreenDrawState &state = {}) override
+    {
+        if (m_recording)
+        {
+            Op &op = record(Op::ScreenTriangles);
+            op.screen = vertices;
+            op.w = w;
+            op.h = h;
+            op.name = std::string(textureName);
+            op.screenState = state;
+        }
+        m_in->drawScreenTriangles(vertices, w, h, textureName, state);
+    }
+    void drawScreenLines(const std::vector<ScreenVertex> &vertices, float w, float h, std::string_view textureName = {},
+                         const ScreenDrawState &state = {}) override
+    {
+        if (m_recording)
+        {
+            Op &op = record(Op::ScreenLines);
+            op.screen = vertices;
+            op.w = w;
+            op.h = h;
+            op.name = std::string(textureName);
+            op.screenState = state;
+        }
+        m_in->drawScreenLines(vertices, w, h, textureName, state);
+    }
+    std::string drainDiagReport() override { return m_in->drainDiagReport(); }
+
+    void endFrame() override
+    {
+        if (!m_recording)
+        {
+            m_in->endFrame();
+            return;
+        }
+        m_recording = false;
+        const VitaGlRenderer::Modes live = m_in->modes();
+        Image a;
+        m_in->readFramebuffer(a.rgba, a.w, a.h);
+        m_in->endFrame();
+        ++m_done; // numbers the screenshots of this comparison
+        --m_done;
+        if (m_poisoned || m_ops.empty())
+        {
+            std::fprintf(stderr, "[ab] frame %ld: skipped (%s)\n", m_frame, m_poisoned ? "render target or snapshot inside the frame" : "no draws");
+            return;
+        }
+        ++m_done;
+        std::vector<std::pair<std::string, VitaGlRenderer::Modes>> tests = m_tests;
+        if (tests.empty())
+            tests.emplace_back("live", live);
+        std::fprintf(stderr, "[ab] frame %ld #%ld: ops=%u meshes=%u\n", m_frame, m_done, static_cast<unsigned>(m_ops.size()), m_meshes);
+        Image reference = replay(VitaGlRenderer::Modes{}, nullptr, true);
+        shot("ref");
+        Image reference2 = replay(VitaGlRenderer::Modes{}, nullptr, true);
+        shot("ref2");
+        std::fprintf(stderr, "[ab]   ref-vs-ref2 (platform noise): ");
+        report("", reference, reference2);
+        std::fprintf(stderr, "\n[ab]   live(%s%s%s)-vs-ref: ", live.glCache ? "cache " : "", live.merge ? "merge " : "", live.screenCache ? "s2d" : "");
+        report("", a, reference);
+        std::fprintf(stderr, "\n");
+        if (m_dump)
+        {
+            dump("test", a);
+            dump("ref", reference);
+        }
+        for (std::size_t t = 0; t < tests.size(); ++t)
+        {
+            Image image = replay(tests[t].second, nullptr, true);
+            shot(("m" + std::to_string(t)).c_str());
+            std::fprintf(stderr, "[ab]   ref-vs-%s: ", tests[t].first.c_str());
+            report("", reference, image);
+            std::fprintf(stderr, "\n");
+            if (countOver(reference, image, 32) > 50)
+                bisect(tests[t].first.c_str(), tests[t].second, reference);
+            if (m_dump)
+                dump(("m" + std::to_string(t)).c_str(), image);
+        }
+        // Host-thread cost of the same frame per mode, median of m_runs replays (microseconds).
+        std::vector<std::pair<std::string, VitaGlRenderer::Modes>> timed;
+        timed.emplace_back("ref", VitaGlRenderer::Modes{});
+        for (const auto &t : tests)
+            timed.push_back(t);
+        std::vector<std::vector<Timing>> samples(timed.size());
+        for (int run = 0; run < m_runs; ++run)
+            for (std::size_t t = 0; t < timed.size(); ++t)
+            {
+                Timing timing;
+                replay(timed[t].second, &timing, false);
+                samples[t].push_back(timing);
+            }
+        for (std::size_t t = 0; t < timed.size(); ++t)
+        {
+            const auto median = [&](double Timing::*field) {
+                std::vector<double> v;
+                for (const Timing &x : samples[t]) v.push_back(x.*field);
+                std::sort(v.begin(), v.end());
+                return v[v.size() / 2];
+            };
+            std::fprintf(stderr, "[ab]   cost %-14s total=%.2f ms: begin=%.2f mesh=%.2f screen=%.2f other=%.2f (runs=%d)\n",
+                         timed[t].first.c_str(), median(&Timing::total) / 1000.0, median(&Timing::begin) / 1000.0,
+                         median(&Timing::mesh) / 1000.0, median(&Timing::screen) / 1000.0, median(&Timing::other) / 1000.0, m_runs);
+        }
+        m_in->setModes(live);
+    }
+
+private:
+    struct Op
+    {
+        enum Kind { Widescreen, ScreenPlacement, WorldPlacement, Camera, Clear, Mesh, WorldLines, ScreenTriangles, ScreenLines } kind;
+        int a = 0, b = 0;
+        native_renderer::Camera camera;
+        ClearColor clear;
+        MeshId id = 0;
+        Matrix4 model{};
+        MeshDrawState state;
+        std::vector<Vertex> vertices;
+        std::vector<ScreenVertex> screen;
+        std::string name;
+        float w = 0.0f, h = 0.0f;
+        ScreenDrawState screenState;
+    };
+    struct Image
+    {
+        std::vector<std::uint8_t> rgba;
+        int w = 0, h = 0;
+    };
+
+    Op &record(Op::Kind kind)
+    {
+        m_ops.emplace_back();
+        m_ops.back().kind = kind;
+        return m_ops.back();
+    }
+
+    struct Timing
+    {
+        double total = 0, begin = 0, mesh = 0, screen = 0, other = 0;
+    };
+    static double nowUs()
+    {
+#if defined(__vita__)
+        return static_cast<double>(sceKernelGetProcessTimeWide());
+#else
+        return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+    }
+
+    // Draws the recorded frame again with the given switches; with `timing` it measures the host thread's cost of the
+    // calls (not the swap), with `read` it returns the picture.
+    Image replay(const VitaGlRenderer::Modes &modes, Timing *timing, bool read, int testMeshes = -1)
+    {
+        double mark = nowUs();
+        const double start = mark;
+        int meshOrdinal = 0;
+        const auto lap = [&](double Timing::*field) {
+            if (!timing)
+                return;
+            const double now = nowUs();
+            timing->*field += now - mark;
+            mark = now;
+        };
+        m_in->setModes(modes);
+        mark = nowUs();
+        m_in->setWidescreen(m_startWidescreen);
+        m_in->setScreenPlacement(m_startScreenPlacement);
+        m_in->setWorldPlacement(m_startWorldPlacement);
+        m_in->beginFrame(m_startCamera, m_startClear);
+        lap(&Timing::begin);
+        for (const Op &op : m_ops)
+        {
+            switch (op.kind)
+            {
+            case Op::Widescreen: m_in->setWidescreen(op.a); lap(&Timing::other); break;
+            case Op::ScreenPlacement: m_in->setScreenPlacement(static_cast<ScreenPlacement>(op.a)); lap(&Timing::other); break;
+            case Op::WorldPlacement: m_in->setWorldPlacement(static_cast<WorldPlacement>(op.a)); lap(&Timing::other); break;
+            case Op::Camera: m_in->setCamera(op.camera); lap(&Timing::other); break;
+            case Op::Clear: m_in->clear(op.clear, op.a != 0, op.b != 0); lap(&Timing::other); break;
+            case Op::Mesh:
+                // bisecting: the first `testMeshes` mesh draws use `modes`, the others the reference
+                if (testMeshes >= 0 && meshOrdinal++ == testMeshes)
+                    m_in->setModes(VitaGlRenderer::Modes{});
+                m_in->drawMesh(op.id, op.model, op.state);
+                lap(&Timing::mesh);
+                break;
+            case Op::WorldLines: m_in->drawWorldLines(op.vertices, op.model, op.name, op.state); lap(&Timing::other); break;
+            case Op::ScreenTriangles: m_in->drawScreenTriangles(op.screen, op.w, op.h, op.name, op.screenState); lap(&Timing::screen); break;
+            case Op::ScreenLines: m_in->drawScreenLines(op.screen, op.w, op.h, op.name, op.screenState); lap(&Timing::screen); break;
+            }
+        }
+        m_in->drainPending();
+        lap(&Timing::screen);
+        if (timing)
+            timing->total = nowUs() - start;
+        Image image;
+        if (read)
+            m_in->readFramebuffer(image.rgba, image.w, image.h);
+        m_in->endFrame();
+        return image;
+    }
+
+    static std::uint64_t countOver(const Image &a, const Image &b, int limit)
+    {
+        if (a.rgba.size() != b.rgba.size())
+            return ~0ull;
+        std::uint64_t n = 0;
+        for (std::size_t i = 0; i + 3 < a.rgba.size(); i += 4)
+        {
+            int d = 0;
+            for (int c = 0; c < 3; ++c)
+                d = std::max(d, std::abs(static_cast<int>(a.rgba[i + static_cast<std::size_t>(c)]) - static_cast<int>(b.rgba[i + static_cast<std::size_t>(c)])));
+            n += d > limit;
+        }
+        return n;
+    }
+
+    // Finds the first mesh draw of the frame whose drawing with the test switches (everything before it drawn the same
+    // way) already changes the picture, and says what that draw is.
+    void bisect(const char *label, const VitaGlRenderer::Modes &modes, const Image &reference)
+    {
+        std::vector<const Op *> meshes;
+        for (const Op &op : m_ops)
+            if (op.kind == Op::Mesh)
+                meshes.push_back(&op);
+        int lo = 0, hi = static_cast<int>(meshes.size());
+        while (hi - lo > 1)
+        {
+            const int mid = (lo + hi) / 2;
+            const Image image = replay(modes, nullptr, true, mid);
+            if (countOver(reference, image, 32) > 50)
+                hi = mid;
+            else
+                lo = mid;
+        }
+        const Op &op = *meshes[static_cast<std::size_t>(hi - 1)];
+        const MeshDrawState &st = op.state;
+        std::fprintf(stderr,
+                     "[ab]   bisect %s: first differing mesh draw is #%d of %u: id=%llu depthTest=%d depthWrite=%d cull=%d blend=%d gouraud=%d "
+                     "alpha(enabled=%d function=0x%x ref=%u) fog=%d lighting=%d textures=%u blends=%u dual=%u env=%u colors=%u\n",
+                     label, hi - 1, static_cast<unsigned>(meshes.size()), static_cast<unsigned long long>(op.id), st.depthTest, st.depthWrite,
+                     static_cast<int>(st.cullMode), st.blendEnabled, st.gouraudShading, st.alphaTest.enabled,
+                     st.alphaTest.function, st.alphaTest.reference, st.fog.enabled, st.lightingEnabled,
+                     static_cast<unsigned>(st.materialTextures.size()), static_cast<unsigned>(st.materialBlends.size()),
+                     static_cast<unsigned>(st.materialDualPasses.size()), static_cast<unsigned>(st.materialEnvPasses.size()),
+                     static_cast<unsigned>(st.materialColors.size()));
+        for (std::size_t b = 0; b < st.materialBlends.size() && b < 6; ++b)
+            std::fprintf(stderr, "[ab]     material %u: blend enabled=%d src=%u dst=%u subtract=%d | texture=%s | dual=%d env=%d\n", static_cast<unsigned>(b),
+                         st.materialBlends[b].enabled, st.materialBlends[b].src, st.materialBlends[b].dst, st.materialBlends[b].subtract,
+                         b < st.materialTextures.size() ? st.materialTextures[b].c_str() : "-",
+                         b < st.materialDualPasses.size() ? st.materialDualPasses[b].enabled : 0,
+                         b < st.materialEnvPasses.size() ? st.materialEnvPasses[b].enabled : 0);
+        m_in->setModes(modes);
+    }
+
+    static void report(const char *, const Image &a, const Image &b)
+    {
+        if (a.w != b.w || a.h != b.h || a.rgba.size() != b.rgba.size())
+        {
+            std::fprintf(stderr, "sizes differ");
+            return;
+        }
+        std::uint64_t differing = 0, over8 = 0, over32 = 0, sum = 0;
+        int max = 0, x0 = a.w, y0 = a.h, x1 = -1, y1 = -1;
+        for (int y = 0; y < a.h; ++y)
+            for (int x = 0; x < a.w; ++x)
+            {
+                const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(a.w) + static_cast<std::size_t>(x)) * 4u;
+                int d = 0;
+                for (int c = 0; c < 3; ++c)
+                    d = std::max(d, std::abs(static_cast<int>(a.rgba[i + c]) - static_cast<int>(b.rgba[i + c])));
+                if (!d)
+                    continue;
+                ++differing;
+                sum += static_cast<std::uint64_t>(d);
+                over8 += d > 8;
+                if (d > 32)
+                {
+                    ++over32;
+                    x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+                }
+                max = std::max(max, d);
+            }
+        std::fprintf(stderr, "differing=%llu (>8: %llu, >32: %llu) max=%d mean=%.2f bbox32=(%d,%d)-(%d,%d)",
+                     static_cast<unsigned long long>(differing), static_cast<unsigned long long>(over8),
+                     static_cast<unsigned long long>(over32), max, differing ? static_cast<double>(sum) / static_cast<double>(differing) : 0.0,
+                     x0, y0, x1, y1);
+    }
+
+    // Vita3K cannot read its framebuffer back (the readback is black): P3FES_AB_SHOT=1 has it save the displayed picture
+    // instead (the guest asks for a screenshot by name, see the vita3k-test skill). The pause lets the presenter show it.
+    void shot(const char *which) const
+    {
+#if defined(__vita__)
+        static const bool enabled = [] { const char *v = std::getenv("P3FES_AB_SHOT"); return v && *v == '1'; }();
+        if (!enabled)
+            return;
+        sceKernelDelayThread(400000);
+        sceClibPrintf("VITA3K_SCREENSHOT ab%ld-%s\n", m_done, which);
+        sceKernelDelayThread(400000);
+#else
+        (void)which;
+#endif
+    }
+
+    void dump(const char *which, const Image &image) const
+    {
+        char path[256];
+#if defined(__vita__)
+        std::snprintf(path, sizeof path, "ux0:data/p3fes/ab-%ld-%s.p3fb", m_done, which);
+#else
+        std::snprintf(path, sizeof path, "ab-%ld-%s.p3fb", m_done, which);
+#endif
+        if (FILE *file = std::fopen(path, "wb"))
+        {
+            const std::uint32_t header[2] = {static_cast<std::uint32_t>(image.w), static_cast<std::uint32_t>(image.h)};
+            std::fwrite("P3FB", 1, 4, file);
+            std::fwrite(header, sizeof(std::uint32_t), 2, file);
+            // GL order is bottom row first; P3FB is top row first.
+            for (int y = image.h - 1; y >= 0; --y)
+                std::fwrite(image.rgba.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(image.w) * 4u, 1,
+                            static_cast<std::size_t>(image.w) * 4u, file);
+            std::fclose(file);
+        }
+    }
+
+    std::unique_ptr<VitaGlRenderer> m_in;
+    std::vector<std::pair<std::string, VitaGlRenderer::Modes>> m_tests;
+    int m_runs = 5;
+    long m_first = 1000, m_every = 240, m_count = 4, m_done = 0, m_frame = 0;
+    bool m_dump = false, m_recording = false, m_poisoned = false;
+    std::vector<Op> m_ops;
+    unsigned m_meshes = 0;
+    native_renderer::Camera m_startCamera;
+    ClearColor m_startClear;
+    int m_widescreen = 0, m_startWidescreen = 0;
+    ScreenPlacement m_screenPlacement = ScreenPlacement::Centre, m_startScreenPlacement = ScreenPlacement::Centre;
+    WorldPlacement m_worldPlacement = WorldPlacement::Full, m_startWorldPlacement = WorldPlacement::Full;
+};
 } // namespace
 
 std::unique_ptr<Renderer> createPlatformRenderer()
 {
-    return std::make_unique<VitaGlRenderer>();
+    auto renderer = std::make_unique<VitaGlRenderer>();
+    if (std::getenv("P3FES_AB_FRAME"))
+        return std::make_unique<AbRenderer>(std::move(renderer));
+    return renderer;
 }
 } // namespace p3fes::native_renderer

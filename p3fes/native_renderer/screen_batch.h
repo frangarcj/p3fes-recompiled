@@ -209,22 +209,36 @@ struct ScreenBatch
         return r;
     }
 
-    bool accepts(float sw, float sh, std::uintptr_t tex, bool lin, Renderer::ScreenPlacement place,
-                 const ScreenDrawState &st, const ScreenVertex *incoming, std::size_t count) const
+    // Why a draw cannot join the batch: 0 it can, 1 no batch yet, 2 other size / placement / full, 3 another texture,
+    // 4 another filter, 5 other draw state, 6 overlaps an earlier quad of a two-pass state.
+    int whyNot(float sw, float sh, std::uintptr_t tex, bool lin, Renderer::ScreenPlacement place,
+               const ScreenDrawState &st, const ScreenVertex *incoming, std::size_t count) const
     {
-        if (!active || sw != sourceWidth || sh != sourceHeight || tex != texture || lin != linear ||
-            place != placement || vertices.size() + count > kMaxVertices || !sameScreenState(st, state))
-            return false;
+        if (!active)
+            return 1;
+        if (sw != sourceWidth || sh != sourceHeight || place != placement || vertices.size() + count > kMaxVertices)
+            return 2;
+        if (tex != texture)
+            return 3;
+        if (lin != linear)
+            return 4;
+        if (!sameScreenState(st, state))
+            return 5;
         if (ordered)
         {
             if (rects.size() >= kMaxOrderedDraws)
-                return false;
+                return 6;
             const std::array<float, 4> r = boundsOf(incoming, count);
             for (const auto &known : rects)
                 if (r[0] < known[2] && known[0] < r[2] && r[1] < known[3] && known[1] < r[3])
-                    return false;
+                    return 6;
         }
-        return true;
+        return 0;
+    }
+    bool accepts(float sw, float sh, std::uintptr_t tex, bool lin, Renderer::ScreenPlacement place,
+                 const ScreenDrawState &st, const ScreenVertex *incoming, std::size_t count) const
+    {
+        return whyNot(sw, sh, tex, lin, place, st, incoming, count) == 0;
     }
     void added(const ScreenVertex *incoming, std::size_t count)
     {
