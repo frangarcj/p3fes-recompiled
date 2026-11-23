@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Sun, 27 Sep 2026 18:40:35 +0200
+Subject: [PATCH] Prefix the glColorTable global as vgl_color_table
+
+The palette set by glColorTable lived in a global named color_table, which
+collides at link time with applications defining their own color_table
+(e.g. NJEMU's sprite colour lookup).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ source/shared.h          |  2 +-
+ source/textures.c        | 10 +++++-----
+ source/utils/gpu_utils.c |  2 +-
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/source/shared.h b/source/shared.h
+index 80e849a..5e3e91d 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1088,7 +1088,7 @@ extern texture_unit texture_units[COMBINED_TEXTURE_IMAGE_UNITS_NUM]; // Availabl
+ extern texture texture_slots[TEXTURES_NUM]; // Available texture slots
+ extern int8_t server_texture_unit; // Current in use server side texture unit
+ extern int8_t client_texture_unit; // Current in use client side texture unit
+-extern void *color_table; // Current in-use color table
++extern void *vgl_color_table; // Current in-use color table
+ extern int unpack_row_len; // Current setting for GL_UNPACK_ROW_LENGTH
+ 
+ // Matrices
+diff --git a/source/textures.c b/source/textures.c
+index 3f3c750..909a82b 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -77,7 +77,7 @@ texture_unit texture_units[COMBINED_TEXTURE_IMAGE_UNITS_NUM]; // Available textu
+ texture texture_slots[TEXTURES_NUM]; // Available texture slots
+ sampler *samplers[COMBINED_TEXTURE_IMAGE_UNITS_NUM] = {NULL}; // Sampler objects bindings
+ 
+-void *color_table = NULL; // Current in-use color table
++void *vgl_color_table = NULL; // Current in-use color table
+ int8_t server_texture_unit = 0; // Current in use server side texture unit
+ int unpack_row_len = 0; // Current setting for GL_UNPACK_ROW_LENGTH
+ 
+@@ -2077,9 +2077,9 @@ void glColorTable(GLenum target, GLenum internalformat, GLsizei width, GLenum fo
+ 	THREAD_SAFE()
+ 
+ 	// Checking if a color table is already enabled, if so, deallocating it
+-	if (color_table != NULL) {
+-		gpu_free_palette(color_table);
+-		color_table = NULL;
++	if (vgl_color_table != NULL) {
++		gpu_free_palette(vgl_color_table);
++		vgl_color_table = NULL;
+ 	}
+ 
+ 	// Calculating color table bpp
+@@ -2099,7 +2099,7 @@ void glColorTable(GLenum target, GLenum internalformat, GLsizei width, GLenum fo
+ 	}
+ 
+ 	// Allocating and initializing color table
+-	color_table = gpu_alloc_palette(data, width, bpp);
++	vgl_color_table = gpu_alloc_palette(data, width, bpp);
+ }
+ 
+ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+index 4464db5..93a9a61 100644
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -430,7 +430,7 @@ void gpu_alloc_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format, const
+ 		tex->mip_count = 1;
+ 		vglInitLinearTexture(&tex->gxm_tex, texture_data, format, w, h, tex->mip_count);
+ 		if ((format & 0x9F000000U) == SCE_GXM_TEXTURE_BASE_FORMAT_P8)
+-			tex->palette_data = color_table;
++			tex->palette_data = vgl_color_table;
+ 		else
+ 			tex->palette_data = NULL;
+ 		tex->status = TEX_VALID;

@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Sat, 3 Oct 2026 09:27:27 +0200
+Subject: [PATCH] VGL_EXT_multidraw: vglMultiDrawElementsUniform4fvRebase for
+ unpacked layouts with a per-draw stream
+
+Each later cmd moves every active attribute stream but one by
+(vertex_base - base0) from its bound client pointer, and points the aux
+attribute's stream at its own per-cmd pointer: resident meshes drawn with a
+per-frame stream. Also reset the attribute offset in the SAFER direct
+unpacked branch (it kept the offset of an earlier packed draw).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ source/custom_shaders.c | 34 +++++++++++++++++++++++++++++++---
+ source/vitaGL.h         | 13 +++++++++++++
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index f237d00..132b305 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -76,6 +76,7 @@ char vgl_file_cache_path[256];
+ 		} else { \
+ 			if (count * streams[i].stride > SAFE_DRAW_SIZE_THRESHOLD) { \
+ 				ptrs[i] = (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
++				attributes[i].offset = 0; \
+ 			} else { \
+ 				ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
+ 				vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+@@ -3130,9 +3131,9 @@ void glProgramUniform4fv(GLuint prog, GLint location, GLsizei count, const GLflo
+ // and (d) issue sceGxmDraw directly with that draw's indices/count. No
+ // texture or vertex-program state changes between draws in this entry
+ // point, so none of that work is repeated.
+-void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
++static void vgl_multidraw_uniform4fv(GLenum mode, GLint uniform_location,
+ 		GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
+-		GLuint top_idx) {
++		GLuint top_idx, const void *base0, GLint aux_attrib, const void *const *aux_ptrs) {
+ 	THREAD_SAFE()
+ 
+ 	if (n <= 0)
+@@ -3207,12 +3208,27 @@ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 		}
+ 
+ 		if (cmds[i].vertex_base) {
++			// base0 == NULL: every active stream to vertex_base (packed layouts);
++			// else each active stream but the aux one moves by vertex_base - base0
++			// from its own client pointer (unpacked client-array layouts)
++			const int32_t delta = (int32_t)((const uint8_t *)cmds[i].vertex_base - (const uint8_t *)base0);
+ 			for (int j = 0; j < p->attr_num; j++) {
+ 				uint8_t attr_idx = p->attr_map[j];
+-				if (cur_vao->vertex_attrib_state & (1 << attr_idx))
++				if (!(cur_vao->vertex_attrib_state & (1 << attr_idx)) || (GLint)attr_idx == aux_attrib)
++					continue;
++				if (base0)
++					sceGxmSetVertexStream(gxm_context, j, (const uint8_t *)cur_vao->vertex_attrib_offsets[attr_idx] + delta);
++				else
+ 					sceGxmSetVertexStream(gxm_context, j, cmds[i].vertex_base);
+ 			}
+ 		}
++		if (aux_ptrs && aux_ptrs[i]) {
++			for (int j = 0; j < p->attr_num; j++) {
++				uint8_t attr_idx = p->attr_map[j];
++				if ((GLint)attr_idx == aux_attrib && (cur_vao->vertex_attrib_state & (1 << attr_idx)))
++					sceGxmSetVertexStream(gxm_context, j, aux_ptrs[i]);
++			}
++		}
+ 
+ 		const void *idx_i = gpu_buf ? (const void *)((uint8_t *)gpu_buf->ptr + (uint32_t)cmds[i].indices)
+ 		                            : cmds[i].indices;
+@@ -3224,6 +3240,18 @@ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 	restore_polygon_mode(gxm_p);
+ }
+ 
++void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
++		GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
++		GLuint top_idx) {
++	vgl_multidraw_uniform4fv(mode, uniform_location, uniform_vec4_count, cmds, n, top_idx, NULL, -1, NULL);
++}
++
++void vglMultiDrawElementsUniform4fvRebase(GLenum mode, GLint uniform_location,
++		GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
++		GLuint top_idx, const void *base0, GLint aux_attrib, const void *const *aux_ptrs) {
++	vgl_multidraw_uniform4fv(mode, uniform_location, uniform_vec4_count, cmds, n, top_idx, base0, aux_attrib, aux_ptrs);
++}
++
+ inline void glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+ 	THREAD_SAFE()
+ 
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index ee95e46..bdc6350 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1120,6 +1120,19 @@ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 	GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
+ 	GLuint top_idx);
+ 
++// The same for an UNPACKED client-array layout (every attribute its own stream:
++// attribute 0's data not followed within its stride by attribute 1's) with one
++// per-draw stream: cmds[0] runs as above on the bound pointers; for cmds[1..n-1]
++// a non-NULL vertex_base moves every active attribute but aux_attrib by
++// (vertex_base - base0) from its bound client pointer (base0: the address the
++// bound pointers belong to, eg. cmds[0]'s mesh start), and a non-NULL
++// aux_ptrs[i] points aux_attrib's stream at aux_ptrs[i]. All memory GPU-mapped
++// and read in place: top_idx must make every stream exceed the SAFER copy
++// threshold (top_idx * stride > 32 KB) on a DRAW_SPEEDHACK=2 build.
++void vglMultiDrawElementsUniform4fvRebase(GLenum mode, GLint uniform_location,
++		GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
++		GLuint top_idx, const void *base0, GLint aux_attrib, const void *const *aux_ptrs);
++
+ // VGL_EXT_gpu_objects_array extension
+ // glColorPointer equivalent for legacy vgl* draw pipeline.
+ void vglColorPointer(GLint size, GLenum type, GLsizei stride, GLuint count, const GLvoid *pointer);

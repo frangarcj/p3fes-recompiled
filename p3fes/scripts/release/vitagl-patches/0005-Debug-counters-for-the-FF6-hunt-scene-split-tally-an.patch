@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Wed, 29 Jul 2026 09:43:17 +0200
+Subject: [PATCH] Debug counters for the FF6 hunt: scene-split tally and
+ per-draw FFP log
+
+vgl_debug_scene_splits counts mid-frame scene splits (scene_end reached from
+scene_reset), which on Vita3K destroy the whole frame. vgl_debug_log_draws
+switches on a per-draw record of what reaches sceGxm: shader variant mask,
+sampled texture data pointer and the viewport mapping in force.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ source/ffp.c | 14 ++++++++++++++
+ source/gxm.c |  3 +++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/source/ffp.c b/source/ffp.c
+index 11937c4..e2e732c 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -568,6 +568,8 @@ void setup_combiner_pass(int i, char *dst) {
+ }
+ #endif
+ 
++extern uint32_t vgl_debug_log_draws;
++
+ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *streams, SceGxmIndexSource index_type) {
+ #ifdef HAVE_PROFILING
+ 	uint32_t reload_ffp_shaders_start = sceKernelGetProcessTimeLow();
+@@ -1322,6 +1324,18 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ #ifdef HAVE_PROFILING
+ 	ffp_reload_profiler_cnt += sceKernelGetProcessTimeLow() - reload_ffp_shaders_start;
+ #endif
++
++	// DEBUG (vgl_debug_log_draws): per-draw record of what actually reaches
++	// sceGxm -- shader variant mask, sampled texture data pointer and the
++	// viewport mapping in force -- so a visible and an invisible draw can be
++	// diffed at this level.
++	if (vgl_debug_log_draws) {
++		int dtid = texture_units[0].tex_id[texture_units[0].state > 1 ? 0 : 1];
++		texture *dtex = &texture_slots[dtid];
++		sceClibPrintf("[vgl] draw mask=0x%08x texid=%d texdata=%p texstat=%d vp=(%.1f,%.1f,%.1f,%.1f z:%.3f+%.3f)\n",
++			mask.raw, dtid, dtex->status ? sceGxmTextureGetData(&dtex->gxm_tex) : NULL,
++			dtex->status, x_port, x_scale, y_port, y_scale, z_port, z_scale);
++	}
+ 	return draw_mask_state;
+ }
+ 
+diff --git a/source/gxm.c b/source/gxm.c
+index 866988f..f74e4af 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -67,6 +67,8 @@ GLboolean dirty_query = GL_FALSE; // Flag whether occlusion queries needs result
+ static GLboolean needs_end_scene = GL_FALSE; // Flag for gxm end scene requirement at scene reset
+ static GLboolean needs_scene_reset = GL_TRUE; // Flag for when a scene reset is required
+ static GLboolean scene_not_flushed = GL_FALSE; // Flag for when a scene had been forcibly flushed as last operation
++uint32_t vgl_debug_scene_splits = 0; // DEBUG: mid-frame scene splits (scene_end called from scene_reset)
++uint32_t vgl_debug_log_draws = 0; // DEBUG: per-draw ffp logging switch
+ 
+ SceGxmContext *gxm_context; // sceGxm context instance
+ GLenum vgl_error = GL_NO_ERROR; // Error returned by glGetError
+@@ -590,6 +592,7 @@ void scene_reset(void) {
+ 
+ 		// Ending drawing scene
+ 		if (needs_end_scene) {
++			vgl_debug_scene_splits++;
+ 			scene_end();
+ 		} else {
+ 			if (legacy_pool_size) {

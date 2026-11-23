@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Sun, 27 Sep 2026 18:40:35 +0200
+Subject: [PATCH] Make scratch memory opt-in for dynamic and stream VBOs
+
+With USE_SCRATCH_MEMORY, every GL_DYNAMIC_* and GL_STREAM_* buffer defaulted
+to per-frame scratch storage, silently breaking apps that fill such a
+buffer once and draw it over several frames. Default both to GL_FALSE so
+the build flag is safe to enable globally; apps opt in with
+vglSetupScratchMemory().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ source/vgl.c    | 6 ++++--
+ source/vitaGL.h | 2 +-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/source/vgl.c b/source/vgl.c
+index dedb88e..65e22f9 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -128,8 +128,10 @@ void update_scissor_test_uniforms(void) {
+ #ifndef DISABLE_CIRCULAR_POOL
+ #define CIRCULAR_POOL_SIZE_DEF (32 * 1024 * 1024) // Default size in bytes for the circular vertex pool
+ #ifdef HAVE_SCRATCH_MEMORY
+-GLboolean vgl_dynamic_wants_scratch = GL_TRUE;
+-GLboolean vgl_stream_wants_scratch = GL_TRUE;
++// Opt-in: scratch storage only lives for the current frame, which breaks
++// apps that fill a dynamic/stream VBO once and draw it for several frames.
++GLboolean vgl_dynamic_wants_scratch = GL_FALSE;
++GLboolean vgl_stream_wants_scratch = GL_FALSE;
+ #endif
+ #ifndef CIRCULAR_POOL_SPEEDHACK
+ uint8_t *circular_data_pool[DISPLAY_MAX_BUFFER_COUNT];
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 84e6ead..ee95e46 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1335,7 +1335,7 @@ void vglSetupGarbageCollector(int priority, int affinity);
+ // Change the scenes per frame value to use for the display and fbos rendertargets. Default value: 1, 1.
+ void vglSetupRenderTargetScenesNum(uint8_t display_size, uint8_t fbo_size);
+ 
+-// Change what kind of vertex buffer objects are considered eligible for scratch memory usage in order to reduce allocation costs. Requires USE_SCRATCH_MEMORY.
++// Change what kind of vertex buffer objects are considered eligible for scratch memory usage in order to reduce allocation costs. Requires USE_SCRATCH_MEMORY. Default values: GL_FALSE, GL_FALSE.
+ void vglSetupScratchMemory(GLboolean scratch_for_dynamic, GLboolean scratch_for_stream);
+ 
+ // Setup the buffer sizes of the sceGxm shader patcher. Must be called before vglInit*. Default values: 1024 * 1024 each.

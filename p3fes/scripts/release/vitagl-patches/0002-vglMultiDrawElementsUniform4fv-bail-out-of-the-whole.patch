@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Wed, 8 Jul 2026 16:58:06 +0200
+Subject: [PATCH] vglMultiDrawElementsUniform4fv: bail out of the whole batch
+ on illegal first draw
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The batch reuses the first draw's setup (vertex program patch, streams,
+textures) for every subsequent sceGxmDraw. If that setup failed, the
+per-call path would simply skip the one draw and revalidate on the next
+call — but the batch loop would keep issuing sceGxmDraw against invalid
+state. Return early instead.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ source/custom_shaders.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 5c7bdeb..55fd6ef 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -3172,7 +3172,12 @@ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 	GLboolean is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, top_idx, 0, SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
+ 
+ #ifndef SKIP_ERROR_HANDLING
+-	if (is_draw_legal)
++	// Unlike glDrawElements, the batch reuses the first draw's setup for every
++	// subsequent sceGxmDraw — if that setup failed, none of the draws may run.
++	if (!is_draw_legal) {
++		restore_polygon_mode(gxm_p);
++		return;
++	}
+ #endif
+ 	{
+ 		// setup_elements_indices(uint16_t) inlined for the mode==GL_TRIANGLES /

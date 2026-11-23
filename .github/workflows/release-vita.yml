@@ -6,7 +6,6 @@ name: Release PS Vita beta
 # Secrets and variables (Settings -> Secrets and variables -> Actions):
 #   secret   P3FES_INPUTS_TOKEN  fine-grained PAT, only the private inputs repository, permission "Contents: Read"
 #   variable P3FES_INPUTS_REPO   owner/name of the private repository holding SLUS_216.21 at its root
-#   variable P3FES_VITAGL_REPO   owner/name of the vitaGL fork that contains VITAGL_COMMIT (default ppkkkkk/vitaGL)
 #
 # The ELF, the generated C++ and the objects of the build never become workflow artifacts. The only artifact is the
 # final dist/ (VPK + SHA256SUMS + release notes), which is also what the release publishes.
@@ -44,9 +43,12 @@ env:
   PKG_TAIHEN_SHA256: afced213d9d308a665ef91809fd728614a92ec31b2fcf61cf1f6a3e98bec4014
   # --- vitaShaRK: the vdpm package is too old (no is_shark_online / shader association); upstream master is needed ---
   VITASHARK_COMMIT: df24065e65098b2d1ac533760109ad4367573f28
-  # --- vitaGL: the user's fork (repository variable P3FES_VITAGL_REPO) at a pinned commit. These Makefile options
-  # reproduce the installed libvitaGL.a of the development machine (identical code and data in all 30 objects). ---
-  VITAGL_COMMIT: 8a47034e078f7c39aa45e43493d7fe360a52a871
+  # --- vitaGL: upstream (Rinnegatamante/vitaGL) at a pinned commit plus the patches in VITAGL_PATCHES, applied in
+  # name order. VITAGL_TREE is the git tree the patched sources must hash to. With these Makefile options the result
+  # reproduces the installed libvitaGL.a of the development machine (identical code and data in all 30 objects). ---
+  VITAGL_COMMIT: c707ff00d9a372f0ba7056b4a4b723f5a00ba880
+  VITAGL_PATCHES: p3fes/scripts/release/vitagl-patches
+  VITAGL_TREE: cc30760a75dd9068dbdf07cc8e77ddd931f65c50
   VITAGL_FLAGS: >-
     NO_SPLASHSCREEN=1 NO_TEX_COMBINER=1 HAVE_SHARK_LOG=1 USE_SCRATCH_MEMORY=1 LOG_ERRORS=1
     SHARED_RENDERTARGETS=2 DRAW_SPEEDHACK=2 PRIMITIVES_SPEEDHACK=1 INDICES_DRAW_SPEEDHACK=1
@@ -104,11 +106,9 @@ jobs:
       # ---------------------------------------------------------------------------------------------------------
       - name: Toolchain cache key
         id: deps
-        env:
-          VITAGL_REPO: ${{ vars.P3FES_VITAGL_REPO || 'ppkkkkk/vitaGL' }}
         run: |
           key=$(printf '%s\n' "$DEPS_REV" "$VITASDK_TAG" "$VITASDK_SHA256" "$PKG_SDL2_SHA256" "$PKG_MATHNEON_SHA256" \
-            "$PKG_SHACCCGEXT_SHA256" "$PKG_TAIHEN_SHA256" "$VITASHARK_COMMIT" "$VITAGL_REPO" "$VITAGL_COMMIT" \
+            "$PKG_SHACCCGEXT_SHA256" "$PKG_TAIHEN_SHA256" "$VITASHARK_COMMIT" "$VITAGL_COMMIT" "$VITAGL_TREE" \
             "$VITAGL_FLAGS" | sha256sum | cut -c1-24)
           echo "key=vita-toolchain-$key" >> "$GITHUB_OUTPUT"
 
@@ -154,21 +154,24 @@ jobs:
 
       - name: Build vitaGL
         if: steps.cache-sdk.outputs.cache-hit != 'true'
-        env:
-          VITAGL_REPO: ${{ vars.P3FES_VITAGL_REPO || 'ppkkkkk/vitaGL' }}
         run: |
           set -euo pipefail
           export PATH="$VITASDK/bin:$PATH"
-          git clone --quiet "https://github.com/$VITAGL_REPO" "$RUNNER_TEMP/vitaGL"
+          git clone --quiet https://github.com/Rinnegatamante/vitaGL "$RUNNER_TEMP/vitaGL"
           cd "$RUNNER_TEMP/vitaGL"
           git checkout --quiet "$VITAGL_COMMIT"
           [ "$(git rev-parse HEAD)" = "$VITAGL_COMMIT" ]
+          for patch in "$GITHUB_WORKSPACE/$VITAGL_PATCHES"/*.patch; do
+            git apply --index "$patch"
+          done
+          got=$(git write-tree)
+          [ "$got" = "$VITAGL_TREE" ] || { echo "::error::patched vitaGL tree is $got, expected $VITAGL_TREE"; exit 1; }
           # word splitting of VITAGL_FLAGS into separate make variables is intended
           # shellcheck disable=SC2086
           make -j"$(nproc)" $VITAGL_FLAGS install
           # a record of what the cached toolchain was built from
           {
-            echo "vitaGL $VITAGL_REPO@$VITAGL_COMMIT $VITAGL_FLAGS"
+            echo "vitaGL Rinnegatamante/vitaGL@$VITAGL_COMMIT + patches (tree $VITAGL_TREE) $VITAGL_FLAGS"
             echo "vitaShaRK $VITASHARK_COMMIT"
             echo "VitaSDK $VITASDK_TAG"
           } > "$VITASDK/p3fes-deps.txt"

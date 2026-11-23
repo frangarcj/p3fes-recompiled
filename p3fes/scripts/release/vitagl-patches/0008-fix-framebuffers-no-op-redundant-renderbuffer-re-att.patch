@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Sun, 6 Sep 2026 22:24:38 +0200
+Subject: [PATCH] fix(framebuffers): no-op redundant renderbuffer re-attach
+
+glFramebufferRenderbuffer/glNamedFramebufferRenderbuffer unconditionally
+discarded the current depth/stencil surface (mark_as_dirty + depthbuffer_ptr
+= NULL) on every call, even when re-attaching the exact same renderbuffer
+with the same stencil requirement. A client that re-binds its depth
+renderbuffer to the same FBO every frame (common boilerplate before the
+frame's draws) therefore forced init_depth_stencil_buffer to reallocate a
+fresh depth+stencil surface every frame instead of reusing the existing one,
+exhausting the GPU memory pool after a few hundred frames.
+
+Track the renderbuffer currently backing each fbo's depth attachment
+(framebuffer::attached_depth_rb) and skip the discard when the incoming
+renderbuffer pointer and its live wants_stencil value both match what's
+already bound. Any real change (different renderbuffer, or the same
+renderbuffer's storage format changed) still goes through the normal
+invalidation path unchanged.
+---
+ source/framebuffers.c | 21 +++++++++++++++++++++
+ source/shared.h       |  1 +
+ 2 files changed, 22 insertions(+)
+
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 15e59ea..4db5dc8 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -217,6 +217,7 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
+ 			framebuffers[i].depthbuffer_ptr = NULL;
+ 			framebuffers[i].target = NULL;
+ 			framebuffers[i].tex = NULL;
++			framebuffers[i].attached_depth_rb = NULL;
+ 		}
+ 		if (j >= n)
+ 			break;
+@@ -362,6 +363,16 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbu
+ 	}
+ #endif
+ 
++	// Re-attaching the same renderbuffer with unchanged stencil requirement is a no-op:
++	// the depth/stencil surface already backing this fbo still matches, so skip discarding
++	// it. A client re-binding the same renderbuffer every frame (common FBO setup boilerplate)
++	// would otherwise force init_depth_stencil_buffer to reallocate depth+stencil every frame.
++	GLboolean valid_attachment = attachment == GL_DEPTH_STENCIL_ATTACHMENT || attachment == GL_DEPTH_ATTACHMENT || attachment == GL_STENCIL_ATTACHMENT;
++	if (valid_attachment && fb->depthbuffer_ptr && (void *)(uintptr_t)rb == fb->attached_depth_rb &&
++		(GLboolean)(rb && ((renderbuffer *)rb)->wants_stencil) == (GLboolean)((fb->depthbuffer_state & DEPTHBUFFER_WANTS_STENCIL) != 0)) {
++		return;
++	}
++
+ 	// Discarding any previously bound hidden depth buffers
+ 	if (fb->depthbuffer_ptr) {
+ #ifndef DEPTH_STENCIL_HACK
+@@ -369,6 +380,7 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbu
+ #endif
+ 	}
+ 	fb->depthbuffer_ptr = NULL;
++	fb->attached_depth_rb = (void *)rb;
+ 
+ 	switch (attachment) {
+ 	case GL_DEPTH_STENCIL_ATTACHMENT:
+@@ -394,6 +406,14 @@ void glNamedFramebufferRenderbuffer(GLuint target, GLenum attachment, GLenum ren
+ 
+ 	framebuffer *fb = (framebuffer *)target;
+ 
++	// See glFramebufferRenderbuffer: skip the depth/stencil discard entirely when
++	// re-attaching the same renderbuffer with unchanged stencil requirement.
++	GLboolean valid_attachment = attachment == GL_DEPTH_STENCIL_ATTACHMENT || attachment == GL_DEPTH_ATTACHMENT || attachment == GL_STENCIL_ATTACHMENT;
++	if (valid_attachment && fb->depthbuffer_ptr && (void *)(uintptr_t)rb == fb->attached_depth_rb &&
++		(GLboolean)(rb && ((renderbuffer *)rb)->wants_stencil) == (GLboolean)((fb->depthbuffer_state & DEPTHBUFFER_WANTS_STENCIL) != 0)) {
++		return;
++	}
++
+ 	// Discarding any previously bound hidden depth buffers
+ 	if (fb->depthbuffer_ptr) {
+ #ifndef DEPTH_STENCIL_HACK
+@@ -401,6 +421,7 @@ void glNamedFramebufferRenderbuffer(GLuint target, GLenum attachment, GLenum ren
+ #endif
+ 		fb->depthbuffer_ptr = NULL;
+ 	}
++	fb->attached_depth_rb = (void *)rb;
+ 
+ 	switch (attachment) {
+ 	case GL_DEPTH_STENCIL_ATTACHMENT:
+diff --git a/source/shared.h b/source/shared.h
+index 7ae3dd6..80e849a 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -604,6 +604,7 @@ typedef struct {
+ 	int stride;
+ 	void *data;
+ 	texture *tex;
++	void *attached_depth_rb; // Renderbuffer currently attached to depth/stencil, used to no-op redundant re-attaches
+ } framebuffer;
+ 
+ // Query struct

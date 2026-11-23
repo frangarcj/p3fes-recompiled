@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Wed, 29 Jul 2026 09:43:37 +0200
+Subject: [PATCH] Add vglInPlaceTexSubImage: opt out of orphaning on
+ glTexSubImage2D
+
+When a texture drawn within the last FRAME_PURGE_FREQ frames receives a
+glTexSubImage2D, _glTexSubImage2D orphans it: a fresh full-size allocation
+plus a copy of the ENTIRE surface through uncached memory, before the
+sub-rect is applied. For apps that stream small rects into large textures
+every frame that dominates the frame time -- FF6's tile compositor streams
+strips into two 1024x2048 RGBA atlases, costing ~5 MB of uncached copying
+per frame.
+
+vglInPlaceTexSubImage(GL_TRUE) writes the storage in place instead. Only the
+orphan block is skipped: last_frame tracking, purge lists and deferred
+deletes behave exactly as before (unlike the TEXTURES_SPEEDHACK build flag,
+which also makes frees immediate). The caller accepts that the GPU may
+sample a mix of old and new texels for a frame.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ source/shared.h   | 1 +
+ source/textures.c | 2 +-
+ source/vgl.c      | 5 +++++
+ source/vitaGL.h   | 7 +++++++
+ 4 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/source/shared.h b/source/shared.h
+index 749c91e..7ae3dd6 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -876,6 +876,7 @@ extern int garbage_collector(unsigned int args, void *arg); // Garbage collector
+ #endif
+ extern SceUID gc_mutex[2]; // Garbage collector mutex
+ extern GLboolean has_cached_mem; // Flag for whether to use cached memory for mempools or not
++extern GLboolean vgl_inplace_texsub; // Flag for whether glTexSubImage2D writes texture storage in place (no orphan copy)
+ extern uint8_t gxm_display_buffer_count; // Display buffers count
+ 
+ extern int legacy_pool_size; // Mempool size for GL1 immediate draw pipeline
+diff --git a/source/textures.c b/source/textures.c
+index 7b5d704..7c74d7f 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -982,7 +982,7 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ 
+ #ifndef TEXTURES_SPEEDHACK
+ 	// Copying the texture in a new mem location and dirtying old one
+-	if (tex->last_frame != OBJ_NOT_USED && (vgl_framecount - tex->last_frame <= FRAME_PURGE_FREQ)) {
++	if (!vgl_inplace_texsub && tex->last_frame != OBJ_NOT_USED && (vgl_framecount - tex->last_frame <= FRAME_PURGE_FREQ)) {
+ 		uint32_t size;
+ 		if (tex->mip_count > 1) {
+ 			po2_w = nearest_po2(orig_w);
+diff --git a/source/vgl.c b/source/vgl.c
+index a9fa49b..dedb88e 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -787,6 +787,11 @@ void vglUseCachedMem(GLboolean use) {
+ 	has_cached_mem = use;
+ }
+ 
++GLboolean vgl_inplace_texsub = GL_FALSE;
++void vglInPlaceTexSubImage(GLboolean enable) {
++	vgl_inplace_texsub = enable;
++}
++
+ void vglSetTextureCacheFrequency(GLuint freq) {
+ #ifdef HAVE_TEX_CACHE
+ 	vgl_tex_cache_freq = freq;
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 2847270..84e6ead 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1359,6 +1359,13 @@ void vglTexImageDepthBuffer(GLenum target);
+ // Makes vitaGL use cached memory instead of uncached memory for its internal memory pools. Must be called before vglInit*.
+ void vglUseCachedMem(GLboolean use);
+ 
++// Makes glTexSubImage2D write the texture storage in place instead of orphaning it
++// (allocating a fresh surface and copying the WHOLE texture over) when the texture
++// was drawn in the last few frames. Big win for apps that stream sub-rects into
++// large textures every frame; the caller accepts that the GPU may sample a mix of
++// old and new texels for a frame.
++void vglInPlaceTexSubImage(GLboolean enable);
++
+ // Makes the GLSL translator use low precision variables (eg: float -> half).
+ void vglUseLowPrecision(GLboolean val);
+ 

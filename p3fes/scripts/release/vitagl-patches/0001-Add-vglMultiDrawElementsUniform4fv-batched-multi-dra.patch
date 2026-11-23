@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Wed, 8 Jul 2026 16:53:11 +0200
+Subject: [PATCH] Add vglMultiDrawElementsUniform4fv batched multi-draw entry
+ point
+
+Per-object fused-opaque draws in Geometrizer (VR 3D pass) issue one
+glUniform4fv + glDrawElements pair per object, and every glDrawElements
+re-runs the full custom-shader draw setup (fragment/vertex texture
+binds, attribute alignment + packing analysis, vertex program patch,
+index high-water scan) even though only the uniform and index span
+change between draws. This new entry point runs that setup once for
+the first draw in a batch and, for the rest, only re-seeds the uniform
+data and reserves a fresh GXM vertex default-uniform buffer (required
+per draw) before issuing sceGxmDraw directly.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ source/custom_shaders.c | 99 +++++++++++++++++++++++++++++++++++++++++
+ source/vitaGL.h         | 30 +++++++++++++
+ 2 files changed, 129 insertions(+)
+
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 3b91d11..5c7bdeb 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -3106,6 +3106,105 @@ void glProgramUniform4fv(GLuint prog, GLint location, GLsizei count, const GLflo
+ 	glUniform4fv(location, count, value);
+ }
+ 
++// vglMultiDrawElementsUniform4fv: see vitaGL.h for the batching rationale.
++//
++// cmds[0] goes through the exact same path glDrawElements would take (uniform
++// write via vgl_fill_uniform_data - the same macro glUniform4fv itself uses,
++// just above - then _glDrawElements_CustomShadersIMPL, then the same trivial
++// zero-copy index handling glDrawElements' setup_elements_indices does for
++// GL_TRIANGLES under INDICES_DRAW_SPEEDHACK), so all the one-time state
++// (textures, vertex program patch, attribute pointers) gets set up exactly
++// as before.
++//
++// cmds[1..n-1] skip all of that: they only need to (a) re-seed the uniform
++// data into p->unif_vbuffer at the same resolved offset, (b) reserve a fresh
++// vertex default-uniform buffer and copy the whole (small) unif_vbuffer block
++// into it - GXM does not allow writing into a default-uniform-buffer
++// reservation again once a prior sceGxmDraw has consumed it, so this
++// reserve+copy must happen once per draw - and (c) issue sceGxmDraw directly
++// with that draw's indices/count. No texture, attribute or vertex-program
++// state changes between draws in this entry point, so none of that work is
++// repeated.
++void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
++		GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
++		GLuint top_idx) {
++	THREAD_SAFE()
++
++	if (n <= 0)
++		return;
++
++#ifndef SKIP_ERROR_HANDLING
++	if (mode != GL_TRIANGLES) {
++		vgl_log("%s:%d vglMultiDrawElementsUniform4fv: only GL_TRIANGLES is supported (mode: 0x%x).\n", __FILE__, __LINE__, mode);
++		return;
++	}
++	if (cur_program == 0) {
++		vgl_log("%s:%d vglMultiDrawElementsUniform4fv: no custom shader program is bound.\n", __FILE__, __LINE__);
++		return;
++	}
++	if (uniform_location == -1 || uniform_location == 0) {
++		vgl_log("%s:%d vglMultiDrawElementsUniform4fv: invalid uniform location.\n", __FILE__, __LINE__);
++		return;
++	}
++#endif
++
++	program *p = &progs[cur_program - 1];
++
++	// Resolve the uniform location to its CPU-side staging pointer(s) exactly
++	// the way glUniform4fv (above) does - `u` and `offs` are the names
++	// vgl_fill_uniform_data expects in scope.
++	int offs = 0;
++	uniform *u = (uniform *)get_uniform_from_ptr(uniform_location, &offs);
++
++	SceGxmPrimitiveType gxm_p = SCE_GXM_PRIMITIVE_TRIANGLES;
++	prim_is_non_native = GL_FALSE;
++
++	scene_reset();
++
++	// --- cmds[0]: seed the uniform, then run the full setup path once. ---
++	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
++	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)cmds[0].indices)
++	                        : (uint16_t *)cmds[0].indices;
++	GLsizei count = cmds[0].count;
++
++	vgl_fill_uniform_data(cmds[0].uniform_data, SCE_GXM_PARAMETER_TYPE_F32, 4, uniform_vec4_count)
++
++	GLboolean is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, top_idx, 0, SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
++
++#ifndef SKIP_ERROR_HANDLING
++	if (is_draw_legal)
++#endif
++	{
++		// setup_elements_indices(uint16_t) inlined for the mode==GL_TRIANGLES /
++		// INDICES_DRAW_SPEEDHACK case only (the macro itself is draw.c-local):
++		// both its "bound index VBO" and "default" switch cases resolve to
++		// ptr = src for GL_TRIANGLES, differing only in the last_frame touch.
++		uint16_t *ptr = src;
++		if (gpu_buf)
++			gpu_buf->last_frame = vgl_framecount;
++		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, ptr, count);
++	}
++
++	// --- cmds[1..n-1]: uniform reseed + fresh default-uniform-buffer + draw. ---
++	for (GLsizei i = 1; i < n; i++) {
++		vgl_fill_uniform_data(cmds[i].uniform_data, SCE_GXM_PARAMETER_TYPE_F32, 4, uniform_vec4_count)
++
++		if (p->vert_uniforms && dirty_shader_vert_unifs) {
++			void *buffer = vglReserveVertexUniformBuffer(p->vshader->unif_buf_size);
++			vgl_fast_memcpy(buffer, p->unif_vbuffer, p->vshader->unif_buf_size);
++			dirty_shader_vert_unifs = GL_FALSE;
++		}
++
++		const void *idx_i = gpu_buf ? (const void *)((uint8_t *)gpu_buf->ptr + (uint32_t)cmds[i].indices)
++		                            : cmds[i].indices;
++		if (gpu_buf)
++			gpu_buf->last_frame = vgl_framecount;
++		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, idx_i, cmds[i].count);
++	}
++
++	restore_polygon_mode(gxm_p);
++}
++
+ inline void glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+ 	THREAD_SAFE()
+ 
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index dac9fa0..0260b89 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1068,6 +1068,36 @@ EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface);
+ EGLBoolean eglTerminate(EGLDisplay dpy);
+ #endif
+ 
++// VGL_EXT_multidraw extension
++// One draw call within a vglMultiDrawElementsUniform4fv batch: a GL_TRIANGLES/
++// GL_UNSIGNED_SHORT glDrawElements call preceded by a glUniform4fv of the
++// batch's uniform. `indices` must be a client pointer to GPU-mapped memory
++// (eg. returned by vglAllocFromScratch) - the whole batch is zero-copy.
++typedef struct {
++	const void *indices;        // GL_UNSIGNED_SHORT index list for this draw
++	int32_t count;               // index count for this draw
++	const float *uniform_data;   // uniform_vec4_count vec4s (uniform_vec4_count * 4 floats) to upload before this draw
++} vglMultiDrawCmd;
++
++// Batches a run of glUniform4fv(uniform_location, uniform_vec4_count, ...) +
++// glDrawElements(mode, cmds[i].count, GL_UNSIGNED_SHORT, cmds[i].indices)
++// pairs against the currently bound custom shader program. Only mode ==
++// GL_TRIANGLES is supported. The expensive per-draw setup that
++// glDrawElements/_glDrawElements_CustomShadersIMPL normally redoes on every
++// call (fragment/vertex texture binds, attribute alignment + packing
++// analysis, vertex program patching, and the top-index scan) runs once for
++// the whole batch instead of once per draw; only the uniform data and the
++// GXM default-uniform-buffer reservation (which GXM requires fresh per draw)
++// are repeated for cmds[1..n-1].
++// top_idx is the highest vertex index referenced by ANY cmd in the batch,
++// plus 1 - the caller must know this already (eg. the vertex count of a
++// shared/fused vertex buffer), which is what lets this entry point skip the
++// O(indices) index high-water scan that the single-draw path has to do when
++// it isn't told.
++void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
++	GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
++	GLuint top_idx);
++
+ // VGL_EXT_gpu_objects_array extension
+ // glColorPointer equivalent for legacy vgl* draw pipeline.
+ void vglColorPointer(GLint size, GLenum type, GLsizei stride, GLuint count, const GLvoid *pointer);

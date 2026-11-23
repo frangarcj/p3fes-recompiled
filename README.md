@@ -143,7 +143,8 @@ Updates only need the new VPK; saves (`ux0:data/p3fes/memcards/`) are kept. For 
 
 Releases are built by [`release-vita.yml`](.github/workflows/release-vita.yml) with
 [`build_vita_release.sh`](p3fes/scripts/release/build_vita_release.sh): it recompiles `SLUS_216.21` (kept in a private
-repository, SHA-1 checked, never cached or uploaded), builds the pinned VitaSDK, vitaShaRK and vitaGL, and publishes
+repository, SHA-1 checked, never cached or uploaded), builds the pinned VitaSDK, vitaShaRK and vitaGL (upstream plus
+[these patches](p3fes/scripts/release/vitagl-patches/)), and publishes
 only the VPK, `SHA256SUMS` and the notes. Start a release with *Run workflow* on `main` and a tag such as
 `v0.1.0-beta.1` (that keeps the build caches; a pushed tag rebuilds from scratch). The data tool lives in
 [`web/`](web/) and is deployed to GitHub Pages by [`pages.yml`](.github/workflows/pages.yml).

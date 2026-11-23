@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Sun, 6 Sep 2026 22:24:49 +0200
+Subject: [PATCH] perf(textures): shrink glTexSubImage2D orphan copy to
+ untouched rows
+
+_glTexSubImage2D orphans (allocates a fresh backing store for) a texture
+that was used within the last FRAME_PURGE_FREQ frames, since a scene still
+in flight on the GPU may be sampling the current store and vitaGL has no
+cheap way to ask GXM whether that scene's fence has signaled yet (short of
+sceGxmFinish, a full CPU/GPU stall). That part of the policy is unavoidable
+without real per-resource fencing, which would be a much larger change than
+this task calls for.
+
+What was avoidable: before applying the caller's update, the orphan path
+always memcpy'd the WHOLE old texture into the new store to preserve texels
+the update doesn't touch. For a single-level (non-mipmapped) texture, a
+full-row update (xoffset == 0, width == full texture width) is about to
+overwrite every byte in rows [yoffset, yoffset+height) anyway, so copying
+those rows forward first is pure waste - only the rows outside that band
+need to survive into the new store.
+
+This is exactly the shape of a row-packed texture atlas/cache that
+re-uploads its whole live region (rows [0, yMax)) every frame: the
+preserved range now shrinks to the rows above/below the write, down to a
+zero-byte copy once the write covers the full height. A 6MB atlas updated
+every frame goes from a 6MB copy to whatever fraction is actually unused
+this frame. Mipmapped textures and partial-row updates keep the previous
+full-copy behavior, since only part of each touched row would otherwise
+survive. vglInPlaceTexSubImage still bypasses this whole path as before.
+---
+ source/textures.c | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/source/textures.c b/source/textures.c
+index 7c74d7f..3f3c750 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -981,9 +981,26 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ #endif
+ 
+ #ifndef TEXTURES_SPEEDHACK
+-	// Copying the texture in a new mem location and dirtying old one
++	// Orphaning: a scene submitted in the last FRAME_PURGE_FREQ frames may still be in
++	// flight on the GPU and sampling this texture's current backing store, so we cannot
++	// write into it directly (GXM gives us no cheap way to query "has that scene's fence
++	// signaled yet" short of sceGxmFinish, which would stall the CPU on the GPU). Instead
++	// we hand the GPU-visible pointer of the OLD store to sceGxmTextureSetData and rewrite
++	// tex->data to a freshly allocated store, so any in-flight draw keeps sampling the old
++	// (unmodified) memory while we write into the new one; the old store is deferred-freed
++	// via gpu_free_texture_data/mark_as_dirty once FRAME_PURGE_FREQ frames have passed.
++	//
++	// The naive version of this copies the WHOLE old texture forward before applying the
++	// caller's update, to preserve texels the update doesn't touch. But for a single-level
++	// (non-mipmapped) texture, a full-row update (xoffset == 0, width == orig_w) is about to
++	// overwrite every byte in rows [yoffset, yoffset+height) anyway, so forwarding those rows
++	// from the old store is wasted bandwidth: only the rows OUTSIDE that band need to survive.
++	// This is exactly the access pattern of a row-packed texture atlas/cache that re-uploads
++	// its whole live region (e.g. rows [0, yMax)) every frame: the preserved range shrinks to
++	// just the rows above/below the write, down to zero once the write covers the full height.
+ 	if (!vgl_inplace_texsub && tex->last_frame != OBJ_NOT_USED && (vgl_framecount - tex->last_frame <= FRAME_PURGE_FREQ)) {
+ 		uint32_t size;
++		GLboolean full_row_update = tex->mip_count <= 1 && xoffset == 0 && (uint32_t)width == orig_w;
+ 		if (tex->mip_count > 1) {
+ 			po2_w = nearest_po2(orig_w);
+ 			po2_h = nearest_po2(orig_h);
+@@ -1000,7 +1017,17 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ 			size = orig_h * VGL_ALIGN(orig_w, 8) * bpp;
+ 		}
+ 		void *texture_data = gpu_alloc_mapped_for_gpu(size);
+-		vgl_fast_memcpy(texture_data, tex->data, size);
++		if (full_row_update) {
++			uint32_t stride = VGL_ALIGN(orig_w, 8) * bpp;
++			uint32_t head_size = yoffset * stride;
++			uint32_t tail_off = (yoffset + height) * stride;
++			if (head_size)
++				vgl_fast_memcpy(texture_data, tex->data, head_size);
++			if (tail_off < size)
++				vgl_fast_memcpy((uint8_t *)texture_data + tail_off, (uint8_t *)tex->data + tail_off, size - tail_off);
++		} else {
++			vgl_fast_memcpy(texture_data, tex->data, size);
++		}
+ 		gpu_free_texture_data(tex);
+ 		sceGxmTextureSetData(&tex->gxm_tex, texture_data);
+ 		tex->data = texture_data;

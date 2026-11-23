@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Wed, 29 Jul 2026 09:43:37 +0200
+Subject: [PATCH] glColorPointer: accept GL_FIXED, unpacking 16.16 in the
+ vertex shader
+
+GLES 1.1 allows GL_FIXED colour arrays and FF6's Android build uses them for
+battle sprites. The switch had no case for it: GL_INVALID_ENUM, and the
+colour attribute kept the previous draw's layout -- garbage vertex colours.
+
+The GPU has no fixed-point vertex format, so do what positions, normals and
+texcoords already do: declare the attribute F32 and unpack the raw 16.16
+words in the generated vertex shader. Colours get their own fixed_color mask
+bit and a fixed_mode_color define in both template variants -- the bit above
+Tex1 in fixed_mode_mask is already Tex2 on HAVE_HIGH_FFP_TEXUNITS builds, so
+a mask bit would not have a stable value across variants. Requires 4
+components per colour, which is what the GLES1 spec mandates anyway.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ source/ffp.c               | 68 ++++++++++++++++++++++++--------------
+ source/shaders/ffp_ext_v.h |  6 ++++
+ source/shaders/ffp_v.h     |  6 ++++
+ 3 files changed, 55 insertions(+), 25 deletions(-)
+
+diff --git a/source/ffp.c b/source/ffp.c
+index e2e732c..9288858 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -281,6 +281,7 @@ static GLenum ffp_mode;
+ uint16_t ffp_vertex_attrib_state = 0;
+ uint8_t ffp_vertex_attrib_fixed_mask = 0;
+ uint8_t ffp_vertex_attrib_fixed_pos_mask = 0;
++uint8_t ffp_vertex_attrib_fixed_color = 0;
+ 
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+ typedef union {
+@@ -302,36 +303,39 @@ typedef union {
+ 		uint64_t fast_perspective_correction : 1; // Frag/Vert
+ 		uint64_t srgb_mode : 1; // Frag
+ 		uint64_t lighting : 1; // Frag/Vert
+-		uint64_t UNUSED : 28;
++		uint64_t fixed_color : 1; // Vert
++		uint64_t UNUSED : 27;
+ 	};
+ 	uint64_t raw;
+ } shader_mask;
+-#define VERTEX_SHADER_MASK   (0b0000000000000000000000000000101011111100011000000111111100111000)
++#define VERTEX_SHADER_MASK   (0b0000000000000000000000000001101011111100011000000111111100111000)
+ #define FRAGMENT_SHADER_MASK (0b0000000000000000000000000000111100000011101111111111100011111111)
+ #else
+ typedef union {
+ 	struct {
+-		uint32_t alpha_test_mode : 3; // Frag
+-		uint32_t num_textures : 2; // Frag/Vert
+-		uint32_t has_colors : 1; // Frag/Vert
+-		uint32_t fog_mode : 2; // Frag
+-		uint32_t clip_planes_num : 3; // Vert
+-		uint32_t lights_num : 4; // Frag/Vert
+-		uint32_t tex_env_mode_pass0 : 3; // Frag
+-		uint32_t tex_env_mode_pass1 : 3; // Frag
+-		uint32_t shading_mode : 1; // Frag/Vert
+-		uint32_t normalize : 1; // Vert
+-		uint32_t fixed_mask : 3; // Vert
+-		uint32_t pos_fixed_mask : 2; // Vert
+-		uint32_t point_sprite : 1; // Frag
+-		uint32_t fast_perspective_correction : 1; // Frag/Vert
+-		uint32_t srgb_mode : 1; // Frag
+-		uint32_t lighting : 1; // Frag/Vert
++		uint64_t alpha_test_mode : 3; // Frag
++		uint64_t num_textures : 2; // Frag/Vert
++		uint64_t has_colors : 1; // Frag/Vert
++		uint64_t fog_mode : 2; // Frag
++		uint64_t clip_planes_num : 3; // Vert
++		uint64_t lights_num : 4; // Frag/Vert
++		uint64_t tex_env_mode_pass0 : 3; // Frag
++		uint64_t tex_env_mode_pass1 : 3; // Frag
++		uint64_t shading_mode : 1; // Frag/Vert
++		uint64_t normalize : 1; // Vert
++		uint64_t fixed_mask : 3; // Vert
++		uint64_t pos_fixed_mask : 2; // Vert
++		uint64_t point_sprite : 1; // Frag
++		uint64_t fast_perspective_correction : 1; // Frag/Vert
++		uint64_t srgb_mode : 1; // Frag
++		uint64_t lighting : 1; // Frag/Vert
++		uint64_t fixed_color : 1; // Vert
++		uint64_t UNUSED : 31;
+ 	};
+-	uint32_t raw;
++	uint64_t raw;
+ } shader_mask;
+-#define VERTEX_SHADER_MASK   (0b10101111111000000111111100111000)
+-#define FRAGMENT_SHADER_MASK (0b11110000001111111111100011111111)
++#define VERTEX_SHADER_MASK   (0b110101111111000000111111100111000ULL)
++#define FRAGMENT_SHADER_MASK (0b011110000001111111111100011111111ULL)
+ #endif
+ #ifndef DISABLE_TEXTURE_COMBINER
+ typedef union {
+@@ -399,7 +403,7 @@ uint16_t ffp_dirty_vert_attr = 0xFFFF;
+ uint16_t dirty_vert_unifs = 0xFFFF;
+ uint32_t dirty_frag_unifs = 0xFFFFFFFF;
+ blend_config ffp_blend_info;
+-shader_mask ffp_mask = {.raw = 0xFFFFFFFF};
++shader_mask ffp_mask = {.raw = ~0ULL};
+ GLenum color_material_mode = GL_AMBIENT_AND_DIFFUSE;
+ GLboolean color_material_state = GL_FALSE;
+ #ifndef DISABLE_TEXTURE_COMBINER
+@@ -613,6 +617,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 	mask.normalize = normalize;
+ 	mask.fixed_mask = ffp_vertex_attrib_fixed_mask;
+ 	mask.pos_fixed_mask = ffp_vertex_attrib_fixed_pos_mask;
++	mask.fixed_color = (ffp_vertex_attrib_fixed_color && mask.has_colors) ? 1 : 0;
+ 	mask.fast_perspective_correction = fast_perspective_correction_hint;
+ 	mask.srgb_mode = srgb_mode;
+ 	mask.lighting = lighting_state;
+@@ -736,7 +741,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 	uint64_t vert_shader_mask = mask.raw & VERTEX_SHADER_MASK;
+ 	uint64_t frag_shader_mask = mask.raw & FRAGMENT_SHADER_MASK;
+ #else
+-	uint32_t vert_shader_mask = mask.raw & VERTEX_SHADER_MASK;
++	uint64_t vert_shader_mask = mask.raw & VERTEX_SHADER_MASK; // fixed_color lives in bit 32
+ 	uint32_t frag_shader_mask = mask.raw & FRAGMENT_SHADER_MASK;
+ #endif
+ 	
+@@ -817,7 +822,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+ 		sprintf(fname, "ux0:data/shader_cache/v%d/v/%016llX-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
+ #else
+-		sprintf(fname, "ux0:data/shader_cache/v%d/v/%08X-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
++		sprintf(fname, "ux0:data/shader_cache/v%d/v/%09llX-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
+ #endif
+ 		SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+ 		if (f >= 0) {
+@@ -834,7 +839,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 
+ 			// Compiling the new shader
+ 			char vshader[8192];
+-			sprintf(vshader, ffp_vert_src, mask.clip_planes_num, mask.num_textures, mask.has_colors, mask.lights_num, mask.lighting, mask.shading_mode, mask.normalize, mask.fixed_mask, mask.pos_fixed_mask, WVP_ON_GPU, mask.fast_perspective_correction);
++			sprintf(vshader, ffp_vert_src, mask.clip_planes_num, mask.num_textures, mask.has_colors, mask.lights_num, mask.lighting, mask.shading_mode, mask.normalize, mask.fixed_mask, mask.pos_fixed_mask, mask.fixed_color, WVP_ON_GPU, mask.fast_perspective_correction);
+ 			uint32_t size = strlen(vshader);
+ 			SceGxmProgram *t = shark_compile_shader_extended(vshader, &size, SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+ 			ffp_vertex_program = (SceGxmProgram *)vglMalloc(size);
+@@ -1951,25 +1956,38 @@ void glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *point
+ 	unsigned short bpe;
+ 	switch (type) {
+ 	case GL_FLOAT:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+ 		bpe = 4;
+ 		break;
+ 	case GL_SHORT:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_S16N;
+ 		bpe = 2;
+ 		break;
+ 	case GL_UNSIGNED_SHORT:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_U16N;
+ 		bpe = 2;
+ 		break;
+ 	case GL_BYTE:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_S8N;
+ 		bpe = 1;
+ 		break;
+ 	case GL_UNSIGNED_BYTE:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_U8N;
+ 		bpe = 1;
+ 		break;
++	case GL_FIXED:
++		// No fixed point vertex format on the GPU: declare F32 and let the
++		// generated vertex shader unpack the raw 16.16 words, same trick as
++		// positions/texcoords. Needs size == 4 (which GLES1 mandates anyway).
++		ffp_vertex_attrib_fixed_color = 1;
++		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
++		bpe = 4;
++		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, type)
+ 	}
+diff --git a/source/shaders/ffp_ext_v.h b/source/shaders/ffp_ext_v.h
+index b7ce3bf..1a07fc4 100644
+--- a/source/shaders/ffp_ext_v.h
++++ b/source/shaders/ffp_ext_v.h
+@@ -16,6 +16,7 @@ R"(#define clip_planes_num %d
+ #define normalization %d
+ #define fixed_mode_mask %d
+ #define fixed_mode_pos %d
++#define fixed_mode_color %d
+ #define calculate_wvp %d
+ #define interp %d
+ 
+@@ -157,6 +158,11 @@ void main(
+ #if fixed_mode_pos == 3
+ 	Nposition = GLFixed4ToFloat4(Nposition);
+ #endif
++#if fixed_mode_color == 1 && (has_colors == 1 || lights_num > 0)
++	// GL_FIXED colour arrays arrive as raw 16.16 words in a F32 attribute
++	// (like positions/texcoords above); requires 4 components per colour.
++	color = GLFixed4ToFloat4(color);
++#endif
+ #if calculate_wvp == 1
+ 	Jwvp = mul(Jwvp, Imodelview); // Jwvp is actually the proj matrix
+ #endif
+diff --git a/source/shaders/ffp_v.h b/source/shaders/ffp_v.h
+index 888cab4..2ecbd67 100644
+--- a/source/shaders/ffp_v.h
++++ b/source/shaders/ffp_v.h
+@@ -15,6 +15,7 @@ R"(#define clip_planes_num %d
+ #define normalization %d
+ #define fixed_mode_mask %d
+ #define fixed_mode_pos %d
++#define fixed_mode_color %d
+ #define calculate_wvp %d
+ #define interp %d
+ 
+@@ -149,6 +150,11 @@ void main(
+ #if fixed_mode_pos == 3
+ 	Nposition = GLFixed4ToFloat4(Nposition);
+ #endif
++#if fixed_mode_color == 1 && (has_colors == 1 || lights_num > 0)
++	// GL_FIXED colour arrays arrive as raw 16.16 words in a F32 attribute
++	// (like positions/texcoords above); requires 4 components per colour.
++	color = GLFixed4ToFloat4(color);
++#endif
+ #if calculate_wvp == 1
+ 	Jwvp = mul(Jwvp, Imodelview); // Jwvp is actually the proj matrix
+ #endif

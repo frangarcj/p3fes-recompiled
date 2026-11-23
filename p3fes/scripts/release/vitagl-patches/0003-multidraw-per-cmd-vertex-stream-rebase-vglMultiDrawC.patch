@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Francisco=20Jos=C3=A9=20Garc=C3=ADa=20Garc=C3=ADa?=
+ <frangarcj@gmail.com>
+Date: Wed, 8 Jul 2026 17:19:30 +0200
+Subject: [PATCH] multidraw: per-cmd vertex stream rebase
+ (vglMultiDrawCmd.vertex_base)
+
+Geometrizer's static-mesh path draws ~100 objects/frame whose u16
+indices are mesh-relative into a resident 24 MB arena, so each object
+needs its interleaved attribute streams rebased to the mesh's first
+vertex. Doing that with glVertexAttribPointer + glDrawElements pays
+the full per-draw setup every time. Add an optional vertex_base per
+vglMultiDrawCmd: NULL leaves the streams alone; non-NULL re-points
+every ACTIVE attribute's GXM vertex stream at the new base before the
+draw (packed layouts only - the patched vertex program's per-attribute
+offsets are stream-relative, no repatch; inactive attributes keep
+their constant-value stream, mirroring the IMPL's own stream loop).
+cmds[0] must pass NULL and have the GL attrib pointers already bound
+to its base, since the first draw's full setup consumes VAO state.
+
+Also document that an over-large top_idx is safe for arena sub-ranges
+(it only feeds the zero-copy size decision and the 16-bit index
+downgrade) and that the batched uniform must be vertex-stage.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ source/custom_shaders.c | 24 +++++++++++++++++++-----
+ source/vitaGL.h         | 28 +++++++++++++++++++++++++---
+ 2 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 55fd6ef..f237d00 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -3121,10 +3121,15 @@ void glProgramUniform4fv(GLuint prog, GLint location, GLsizei count, const GLflo
+ // vertex default-uniform buffer and copy the whole (small) unif_vbuffer block
+ // into it - GXM does not allow writing into a default-uniform-buffer
+ // reservation again once a prior sceGxmDraw has consumed it, so this
+-// reserve+copy must happen once per draw - and (c) issue sceGxmDraw directly
+-// with that draw's indices/count. No texture, attribute or vertex-program
+-// state changes between draws in this entry point, so none of that work is
+-// repeated.
++// reserve+copy must happen once per draw - (c) if the cmd carries a
++// non-NULL vertex_base, rebase every ACTIVE attribute's GXM vertex stream
++// to it (packed/interleaved layouts only: the patched vertex program's
++// per-attribute offsets are stream-relative, so an address change needs no
++// repatch; inactive attributes keep their constant-value stream, mirroring
++// the active/inactive split of the IMPL's own sceGxmSetVertexStream loop) -
++// and (d) issue sceGxmDraw directly with that draw's indices/count. No
++// texture or vertex-program state changes between draws in this entry
++// point, so none of that work is repeated.
+ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 		GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
+ 		GLuint top_idx) {
+@@ -3190,7 +3195,8 @@ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, ptr, count);
+ 	}
+ 
+-	// --- cmds[1..n-1]: uniform reseed + fresh default-uniform-buffer + draw. ---
++	// --- cmds[1..n-1]: uniform reseed + fresh default-uniform-buffer +
++	// optional vertex stream rebase + draw. ---
+ 	for (GLsizei i = 1; i < n; i++) {
+ 		vgl_fill_uniform_data(cmds[i].uniform_data, SCE_GXM_PARAMETER_TYPE_F32, 4, uniform_vec4_count)
+ 
+@@ -3200,6 +3206,14 @@ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 			dirty_shader_vert_unifs = GL_FALSE;
+ 		}
+ 
++		if (cmds[i].vertex_base) {
++			for (int j = 0; j < p->attr_num; j++) {
++				uint8_t attr_idx = p->attr_map[j];
++				if (cur_vao->vertex_attrib_state & (1 << attr_idx))
++					sceGxmSetVertexStream(gxm_context, j, cmds[i].vertex_base);
++			}
++		}
++
+ 		const void *idx_i = gpu_buf ? (const void *)((uint8_t *)gpu_buf->ptr + (uint32_t)cmds[i].indices)
+ 		                            : cmds[i].indices;
+ 		if (gpu_buf)
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 0260b89..d0dbb2d 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1077,6 +1077,12 @@ typedef struct {
+ 	const void *indices;        // GL_UNSIGNED_SHORT index list for this draw
+ 	int32_t count;               // index count for this draw
+ 	const float *uniform_data;   // uniform_vec4_count vec4s (uniform_vec4_count * 4 floats) to upload before this draw
++	const void *vertex_base;     // NULL = vertex streams unchanged; non-NULL = rebase every ACTIVE
++	                             // attribute's vertex stream to this (GPU-mapped) pointer before this
++	                             // draw. For interleaved/packed attribute layouts only: the patched
++	                             // vertex program keeps its per-attribute intra-stride offsets, so a
++	                             // stream-address change needs no repatch. MUST be NULL for cmds[0]
++	                             // (see the function comment below).
+ } vglMultiDrawCmd;
+ 
+ // Batches a run of glUniform4fv(uniform_location, uniform_vec4_count, ...) +
+@@ -1086,14 +1092,30 @@ typedef struct {
+ // glDrawElements/_glDrawElements_CustomShadersIMPL normally redoes on every
+ // call (fragment/vertex texture binds, attribute alignment + packing
+ // analysis, vertex program patching, and the top-index scan) runs once for
+-// the whole batch instead of once per draw; only the uniform data and the
++// the whole batch instead of once per draw; only the uniform data, the
+ // GXM default-uniform-buffer reservation (which GXM requires fresh per draw)
+-// are repeated for cmds[1..n-1].
++// and the optional vertex_base stream rebase are repeated for cmds[1..n-1].
++//
++// cmds[0] contract: its vertex_base must be NULL and the caller must have
++// the GL vertex attrib pointers (glVertexAttribPointer / VAO state) already
++// bound to cmds[0]'s vertex base - the first draw goes through the full
++// setup path, which consumes that GL-side state to program the GXM streams;
++// vertex_base is ignored on cmds[0].
++//
++// The batched uniform must be a VERTEX-stage uniform: cmds[1..n-1] only
++// re-reserve and re-upload the vertex default uniform buffer. If the named
++// uniform aliases into the fragment program too, the fragment side is only
++// refreshed by cmds[0].
++//
+ // top_idx is the highest vertex index referenced by ANY cmd in the batch,
+ // plus 1 - the caller must know this already (eg. the vertex count of a
+ // shared/fused vertex buffer), which is what lets this entry point skip the
+ // O(indices) index high-water scan that the single-draw path has to do when
+-// it isn't told.
++// it isn't told. Passing an over-large top_idx (eg. the max vertex count
++// over several sub-ranges of a resident arena when cmds rebase between
++// them) is safe and intentional: it only feeds the zero-copy-vs-temp-copy
++// size decision (SAFER_DRAW_SPEEDHACK threshold) and the 16-bit index-source
++// downgrade - the GPU only dereferences indices the draws actually contain.
+ void vglMultiDrawElementsUniform4fv(GLenum mode, GLint uniform_location,
+ 	GLsizei uniform_vec4_count, const vglMultiDrawCmd *cmds, GLsizei n,
+ 	GLuint top_idx);
