@@ -284,6 +284,8 @@ jobs:
       - name: Create or update the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          # this job has no checkout, so gh must be told the repository
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.build.outputs.tag }}
           TARGET_SHA: ${{ github.sha }}
         run: |
