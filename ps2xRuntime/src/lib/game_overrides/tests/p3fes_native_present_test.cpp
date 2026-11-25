@@ -9,6 +9,7 @@
 
 #include "p3fes_native_present.h"
 #include "p3fes_native_movie.h"
+#include "p3fes_scene_forward.h"
 
 #include <atomic>
 #include <cassert>
@@ -20,6 +21,8 @@
 #include <vector>
 
 namespace p3fes_native_movie { void shutdownHost() {} }
+extern "C" int ps2xFrameHistEnabled() { return 0; }
+extern "C" void ps2xFrameHistAddLock(uint64_t) {}
 
 namespace nr = p3fes::native_renderer;
 namespace present = p3fes_native_present;
@@ -57,6 +60,10 @@ public:
     void removeMesh(nr::MeshId) override {}
     void beginFrame(const nr::Camera &, nr::ClearColor) override {}
     void setCamera(const nr::Camera &) override {}
+    void beginTextureTarget(std::string_view, int, int) override {}
+    void endTextureTarget() override {}
+    void setWidescreen(int) override {}
+    void setScreenPlacement(ScreenPlacement) override {}
     void clear(nr::ClearColor, bool, bool) override {}
     void drawMesh(nr::MeshId, const nr::Matrix4 &, const nr::MeshDrawState &state) override
     {
@@ -86,7 +93,7 @@ public:
     }
     void drawScreenLines(const std::vector<nr::ScreenVertex> &, float, float, std::string_view,
                          const nr::ScreenDrawState &) override {}
-    void endFrame() override {}
+    void endFrame(void (*)()) override {}
 };
 
 nr::TextureData texture(std::string name, unsigned value)
@@ -102,6 +109,20 @@ std::unique_ptr<Renderer> createPlatformRenderer() { return std::make_unique<::R
 int main()
 {
     present::setActive(true);
+
+    // Holding the scene control adds one batched VHS draw. Releasing it removes
+    // that draw on the next frame, without leaving a texture bound.
+    for (bool held : {false, true, false})
+    {
+        p3fes_scene_forward::active.store(held);
+        present::beginFrame({});
+        present::drawScreenTriangles(std::vector<nr::ScreenVertex>(3), 640, 448, {});
+        present::endFrame();
+        observed = {};
+        assert(present::renderHostFrame());
+        assert(observed.draws == (held ? 2u : 1u) && observed.missing == 0);
+    }
+    observed = {};
 
     // A texture redefined under the same name after a draw already retained it: the frame uses the
     // latest definition for every draw (what the per-draw map assignment used to give).

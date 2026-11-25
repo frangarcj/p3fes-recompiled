@@ -1342,6 +1342,7 @@ namespace ps2recomp
 
             const auto &generatedStubs = m_generatedStubs;
             const auto &decodedFunctions = m_decodedFunctions;
+            const auto &optionalBodies = m_optionalBodies;
 
             auto generateFunctionCode = [&](CodeGenerator &codeGenerator, const Function &function, bool useHeaders) -> std::string
             {
@@ -1367,7 +1368,21 @@ namespace ps2recomp
                     }
 
                     const auto &instructions = decodedFunctions.at(function.start);
-                    return codeGenerator.generateFunction(function, instructions, useHeaders);
+                    const auto variant = optionalBodies.find(function.start);
+                    if (variant == optionalBodies.end())
+                        return codeGenerator.generateFunction(function, instructions, useHeaders);
+
+                    const auto name = codeGenerator.getFunctionName(function.start);
+                    std::ostringstream out;
+                    out << "#include \"runtime/ps2_optional_patch.h\"\n";
+                    out << codeGenerator.generateFunction(function, instructions, useHeaders, "_original");
+                    out << codeGenerator.generateFunction(function, variant->second.instructions, false, "_patched");
+                    out << "void " << name << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime) {\n"
+                        << "    if (ps2xRuntimePatchEnabled(\"" << variant->second.option << "\", " << function.start
+                        << "u, rdram, ctx)) " << name
+                        << "_patched(rdram, ctx, runtime);\n"
+                        << "    else " << name << "_original(rdram, ctx, runtime);\n}\n";
+                    return out.str();
                 }
                 catch (const std::exception &e)
                 {
@@ -1775,6 +1790,7 @@ namespace ps2recomp
             }
 
             m_decodedFunctions.clear();
+            m_optionalBodies.clear();
 
             std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
             m_generatedStubs.clear();
@@ -2042,6 +2058,8 @@ namespace ps2recomp
             return prefixMaxEnd[idx] > address;
         };
 
+        m_optionalBodies.clear();
+        std::unordered_set<uint32_t> appliedPatches;
         for (const auto &function : m_functions)
         {
             if (!function.isRecompiled || function.isStub || function.isSkipped)
@@ -2061,33 +2079,46 @@ namespace ps2recomp
             }
 
             const auto &instructions = decodedIt->second;
-            CodeGenerator::AnalysisResult analysisResult =
-                m_codeGenerator->collectInternalBranchTargets(function, instructions, &m_functions);
-
-            auto &ownerTargets = m_resumeEntryTargetsByOwner[function.start];
-            ownerTargets.insert(ownerTargets.end(),
-                                analysisResult.resumeEntryPoints.begin(),
-                                analysisResult.resumeEntryPoints.end());
-            ownerTargets.insert(ownerTargets.end(),
-                                analysisResult.indirectFallbackEntryPoints.begin(),
-                                analysisResult.indirectFallbackEntryPoints.end());
-
-            for (uint32_t target : analysisResult.externalEntryPoints)
+            auto collectTargets = [&](const std::vector<Instruction> &body)
             {
-                const Function *owner = findContainingFunction(target);
-                if (!owner)
+                const auto analysis = m_codeGenerator->collectInternalBranchTargets(function, body, &m_functions);
+                auto &entries = m_resumeEntryTargetsByOwner[function.start];
+                entries.insert(entries.end(), analysis.resumeEntryPoints.begin(), analysis.resumeEntryPoints.end());
+                entries.insert(entries.end(), analysis.indirectFallbackEntryPoints.begin(), analysis.indirectFallbackEntryPoints.end());
+                for (uint32_t target : analysis.externalEntryPoints)
                 {
-                    continue;
+                    const Function *owner = findContainingFunction(target);
+                    if (owner && owner->start != target)
+                        m_resumeEntryTargetsByOwner[owner->start].push_back(target);
                 }
+            };
+            collectTargets(instructions);
 
-                if (owner->start == target)
-                {
-                    continue;
-                }
+            auto patch = m_config.optionalPatches.lower_bound(function.start);
+            if (patch == m_config.optionalPatches.end() || patch->first >= function.end)
+                continue;
 
-                auto &targets = m_resumeEntryTargetsByOwner[owner->start];
-                targets.push_back(target);
+            OptionalBody alternate{patch->second.option, instructions};
+            for (; patch != m_config.optionalPatches.end() && patch->first < function.end; ++patch)
+            {
+                const auto index = (patch->first - function.start) / 4;
+                if (index >= instructions.size() || instructions[index].address != patch->first ||
+                    instructions[index].raw != patch->second.expected)
+                    throw std::runtime_error("Original instruction mismatch in " + function.name + " at " + std::to_string(patch->first));
+                if (patch->second.option != alternate.option)
+                    throw std::runtime_error("Multiple runtime options in " + function.name);
+                alternate.instructions[index] = m_decoder->decodeInstruction(patch->first, patch->second.value, !m_config.lowMemoryMode);
+                appliedPatches.insert(patch->first);
             }
+            // Both versions share the registered wrapper, including on a yield.
+            collectTargets(alternate.instructions);
+            m_optionalBodies.emplace(function.start, std::move(alternate));
+        }
+
+        for (const auto &[address, patch] : m_config.optionalPatches)
+        {
+            if (!appliedPatches.contains(address))
+                throw std::runtime_error("Optional patch outside generated code: " + std::to_string(address));
         }
 
         size_t totalTargets = 0u;

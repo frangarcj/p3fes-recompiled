@@ -65,6 +65,12 @@ namespace ps2recomp
         std::vector<Relocation> m_relocations;
 
         std::unordered_map<uint32_t, std::vector<Instruction>> m_decodedFunctions;
+        struct OptionalBody
+        {
+            std::string option;
+            std::vector<Instruction> instructions;
+        };
+        std::unordered_map<uint32_t, OptionalBody> m_optionalBodies;
         std::unordered_map<std::string, bool> m_skipFunctions;
         std::unordered_map<std::string, bool> m_keepGuestFunctions;
         std::unordered_set<uint32_t> m_keepGuestStarts;

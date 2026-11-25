@@ -2098,10 +2098,15 @@ public:
         return std::string(meshLine) + line + breakLine;
     }
 
-    void endFrame() override
+    void endFrame(void (*overlay)() = nullptr) override
     {
         flushScreenBatch();
         glDisable(GL_DEPTH_TEST);
+        if (overlay)
+        {
+            ps2xVitaPrepareHostDrawing();
+            overlay();
+        }
         EndDrawing();
         m_in3D = false;
         if (m_gpuSkinEnabled && resourceDiagEnabled() && ++m_gpuSkinReportFrames % 120u == 0u)
@@ -4030,18 +4035,18 @@ public:
     }
     std::string drainDiagReport() override { return m_in->drainDiagReport(); }
 
-    void endFrame() override
+    void endFrame(void (*overlay)() = nullptr) override
     {
         if (!m_recording)
         {
-            m_in->endFrame();
+            m_in->endFrame(overlay);
             return;
         }
         m_recording = false;
         const VitaGlRenderer::Modes live = m_in->modes();
         Image a;
         m_in->readFramebuffer(a.rgba, a.w, a.h);
-        m_in->endFrame();
+        m_in->endFrame(overlay);
         ++m_done; // numbers the screenshots of this comparison
         --m_done;
         if (m_poisoned || m_ops.empty())

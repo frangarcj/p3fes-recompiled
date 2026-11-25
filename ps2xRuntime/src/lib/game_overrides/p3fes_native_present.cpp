@@ -1,5 +1,7 @@
 #include "p3fes_native_present.h"
 #include "p3fes_native_movie.h"
+#include "p3fes_scene_forward.h"
+#include "p3fes_vhs.h"
 #include "../gs/gs_draw_control.h"
 #include "runtime/ps2_perf.h"
 #if defined(PS2X_P3FES_FRAME_TRACE)
@@ -2055,7 +2057,7 @@ void endFrame()
     }
 }
 
-bool renderHostFrame()
+bool renderHostFrame(void (*overlay)())
 {
     if (!active() || g_hostPresentationPaused.load(std::memory_order_acquire))
         return false;
@@ -3062,7 +3064,23 @@ bool renderHostFrame()
 #if defined(PS2X_P3FES_FRAME_TRACE)
     const uint64_t endFrameStartNs = traceFrame ? p3fes_frame_trace::nowNs() : 0u;
 #endif
-    g_renderer->endFrame();
+    if (p3fes_scene_forward::active.load(std::memory_order_relaxed))
+    {
+        static std::vector<ScreenVertex> tracking;
+        tracking.clear();
+        p3fes_vhs::draw([&](int x, int y, int w, int h, p3fes_vhs::Ink ink) {
+            if (y < 0 || y >= 448) return;
+            const std::array<uint8_t, 4> color{ink.r, ink.g, ink.b, ink.a};
+            const ScreenVertex a{float(x), float(y), 0, 0, 0, color};
+            const ScreenVertex b{float(x+w), float(y), 0, 0, 0, color};
+            const ScreenVertex c{float(x), float(y+h), 0, 0, 0, color};
+            const ScreenVertex d{float(x+w), float(y+h), 0, 0, 0, color};
+            tracking.insert(tracking.end(), {a, b, c, c, b, d});
+        });
+        g_renderer->setScreenPlacement(Renderer::ScreenPlacement::Stretch);
+        g_renderer->drawScreenTriangles(tracking, 640, 448, {}, {});
+    }
+    g_renderer->endFrame(overlay);
     lap(g_timing.endFrame);
 #if defined(PS2X_P3FES_FRAME_TRACE)
     const uint64_t endFrameNs = traceFrame

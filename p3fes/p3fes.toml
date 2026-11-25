@@ -2340,3 +2340,46 @@ critical = [
   "sub_007C4EE8", # Uses SIMD instructions
 ]
 
+
+# Optional direct commands for SLUS-21621. Each pair is [original word, replacement].
+# Command selection, escape, and shared inventory sites identified by TGE and Warrior250.
+# The skill menu looks up the acting unit, and its Persona, at the two menu call sites only.
+[patches.optional.P3FES_DIRECT_PARTY]
+0x29afc8 = [0x14460005, 0]          # player-side order goes to manual command
+0x202060 = [0x24040001, 0x8f84b6fc] # battle context
+0x202064 = [0x0c07fd40, 0x8c840254] # current action
+0x202068 = [0, 0x8c900030]          # s0 = acting battle unit
+0x20206c = [0x0040802d, 0]
+0x202098 = [0x24040001, 0x960400a4] # Persona by acting PC id
+0x28de14 = [0x2405001a, 0x2405001b] # use the party escape state
+0x29692c = [0x14500061, 0]
+0x2d8210 = [0x14440012, 0]          # use shared consumable inventory
+0x2d8220 = [0x0002243c, 0]
+0x2d8224 = [0x0004243f, 0]
+0x2d823c = [0x84440002, 0x24040001]
+# The cost preview, availability check and final skill description also ask for unit 1.
+0x2021ec = [0x24040001, 0x8f82b6fc]
+0x2021f0 = [0x0c07fd40, 0x8c420254]
+0x2021f4 = [0, 0x8c420030]
+0x202648 = [0x24040001, 0x8f82b6fc]
+0x20264c = [0x0c07fd40, 0x8c420254]
+0x202650 = [0, 0x8c420030]
+0x20299c = [0x24040001, 0x8f82b6fc]
+0x2029a0 = [0x0c07fd40, 0x8c420254]
+0x2029a4 = [0, 0x8c420030]
+# btlEffect's sole caller of this helper has the acting order in s3. Enable the
+# Persona command only for the battle leader, respecting the existing turn lock.
+0x1fedc0 = [0x27bdfff0, 0x8f82b6fc] # lw v0, battle(gp)
+0x1fedc4 = [0xffbf0000, 0x8c430148] # lw v1, leader(v0)
+0x1fedc8 = [0x0c081f38, 0x14730003] # bne v1,s3,disable
+0x1fedd0 = [0xdfbf0000, 0x08081f38] # tail-call enable
+0x1fedd4 = [0x27bd0010, 0]
+0x1fedd8 = [0x03e00008, 0x08081eac] # tail-call disable
+
+# Hold Triangle to reveal and advance ordinary message pages. Reuse the game's
+# transitions (including the non-skippable window flag) and leave choice input alone.
+[patches.optional.P3FES_FAST_FORWARD]
+0x3a71ec = [0x2c610005, 0x2c610002] # two message updates between pages
+0x3a71f8 = [0x8f83b930, 0x1000000f] # held Triangle takes the normal confirm path
+0x3a71fc = [0x30630001, 0]
+0x3a73f0 = [0x14600019, 0]          # allow fast text reveal while held

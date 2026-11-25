@@ -5,6 +5,14 @@ USA PS2 executable (SLUS-21621), so it contains no game data: you need your own 
 
 Build: `@COMMIT@`, Vita app version `@APP_VER@`, @DATE@.
 
+### Gameplay controls
+
+Open **System → Config** and press **R** for the gameplay settings. Select **Confirm** to save changes.
+
+- **Dialogue history** is on by default. During a conversation, press **SELECT** to read recent lines over the dimmed scene. Use **Up/Down** to browse and press **SELECT** again to return to the conversation.
+- **Direct party control** lets you choose commands for each active companion starting with the next battle. Rush and forced actions still follow the game's AI.
+- **Scene fast forward** speeds up scripted scenes while you hold **Triangle**, with a VHS tracking effect. Release it to resume normal speed. The game waits for your dialogue choices.
+
 ### Requirements
 
 - A PS Vita or PS TV with HENkaku/Ensō and taiHEN installed (the app imports taiHEN).

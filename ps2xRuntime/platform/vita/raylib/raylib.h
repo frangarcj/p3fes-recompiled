@@ -181,6 +181,7 @@ double GetTime(void);
 int GetScreenWidth(void);
 int GetScreenHeight(void);
 void BeginDrawing(void);
+void ps2xVitaPrepareHostDrawing(void);
 void PollInputEvents(void);
 void EndDrawing(void);
 void ClearBackground(Color color);

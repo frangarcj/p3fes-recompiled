@@ -1,5 +1,8 @@
 // host context, frame selection and raylib drawing used by the port.
 #include "runtime/gs/gs_host_present.h"
+#include "../game_overrides/p3fes_gameplay_options.h"
+#include "../game_overrides/p3fes_vhs_raylib.h"
+#include "../game_overrides/p3fes_scene_forward.h"
 #include "../game_overrides/p3fes_native_present.h"
 #include "../game_overrides/p3fes_native_movie.h"
 #include "runtime/gs/gs_direct_frame.h"
@@ -204,6 +207,8 @@ void GSHostPresentation::presentDirectTexture(uint32_t texture, uint32_t width, 
     DrawTexturePro(Texture2D{texture | 0x80000000u, static_cast<int>(width), static_cast<int>(height),
                              1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8},
                    source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    if (p3fes_scene_forward::active.load(std::memory_order_relaxed)) p3fes_vhs::drawIn(destination);
+    if (p3fes_gameplay_options::visible()) p3fes_gameplay_options::drawHistory();
     EndDrawing();
     workerDirectWidth.store(width, std::memory_order_relaxed);
     workerDirectHeight.store(height, std::memory_order_relaxed);
@@ -473,7 +478,8 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         // graphics API call here, on the host thread that owns the raylib/GL
         // context, and never paint an interlaced GS fallback over the native
         // progressive frame.
-        if (!p3fes_native_present::renderHostFrame())
+        auto history = p3fes_gameplay_options::visible() ? p3fes_gameplay_options::drawHistory : nullptr;
+        if (!p3fes_native_present::renderHostFrame(history))
         {
             PollInputEvents();
             // No swap means no vitaGL frame limiter either (including during
@@ -516,6 +522,8 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
                                 destinationWidth, destinationHeight};
     // PBO texture with rows in order; do not flip source.height.
     DrawTexturePro(selected.texture, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    if (p3fes_scene_forward::active.load(std::memory_order_relaxed)) p3fes_vhs::drawIn(destination);
+    if (p3fes_gameplay_options::visible()) p3fes_gameplay_options::drawHistory();
 #if !defined(PLATFORM_VITA)
     if (const int label = gsFrameDiagDue(selected.blank); label >= 0)
         gsCaptureWindow(label);
@@ -531,6 +539,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
 
 void GSHostPresentation::shutdown(GS &gs)
 {
+    p3fes_gameplay_options::shutdown();
     ps2_pcsx2gs::Shutdown(); // stops feeding PCSX2 before the GS back end goes away
     releasePcsx2View();
     if (!started && fallback.id == 0u)

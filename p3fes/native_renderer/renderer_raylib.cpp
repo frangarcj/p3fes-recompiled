@@ -1106,12 +1106,28 @@ public:
         drawScreenPrimitive(vertices, sourceWidth, sourceHeight, textureName, state, RL_LINES);
     }
 
-    void endFrame() override
+    void endFrame(void (*overlay)() = nullptr) override
     {
         flushScreenBatch();
         if (m_in3D && !m_exactCamera)
             EndMode3D();
         m_in3D = false;
+        if (overlay)
+        {
+            rlDrawRenderBatchActive();
+            rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+            rlSetMatrixProjection(MatrixOrtho(0, GetScreenWidth(), GetScreenHeight(), 0, -1, 1));
+            rlSetMatrixModelview(MatrixIdentity());
+            rlDisableDepthTest();
+            rlDisableScissorTest();
+            rlDisableBackfaceCulling();
+            rlEnableColorBlend();
+            rlSetBlendMode(BLEND_ALPHA);
+            overlay();
+            rlDrawRenderBatchActive();
+            rlSetMatrixProjection(m_hostProjection);
+            rlSetMatrixModelview(m_hostModelview);
+        }
         if (!m_capturePath.empty())
         {
             rlDrawRenderBatchActive();

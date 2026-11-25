@@ -343,7 +343,7 @@ public:
                                  float sourceWidth, float sourceHeight,
                                  std::string_view textureName = {},
                                  const ScreenDrawState &state = {}) = 0;
-    virtual void endFrame() = 0;
+    virtual void endFrame(void (*overlay)() = nullptr) = 0;
     // P3FES_RESOURCE_DIAG: the backend's own timing counters since the last call, as printable lines
     // (empty when it keeps none). Host thread only.
     virtual std::string drainDiagReport() { return {}; }

@@ -188,6 +188,8 @@ namespace ps2recomp
         // Functions whose names match a runtime HLE stub but must stay guest code.
         std::vector<std::string> keepGuestFunctions;
         std::unordered_map<uint32_t, std::string> patches;
+        struct OptionalPatch { std::string option; uint32_t expected, value; };
+        std::map<uint32_t, OptionalPatch> optionalPatches;
         std::vector<std::string> stubImplementations;
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;

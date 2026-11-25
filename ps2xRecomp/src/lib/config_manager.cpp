@@ -112,6 +112,27 @@ namespace ps2recomp
             {
                 const auto &patches = toml::find(data, "patches");
 
+                if (patches.contains("optional"))
+                {
+                    for (const auto &[option, words] : patches.at("optional").as_table())
+                    {
+                        if (option.empty() || option.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+                            throw std::runtime_error("Invalid runtime patch option: " + option);
+                        for (const auto &[key, pair] : words.as_table())
+                        {
+                            size_t consumed = 0;
+                            const auto address = std::stoull(key, &consumed, 0);
+                            const auto values = toml::get<std::vector<int64_t>>(pair);
+                            if (address > UINT32_MAX || address % 4 || consumed != key.size() || values.size() != 2 ||
+                                values[0] < 0 || values[0] > UINT32_MAX || values[1] < 0 || values[1] > UINT32_MAX)
+                                throw std::runtime_error("Invalid optional instruction patch at " + key);
+                            if (!config.optionalPatches.emplace(address, RecompilerConfig::OptionalPatch{
+                                    option, uint32_t(values[0]), uint32_t(values[1])}).second)
+                                throw std::runtime_error("Overlapping optional instruction patches at " + key);
+                        }
+                    }
+                }
+
                 if (patches.contains("instructions") && patches.at("instructions").is_array())
                 {
                     const auto &instPatches = toml::find(patches, "instructions").as_array();
@@ -360,6 +381,9 @@ namespace ps2recomp
             instPatches.push_back(p);
         }
         patches["instructions"] = instPatches;
+        for (const auto &[address, patch] : config.optionalPatches)
+            patches["optional"][patch.option][std::to_string(address)] =
+                std::vector<int64_t>{patch.expected, patch.value};
         data["patches"] = patches;
 
         std::ofstream file(m_configPath);

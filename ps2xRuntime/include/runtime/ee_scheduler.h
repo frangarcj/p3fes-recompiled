@@ -449,6 +449,7 @@ private:
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
+    bool m_sceneForward = false;
     uint64_t m_vsyncTick = 0;
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;

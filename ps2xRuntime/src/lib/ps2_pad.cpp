@@ -1,6 +1,7 @@
 #include <atomic>
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include "game_overrides/p3fes_gameplay_options.h"
 #include <cstring>
 #include <chrono>
 #include <cstdlib>
@@ -226,7 +227,7 @@ namespace
         return pressed;
     }
 
-    std::atomic<uint16_t> g_latchedButtons{0u};
+    std::atomic<uint16_t> g_latchedButtons{0u}, g_scriptButtons{0u};
 }
 
 // Called once per host frame on the window thread (ps2_runtime.cpp): remembers every button seen down until the game's
@@ -235,7 +236,11 @@ void ps2PadLatchHostInput()
 {
     uint8_t sticks[4] = {kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
     const uint16_t pressed = hostPressedMask(sticks);
-    if (pressed != 0u)
+    const uint16_t controls = pressed | g_scriptButtons.load(std::memory_order_relaxed);
+    p3fes_gameplay_options::handleInput(controls);
+    if (p3fes_gameplay_options::consumesInput(controls))
+        g_latchedButtons.store(0u, std::memory_order_relaxed);
+    else if (pressed != 0u)
         g_latchedButtons.fetch_or(pressed, std::memory_order_relaxed);
 }
 
@@ -261,7 +266,13 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[7] = sticks[3];
 
     const uint32_t scripted = scriptedPressedMask();
+    g_scriptButtons.store(static_cast<uint16_t>(scripted), std::memory_order_relaxed);
     pressed |= static_cast<uint16_t>(scripted);
+    if (p3fes_gameplay_options::consumesInput(pressed))
+    {
+        std::memset(data + 4, kPadStickCenter, 4);
+        return true;
+    }
     if (scripted & 0x10000u) data[7] = 0x00u;
     if (scripted & 0x20000u) data[7] = 0xFFu;
     if (scripted & 0x40000u) data[6] = 0x00u;

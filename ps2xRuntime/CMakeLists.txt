@@ -472,6 +472,11 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
     src/lib/game_overrides/p3fes_native_rw_math.cpp
     src/lib/game_overrides/p3fes_native_hanim.cpp
     src/lib/game_overrides/p3fes_native_frame_cuts.cpp
+    src/lib/game_overrides/p3fes_scene_forward.cpp
+    src/lib/game_overrides/p3fes_gameplay.cpp
+    src/lib/game_overrides/p3fes_gameplay_options.cpp
+    src/lib/game_overrides/p3fes_native_config.cpp
+    src/lib/game_overrides/p3fes_backlog.cpp
     src/lib/game_overrides/p3fes_native_dialogue.cpp
     src/lib/game_overrides/p3fes_native_ui.cpp
     src/lib/game_overrides/p3fes_native_fnprof.cpp

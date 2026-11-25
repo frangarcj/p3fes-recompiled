@@ -1,3 +1,4 @@
+#include "../game_overrides/p3fes_scene_forward.h"
 #include <utility>
 #include <string>
 #include "runtime/ee_scheduler.h"
@@ -446,6 +447,14 @@ namespace
     // 29.97 and the audio fell 0.1% behind (from god-of-war-recomp, vblank-ntsc).
     constexpr auto kVBlankPeriod = std::chrono::nanoseconds(16683350);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+
+    // The guest still receives every field and timer in order. Only wall-clock
+    // deadlines change, so camera tracks, actor updates and script waits agree.
+    template<class Duration>
+    Duration sceneDuration(Duration duration, bool forwarding)
+    {
+        return forwarding ? duration / static_cast<int>(p3fes_scene_forward::speed) : duration;
+    }
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
@@ -521,6 +530,8 @@ EeScheduler::~EeScheduler()
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
+    m_sceneForward = false;
+    p3fes_scene_forward::active.store(false, std::memory_order_relaxed);
     m_rdram = rdram;
     m_readyQueues = {};
     m_threads.clear();
@@ -1821,7 +1832,7 @@ int EeScheduler::setAlarm(uint16_t ticks,
     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
+                  std::chrono::steady_clock::now() + sceneDuration(std::chrono::microseconds(tickCount * kAlarmTickMicroseconds), m_sceneForward),
                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
     return id;
 }
@@ -2692,11 +2703,23 @@ void EeScheduler::processDueDeadlines()
                     }
                 }
                 g_busyCyclesThisField = 0u;
+                const bool wasForwarding = m_sceneForward;
+                m_sceneForward = p3fes_scene_forward::sample(m_rdram);
                 ps2AudioOnVBlank(); // SPU2 output to the host sound pipe (ps2_runtime.cpp)
                 // Pace against the host clock, but never "catch up": after a stretch slower than real time
                 // (loading, a heavy scene), restart the schedule from now instead of running fields back to back.
                 auto hostBase = scheduled.hostDeadline;
                 const auto hostNow = std::chrono::steady_clock::now();
+                if (wasForwarding != m_sceneForward)
+                {
+                    // An alarm can have been scheduled several fields ahead under the previous rate.
+                    // Re-anchor it on this field without changing its guest cycle or delivery order.
+                    std::lock_guard lock(m_eventMutex);
+                    for (auto &pending : m_deadlines)
+                        if (pending.event.type == EeEventType::Alarm && pending.deadlineCycle >= scheduled.deadlineCycle)
+                            pending.hostDeadline = hostNow + sceneDuration(
+                                eeCyclesToHostDuration(pending.deadlineCycle - scheduled.deadlineCycle), m_sceneForward);
+                }
                 // PS2X_PACE_DIAG=1: every 300 fields, how often the schedule was restarted, the host time
                 // given up by it, and the longest gap between two consecutive fields.
                 {
@@ -2738,14 +2761,14 @@ void EeScheduler::processDueDeadlines()
                     const int parsed = v && *v ? std::atoi(v) : 15;
                     return parsed >= 1 && parsed <= 600 ? parsed : 15;
                 }();
-                if (hostBase + catchUpFields * kVBlankPeriod < hostNow)
+                if (wasForwarding != m_sceneForward || hostBase + catchUpFields * sceneDuration(kVBlankPeriod, m_sceneForward) < hostNow)
                     hostBase = hostNow;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              hostBase + kVBlankDuration,
+                              hostBase + sceneDuration(kVBlankDuration, m_sceneForward),
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 g_nextVBlankStartCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              hostBase + kVBlankPeriod,
+                              hostBase + sceneDuration(kVBlankPeriod, m_sceneForward),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2941,7 +2964,7 @@ void EeScheduler::waitForEvent()
         const auto now = std::chrono::steady_clock::now();
         const uint32_t fields = frameCap().fields;
         const bool moviePlaying = g_frameCapIpuTick != 0u && m_vsyncTick - g_frameCapIpuTick < 30u;
-        if (!moviePlaying && now - g_slipFrameStart >= fields * kVBlankPeriod - std::chrono::microseconds(500))
+        if (!moviePlaying && now - g_slipFrameStart >= fields * sceneDuration(kVBlankPeriod, m_sceneForward) - std::chrono::microseconds(500))
         {
             const ScheduledEvent *vblank = nullptr;
             for (const ScheduledEvent &item : m_deadlines)
@@ -2994,10 +3017,10 @@ void EeScheduler::waitForEvent()
         // the game's sound drivers loaded (EE timer ticks all through the frame) that held the game
         // at 93 % speed with the thread only 81 % busy. PS2X_TIMER_PACE=now restores the old rule.
         static const bool paceFromNow = [] { const char *v = std::getenv("PS2X_TIMER_PACE"); return v && std::strcmp(v, "now") == 0; }();
-        auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+        auto timerHostDeadline = std::chrono::steady_clock::now() + sceneDuration(eeCyclesToHostDuration(timerCycles), m_sceneForward);
         const uint64_t timerCycle = m_eeCycle + timerCycles;
         if (!paceFromNow && hostDeadline != std::chrono::steady_clock::time_point::max() && timerCycle < deadlineCycle)
-            timerHostDeadline = std::min(timerHostDeadline, hostDeadline - eeCyclesToHostDuration(deadlineCycle - timerCycle));
+            timerHostDeadline = std::min(timerHostDeadline, hostDeadline - sceneDuration(eeCyclesToHostDuration(deadlineCycle - timerCycle), m_sceneForward));
         if (timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
@@ -3046,8 +3069,8 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
                 if (item.event.type != EeEventType::VBlankStart)
                     continue;
                 const auto scheduled = deadlineCycle <= item.deadlineCycle
-                    ? item.hostDeadline - eeCyclesToHostDuration(item.deadlineCycle - deadlineCycle)
-                    : item.hostDeadline + eeCyclesToHostDuration(deadlineCycle - item.deadlineCycle);
+                    ? item.hostDeadline - sceneDuration(eeCyclesToHostDuration(item.deadlineCycle - deadlineCycle), m_sceneForward)
+                    : item.hostDeadline + sceneDuration(eeCyclesToHostDuration(deadlineCycle - item.deadlineCycle), m_sceneForward);
                 hostDeadline = std::min(hostDeadline, scheduled);
                 break;
             }

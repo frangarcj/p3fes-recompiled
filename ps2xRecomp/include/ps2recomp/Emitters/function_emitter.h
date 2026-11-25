@@ -15,7 +15,7 @@ namespace ps2recomp
     public:
         explicit FunctionEmitter(CodeGenerator &codeGenerator);
 
-        std::string emit(const Function &function, const std::vector<Instruction> &instructions, bool useHeaders);
+        std::string emit(const Function &function, const std::vector<Instruction> &instructions, bool useHeaders, const std::string &suffix = {});
 
     private:
         CodeGenerator &m_codeGenerator;

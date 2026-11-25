@@ -5,7 +5,7 @@
 namespace p3fes_native_present
 {
 inline bool active() { return false; }
-inline bool renderHostFrame() { return false; }
+inline bool renderHostFrame(void (*)() = nullptr) { return false; }
 inline void shutdownHost() {}
 }
 
@@ -109,7 +109,7 @@ void noteOldScreenRecord(const std::vector<nr::ScreenVertex> &vertices, float so
 void endFrame();
 
 // Consumer side (host presentation thread): owns every graphics API call.
-bool renderHostFrame();
+bool renderHostFrame(void (*overlay)() = nullptr);
 void shutdownHost();
 }
 

@@ -36,7 +36,8 @@ The game's MIPS R5900 code is statically recompiled to C++ and run on a reimplem
 **Where it stands:** the game boots from its own CVM archives, plays the opening movie, and goes through New Game (the
 FES introduction, the opening anime, name entry) into the story: the dorm, school, day changes and Tartarus, loaded
 from a memory card save. 3D runs at the console's 30 fps with VU1 on PCSX2's microVU recompiler; menus run at 60.
-Music and voices play; sound effects are still silent, and battles have not been tested yet.
+Music and voices play. Sound effects are still silent. A macOS test reached a companion's command menu and
+confirmed an action in the Aigis tutorial encounter.
 
 | Milestone | |
 |---|:---:|
@@ -52,8 +53,24 @@ Music and voices play; sound effects are still silent, and battles have not been
 | 3D at 30 fps, menus at 60 (console frame pacing) | ✅ |
 | Tartarus | 🔧 |
 | Sound effects (SPU2 voices) | 🔧 |
-| Battles | ⏳ |
+| Battles | 🔧 |
 | Widescreen, upscaling, 60 FPS | ⏳ |
+
+## Gameplay options
+
+Open **System → Config** from the command menu, or **Config** on the title screen after choosing a story.
+Press **R1** (**E** on a keyboard) to turn to the gameplay page. Use Up/Down to select a row and Left/Right
+to change it. Select **Confirm** and press Cross to save all pending settings. Circle cancels the edits.
+Press **L1** (**Q**) to return to the original page.
+
+| Option | Default | In play |
+|---|---|---|
+| Direct party control | Off | Give commands to companions from the next battle. Rush and forced actions still use the game's AI. |
+| Scene fast forward | Off | Hold Triangle (**V** on a keyboard) during a scripted scene to run the dialogue, actors and camera at up to 4× with animated VHS tracking. Release to return to normal speed. Choices wait at normal speed. Native Vita movies use the video player’s 4× playback. |
+| Record dialogue history | On | Press **Select** (**Tab** on a keyboard) during dialogue to open or close the history over the scene. Use **Up/Down** to browse. The history keeps the last 128 dialogue pages of the session. |
+
+The history records displayed text and speaker names from the US release. Some special glyphs appear as question marks.
+The original PS2 [Direct Commands mod](https://gamebanana.com/mods/426860) documents the battle mechanics used for party control.
 
 ## Goal
 

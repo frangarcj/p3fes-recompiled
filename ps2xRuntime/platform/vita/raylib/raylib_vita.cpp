@@ -652,6 +652,7 @@ uint32_t ps2xVitaHostFrames() { return g_hostFrames.load(std::memory_order_relax
 namespace
 {
     bool g_glReady = false;
+    bool g_hostQuadsPrepared = false;
     bool g_quit = false;
     int g_width = 960, g_height = 544;
     uint64_t g_startCounter = 0;
@@ -983,6 +984,12 @@ void BeginDrawing(void)
     pollInput();
     ps2xVitaGlMutex().lock(); // released by EndDrawing
     g_hostFrames.fetch_add(1, std::memory_order_relaxed);
+    ps2xVitaPrepareHostDrawing();
+}
+
+void ps2xVitaPrepareHostDrawing(void)
+{
+    g_hostQuadsPrepared = false;
     // The GS renderer has its own GL state set: back to the host's.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glUseProgram(0);
@@ -1136,6 +1143,23 @@ namespace
     {
         if (!g_glReady || quads <= 0)
             return;
+        if (!g_hostQuadsPrepared)
+        {
+            // The native renderer leaves its camera and material state in this context.
+            // Host rectangles and text use pixel coordinates in the full display.
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrthof(0.0f, static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, -1.0f, 1.0f);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+            glDisable(GL_ALPHA_TEST);
+            glDisable(GL_FOG);
+            glDisable(GL_LIGHTING);
+            glDisableClientState(GL_COLOR_ARRAY);
+            glClientActiveTexture(GL_TEXTURE0);
+            glBlendEquation(GL_FUNC_ADD);
+            g_hostQuadsPrepared = true;
+        }
         std::vector<float> pos, tex;
         pos.reserve(quads * 12);
         tex.reserve(quads * 12);

@@ -1,6 +1,8 @@
 #include "p3fes_native_movie.h"
 
 #if defined(PLATFORM_VITA)
+#include "p3fes_gameplay_options.h"
+#include "p3fes_vhs_raylib.h"
 #include <raylib.h>
 #include <vitaGL.h>
 #include <psp2/avplayer.h>
@@ -48,6 +50,8 @@ std::array<void *, kBuffers> g_ownedPixels{};
 unsigned g_textureIndex = 0;
 uint64_t g_started = 0, g_firstFrame = 0, g_draws = 0;
 uint32_t g_previousButtons = 0;
+bool g_trickRequested = false, g_trickPlaying = false;
+uint64_t g_retryNormalAt = 0;
 
 void *allocate(void *, uint32_t alignment, uint32_t size)
 {
@@ -271,6 +275,8 @@ bool openPlayer()
     if (added < 0)
         return false;
     g_textureIndex = 0; g_firstFrame = 0; g_draws = 0;
+    g_trickRequested = g_trickPlaying = false;
+    g_retryNormalAt = 0;
     g_started = sceKernelGetProcessTimeWide();
     SceCtrlData pad{};
     sceCtrlPeekBufferPositiveExt2(0, &pad, 1);
@@ -324,12 +330,22 @@ bool renderHostFrame()
     }
     SceAvPlayerFrameInfo frame{};
     bool active, got;
+    const uint64_t now = sceKernelGetProcessTimeWide();
     {
         std::lock_guard lock(g_decoderMutex);
+        const bool requested = g_firstFrame && (pad.buttons & SCE_CTRL_TRIANGLE) &&
+            p3fes_gameplay_options::sceneForwardEnabled();
+        if (requested != g_trickRequested || (!requested && g_trickPlaying && now >= g_retryNormalAt))
+        {
+            const int speed = requested ? SCE_AVPLAYER_TRICK_SPEED_FAST_FORWARD_4X : SCE_AVPLAYER_TRICK_SPEED_NORMAL;
+            if (sceAvPlayerSetTrickSpeed(g_player, speed) >= 0)
+                g_trickPlaying = requested;
+            g_retryNormalAt = now + 250000;
+            g_trickRequested = requested;
+        }
         active = sceAvPlayerIsActive(g_player);
         got = active && sceAvPlayerGetVideoData(g_player, &frame);
     }
-    const uint64_t now = sceKernelGetProcessTimeWide();
     // Optional harness aid for repeated renderer checks. Disabled in normal
     // playback and full boot benchmarks; it exercises the ordinary skip/EOF
     // handoff without waiting through the same opening on every iteration.
@@ -388,6 +404,7 @@ bool renderHostFrame()
     glEnd();
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glDisable(GL_TEXTURE_2D);
+    if (g_trickPlaying) p3fes_vhs::drawIn({x, y, w, h});
     EndDrawing();
     ++g_draws;
     if (!g_firstFrame)

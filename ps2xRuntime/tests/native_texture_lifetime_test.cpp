@@ -54,7 +54,7 @@ public:
     }
     void drawScreenLines(const std::vector<nr::ScreenVertex> &, float, float,
                          std::string_view, const nr::ScreenDrawState &) override {}
-    void endFrame() override { ++observed.ends; }
+    void endFrame(void (*)()) override { ++observed.ends; }
 };
 
 nr::TextureData texture(std::string name, unsigned value) {

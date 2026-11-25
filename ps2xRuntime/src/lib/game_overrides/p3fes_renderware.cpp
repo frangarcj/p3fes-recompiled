@@ -11,6 +11,9 @@
 // Rinnegatamante/librw-vita @ 5e14b3f8123f8b950917ae46748dd655c723b09f,
 // src/gl/gl3device.cpp (MIT), for the same positive-Z RenderWare camera model;
 // see LICENSE.librw-vita.txt beside this file.
+#include "p3fes_gameplay.h"
+#include "p3fes_scene_forward.h"
+#include "p3fes_vhs.h"
 #include <set>
 #include "game_overrides.h"
 #include "p3fes_native_present.h"
@@ -4831,6 +4834,26 @@ namespace
             revision = 1u;
 
 #if defined(PLATFORM_VITA)
+        // Sofdec on Vita bypasses GL and puts the decoded raster straight on
+        // the display. Apply the same tracking bands to that raster before the swap.
+        if (p3fes_scene_forward::active.load(std::memory_order_relaxed))
+        {
+            p3fes_vhs::draw([&](int x, int y, int w, int h, p3fes_vhs::Ink ink) {
+                if (y < 0 || y >= 448) return;
+                const int left = x * texture.width / 640, right = (x + w) * texture.width / 640;
+                const int top = y * texture.height / 448, bottom = std::min(448, y + h) * texture.height / 448;
+                for (int row = top; row < bottom; ++row)
+                {
+                    uint8_t *pixel = texture.rgba.data() + (row * texture.width + left) * 4;
+                    for (int col = left; col < right; ++col, pixel += 4)
+                    {
+                        pixel[0] = (pixel[0] * (255 - ink.a) + ink.r * ink.a) / 255;
+                        pixel[1] = (pixel[1] * (255 - ink.a) + ink.g * ink.a) / 255;
+                        pixel[2] = (pixel[2] * (255 - ink.a) + ink.b * ink.a) / 255;
+                    }
+                }
+            });
+        }
         return ps2x_vita_present_software_frame_rgba(texture.rgba.data(), texture.width, texture.height) >= 0;
 #else
 
@@ -7555,7 +7578,9 @@ namespace
                     lastPhase = phase;
                 }
             }
+#if defined(PLATFORM_VITA)
             p3fes_native_present::setHostPresentationPaused(activeMovie);
+#endif
             if (activeMovie)
             {
                 if (raster)
@@ -7744,6 +7769,7 @@ namespace
 
     void applyP3fesRenderWare(PS2Runtime &runtime)
     {
+        p3fes_gameplay::install(runtime);
         const char *native = std::getenv("P3FES_NATIVE_RW");
         const char *diag = std::getenv("P3FES_RW_HOOK_DIAG");
 #if defined(PLATFORM_VITA)

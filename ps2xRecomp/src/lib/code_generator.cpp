@@ -273,10 +273,10 @@ namespace ps2recomp
     std::string ps2recomp::CodeGenerator::generateFunction(
         const Function &function,
         const std::vector<Instruction> &instructions,
-        const bool &useHeaders)
+        const bool &useHeaders, const std::string &suffix)
     {
         FunctionEmitter emitter(*this);
-        return emitter.emit(function, instructions, useHeaders);
+        return emitter.emit(function, instructions, useHeaders, suffix);
     }
 
     std::string CodeGenerator::emitUnhandledInstruction(const Instruction &inst, const std::string &message)

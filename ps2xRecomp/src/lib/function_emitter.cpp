@@ -38,7 +38,7 @@ namespace ps2recomp
     std::string FunctionEmitter::emit(
         const Function &function,
         const std::vector<Instruction> &instructions,
-        bool useHeaders)
+        bool useHeaders, const std::string &suffix)
     {
         CodeGenerator &cg = m_codeGenerator;
         std::stringstream ss;
@@ -87,7 +87,7 @@ namespace ps2recomp
             sanitizedName = nameBuilder.str();
         }
 
-        ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        ss << (suffix.empty() ? "void " : "static void ") << sanitizedName << suffix << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
